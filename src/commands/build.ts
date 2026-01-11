@@ -16,7 +16,7 @@ export async function build(options: BuildOptions): Promise<void> {
     timeout,
   } = options
 
-  console.log(chalk.cyan('\n  wc-build - WebContainer Build Tool\n'))
+  console.log(chalk.cyan('\n  wc-exe - WebContainer Executor\n'))
 
   const spinner = ora()
 

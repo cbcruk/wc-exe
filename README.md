@@ -1,15 +1,20 @@
-# wc-build
+# wc-exe
 
-WebContainer-based headless build tool for frontend projects.
+WebContainer Executor - Headless build tool for frontend projects.
 
-Security software real-time file scanning causes extreme I/O delays during `npm install`. wc-build bypasses this by running builds inside a browser's WebContainer where files exist only in memory.
+Security software real-time file scanning causes extreme I/O delays during `npm install`. wc-exe bypasses this by running builds inside a browser's WebContainer where files exist only in memory.
+
+## Requirements
+
+- Node.js 18.0.0 or higher
+- Chrome or Chromium browser (for Puppeteer)
 
 ## Installation
 
 ```bash
-npm install -g wc-build
+npm install -g wc-exe
 # or
-pnpm add -g wc-build
+pnpm add -g wc-exe
 ```
 
 ## Usage
@@ -20,12 +25,12 @@ Build your project using WebContainer:
 
 ```bash
 # In your project directory
-wc-build
+wc-exe
 
 # With options
-wc-build build --source ./src --output ./dist
-wc-build build --no-install  # Skip npm install
-wc-build build --verbose     # Show detailed logs
+wc-exe build --source ./src --output ./dist
+wc-exe build --no-install  # Skip npm install
+wc-exe build --verbose     # Show detailed logs
 ```
 
 ### Dev Server
@@ -33,10 +38,10 @@ wc-build build --verbose     # Show detailed logs
 Start a development server with hot reload:
 
 ```bash
-wc-build dev
+wc-exe dev
 
 # With custom port
-wc-build dev --port 3000
+wc-exe dev --port 3000
 ```
 
 Features:
@@ -50,7 +55,7 @@ Features:
 Install dependencies without building:
 
 ```bash
-wc-build install
+wc-exe install
 ```
 
 ## How It Works
@@ -59,7 +64,7 @@ wc-build install
 ┌─────────────────────────────────────────────────────────┐
 │  Local Environment (with security software)            │
 │                                                         │
-│  1. Express Server (dynamic port)                      │
+│  1. Hono Server (dynamic port)                         │
 │     └─ COEP/COOP headers for WebContainer              │
 │                                                         │
 │  2. Puppeteer (Headless Chrome)                        │
@@ -78,7 +83,7 @@ wc-build install
 ## CLI Options
 
 ```
-wc-build [command] [options]
+wc-exe [command] [options]
 
 Commands:
   build     Build the project (default)
@@ -96,6 +101,10 @@ Build Options:
 
 Dev Options:
   -p, --port <number>     Preview port (default: 5173)
+  --open                  Open browser automatically
+
+Install Options:
+  --cache                 Use cached node_modules
 ```
 
 ## Environment Variables
@@ -107,5 +116,5 @@ Dev Options:
 Example:
 
 ```bash
-CHROME_PATH=/usr/bin/chromium wc-build build
+CHROME_PATH=/usr/bin/chromium wc-exe build
 ```

@@ -6,8 +6,8 @@ import { install } from './commands/install.js'
 const program = new Command()
 
 program
-  .name('wc-build')
-  .description('WebContainer-based headless build tool for frontend projects')
+  .name('wc-exe')
+  .description('WebContainer Executor - Headless build tool for frontend projects')
   .version('0.1.0')
 
 program

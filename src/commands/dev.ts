@@ -14,7 +14,7 @@ import type { DevOptions } from '../types.js'
 export async function dev(options: DevOptions): Promise<void> {
   const { port = 5173 } = options
 
-  console.log(chalk.cyan('\n  wc-build dev - Development Server\n'))
+  console.log(chalk.cyan('\n  wc-exe dev - Development Server\n'))
 
   const spinner = ora()
 

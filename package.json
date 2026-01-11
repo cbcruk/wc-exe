@@ -1,10 +1,10 @@
 {
-  "name": "wc-build",
+  "name": "wc-exe",
   "version": "0.1.0",
-  "description": "WebContainer-based headless build machine for frontend projects",
+  "description": "WebContainer Executor - Headless build tool for frontend projects",
   "type": "module",
   "bin": {
-    "wc-build": "./dist/cli.js"
+    "wc-exe": "./dist/cli.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
