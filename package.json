@@ -1,6 +1,6 @@
 {
   "name": "wc-exe",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "WebContainer Executor - Headless build tool for frontend projects",
   "type": "module",
   "bin": {
@@ -34,8 +34,16 @@
     "security",
     "headless"
   ],
-  "author": "",
+  "author": "cbcruk",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cbcruk/wc-exe.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cbcruk/wc-exe/issues"
+  },
+  "homepage": "https://github.com/cbcruk/wc-exe#readme",
   "engines": {
     "node": ">=18.0.0"
   },
