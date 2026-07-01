@@ -1,6 +1,5 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import type { FileSystemTree, FileNode, DirectoryNode } from '../types.js'
 
 const IGNORE_PATTERNS = [
   'node_modules',
@@ -15,104 +14,68 @@ const IGNORE_PATTERNS = [
   '.cache',
 ]
 
-export async function readProjectFiles(
+export async function listProjectFiles(
   sourcePath: string,
   basePath: string = ''
-): Promise<FileSystemTree> {
-  const result: FileSystemTree = {}
+): Promise<string[]> {
   const absolutePath = path.resolve(sourcePath)
   const entries = await fs.readdir(absolutePath, { withFileTypes: true })
+  const files: string[] = []
 
   for (const entry of entries) {
     if (IGNORE_PATTERNS.includes(entry.name)) {
       continue
     }
 
-    const fullPath = path.join(absolutePath, entry.name)
+    const relativePath = basePath ? `${basePath}/${entry.name}` : entry.name
 
     if (entry.isDirectory()) {
-      const subTree = await readProjectFiles(
-        fullPath,
-        path.join(basePath, entry.name)
+      const subFiles = await listProjectFiles(
+        path.join(absolutePath, entry.name),
+        relativePath
       )
-
-      result[entry.name] = { directory: subTree } as DirectoryNode
+      files.push(...subFiles)
     } else if (entry.isFile()) {
-      const content = await fs.readFile(fullPath)
-      const isBinary = isBinaryFile(entry.name, content)
-
-      result[entry.name] = {
-        file: {
-          contents: isBinary ? content : content.toString('utf-8'),
-        },
-      } as FileNode
+      files.push(relativePath)
     }
   }
 
-  return result
+  return files
 }
 
-function isBinaryFile(filename: string, content: Buffer): boolean {
-  const binaryExtensions = [
-    '.png',
-    '.jpg',
-    '.jpeg',
-    '.gif',
-    '.ico',
-    '.webp',
-    '.avif',
-    '.woff',
-    '.woff2',
-    '.ttf',
-    '.eot',
-    '.otf',
-    '.zip',
-    '.tar',
-    '.gz',
-    '.br',
-    '.pdf',
-    '.doc',
-    '.docx',
-    '.mp3',
-    '.mp4',
-    '.webm',
-    '.ogg',
-  ]
-
-  const ext = path.extname(filename).toLowerCase()
-
-  if (binaryExtensions.includes(ext)) {
-    return true
-  }
-
-  for (let i = 0; i < Math.min(1024, content.length); i++) {
-    if (content[i] === 0) {
-      return true
-    }
-  }
-
-  return false
+export async function readProjectFileBytes(
+  sourcePath: string,
+  relPath: string
+): Promise<Uint8Array> {
+  return fs.readFile(safeResolve(sourcePath, relPath))
 }
 
-export async function writeDistFiles(
-  outputPath: string,
-  files: Record<string, number[]>,
-  distDir: string = '/dist'
-): Promise<void> {
+export async function prepareOutputDir(outputPath: string): Promise<void> {
   const absoluteOutput = path.resolve(outputPath)
-
   await fs.rm(absoluteOutput, { recursive: true, force: true })
   await fs.mkdir(absoluteOutput, { recursive: true })
+}
 
-  const escapedDistDir = distDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const distDirPattern = new RegExp(`^${escapedDistDir}/?`)
+export async function writeDistFile(
+  outputPath: string,
+  relPath: string,
+  data: Uint8Array
+): Promise<void> {
+  const fullPath = safeResolve(outputPath, relPath)
+  await fs.mkdir(path.dirname(fullPath), { recursive: true })
+  await fs.writeFile(fullPath, data)
+}
 
-  for (const [filePath, contentArray] of Object.entries(files)) {
-    const relativePath = filePath.replace(distDirPattern, '')
-    const fullPath = path.join(absoluteOutput, relativePath)
-    const dir = path.dirname(fullPath)
+function safeResolve(base: string, relPath: string): string {
+  const absoluteBase = path.resolve(base)
+  const fullPath = path.resolve(absoluteBase, ...relPath.split('/'))
 
-    await fs.mkdir(dir, { recursive: true })
-    await fs.writeFile(fullPath, Buffer.from(contentArray))
+  if (
+    fullPath !== absoluteBase &&
+    !fullPath.startsWith(absoluteBase + path.sep)
+  ) {
+    throw new Error(`Path escapes base directory: ${relPath}`)
   }
+
+  return fullPath
 }

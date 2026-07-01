@@ -1,5 +1,4 @@
 import puppeteer, { type Browser, type Page } from 'puppeteer-core'
-import type { FileSystemTree } from '../types.js'
 
 export class WCBrowser {
   private browser: Browser | null = null
@@ -88,16 +87,16 @@ export class WCBrowser {
     )
   }
 
-  async mountFiles(files: FileSystemTree): Promise<void> {
+  async mountFromServer(): Promise<number> {
     if (!this.page) throw new Error('Browser not launched')
 
-    await this.page.evaluate(async (filesArg: FileSystemTree) => {
-      await (
+    return await this.page.evaluate(async () => {
+      return await (
         window as unknown as {
-          wcRunner: { mountFiles: (f: FileSystemTree) => Promise<void> }
+          wcRunner: { mountFromServer: () => Promise<number> }
         }
-      ).wcRunner.mountFiles(filesArg)
-    }, files)
+      ).wcRunner.mountFromServer()
+    })
   }
 
   async runCommand(
@@ -138,19 +137,15 @@ export class WCBrowser {
     return Promise.race([commandPromise, timeoutPromise])
   }
 
-  async extractDist(
-    distPath: string = '/dist'
-  ): Promise<Record<string, number[]>> {
+  async uploadDist(distPath: string = '/dist'): Promise<number> {
     if (!this.page) throw new Error('Browser not launched')
 
     return await this.page.evaluate(async (pathArg: string) => {
       return await (
         window as unknown as {
-          wcRunner: {
-            readDirRecursive: (p: string) => Promise<Record<string, number[]>>
-          }
+          wcRunner: { uploadDist: (p: string) => Promise<number> }
         }
-      ).wcRunner.readDirRecursive(pathArg)
+      ).wcRunner.uploadDist(pathArg)
     }, distPath)
   }
 

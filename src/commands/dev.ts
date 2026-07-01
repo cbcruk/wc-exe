@@ -7,9 +7,9 @@ import http from 'node:http'
 import httpProxy from 'http-proxy'
 import { startServer, type ServerInfo } from '../core/server.js'
 import { WCBrowser } from '../core/browser.js'
-import { readProjectFiles } from '../core/file-sync.js'
+import { listProjectFiles, readProjectFileBytes } from '../core/file-sync.js'
 import { withSpin } from '../utils/spinner.js'
-import type { DevOptions } from '../types.js'
+import type { DevOptions, ServerHandlers } from '../types.js'
 
 export async function dev(options: DevOptions): Promise<void> {
   const { port = 5173 } = options
@@ -46,11 +46,16 @@ export async function dev(options: DevOptions): Promise<void> {
     process.exit(0)
   })
 
+  const handlers: ServerHandlers = {
+    listFiles: () => listProjectFiles('.'),
+    readFile: (relPath) => readProjectFileBytes('.', relPath),
+  }
+
   try {
     serverInfo = await withSpin({
       spinner,
       message: 'Starting WebContainer server...',
-      fn: () => startServer(),
+      fn: () => startServer(handlers),
       successMessage: (info) => `WebContainer server started on ${info.url}`,
       failMessage: 'Failed to start server',
     })
@@ -64,19 +69,11 @@ export async function dev(options: DevOptions): Promise<void> {
       failMessage: 'Failed to launch browser',
     })
 
-    const files = await withSpin({
-      spinner,
-      message: 'Reading project files...',
-      fn: () => readProjectFiles('.'),
-      successMessage: 'Project files loaded',
-      failMessage: 'Failed to read project files',
-    })
-
     await withSpin({
       spinner,
       message: 'Mounting files...',
-      fn: () => browser!.mountFiles(files),
-      successMessage: 'Files mounted',
+      fn: () => browser!.mountFromServer(),
+      successMessage: (count) => `Mounted ${count} files`,
       failMessage: 'Failed to mount files',
     })
 

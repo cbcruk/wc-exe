@@ -2,9 +2,14 @@ import ora from 'ora'
 import chalk from 'chalk'
 import { startServer, type ServerInfo } from '../core/server.js'
 import { WCBrowser } from '../core/browser.js'
-import { readProjectFiles, writeDistFiles } from '../core/file-sync.js'
+import {
+  listProjectFiles,
+  readProjectFileBytes,
+  prepareOutputDir,
+  writeDistFile,
+} from '../core/file-sync.js'
 import { withSpin } from '../utils/spinner.js'
-import type { BuildOptions } from '../types.js'
+import type { BuildOptions, ServerHandlers } from '../types.js'
 
 export async function build(options: BuildOptions): Promise<void> {
   const {
@@ -38,11 +43,17 @@ export async function build(options: BuildOptions): Promise<void> {
     process.exit(130)
   })
 
+  const handlers: ServerHandlers = {
+    listFiles: () => listProjectFiles(source),
+    readFile: (relPath) => readProjectFileBytes(source, relPath),
+    writeDistFile: (relPath, data) => writeDistFile(output, relPath, data),
+  }
+
   try {
     serverInfo = await withSpin({
       spinner,
       message: 'Starting local server...',
-      fn: () => startServer(),
+      fn: () => startServer(handlers),
       successMessage: (info) => `Server started on ${info.url}`,
       failMessage: 'Failed to start server',
     })
@@ -56,19 +67,11 @@ export async function build(options: BuildOptions): Promise<void> {
       failMessage: 'Failed to launch browser',
     })
 
-    const files = await withSpin({
-      spinner,
-      message: 'Reading project files...',
-      fn: () => readProjectFiles(source),
-      successMessage: (f) => `Read ${countFiles(f)} files from source`,
-      failMessage: 'Failed to read project files',
-    })
-
     await withSpin({
       spinner,
       message: 'Mounting files to WebContainer...',
-      fn: () => browser!.mountFiles(files),
-      successMessage: 'Files mounted',
+      fn: () => browser!.mountFromServer(),
+      successMessage: (count) => `Mounted ${count} files`,
       failMessage: 'Failed to mount files',
     })
 
@@ -98,19 +101,13 @@ export async function build(options: BuildOptions): Promise<void> {
       failMessage: (err) => `Build failed: ${err.message}`,
     })
 
-    const distFiles = await withSpin({
-      spinner,
-      message: 'Extracting dist files...',
-      fn: () => browser!.extractDist(distDir),
-      successMessage: (files) => `Extracted ${Object.keys(files).length} files`,
-      failMessage: 'Failed to extract dist files',
-    })
+    await prepareOutputDir(output)
 
     await withSpin({
       spinner,
-      message: `Writing to ${output}...`,
-      fn: () => writeDistFiles(output, distFiles, distDir),
-      successMessage: `Output written to ${output}`,
+      message: `Writing dist files to ${output}...`,
+      fn: () => browser!.uploadDist(distDir),
+      successMessage: (count) => `Wrote ${count} files to ${output}`,
       failMessage: `Failed to write to ${output}`,
     })
 
@@ -121,21 +118,4 @@ export async function build(options: BuildOptions): Promise<void> {
     await cleanup()
     throw error
   }
-}
-
-function countFiles(tree: Record<string, unknown>, count = 0): number {
-  for (const value of Object.values(tree)) {
-    if (typeof value === 'object' && value !== null) {
-      if ('file' in value) {
-        count++
-      } else if ('directory' in value) {
-        count = countFiles(
-          (value as { directory: Record<string, unknown> }).directory,
-          count
-        )
-      }
-    }
-  }
-
-  return count
 }

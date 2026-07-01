@@ -1,4 +1,4 @@
-import { WebContainer } from '@webcontainer/api'
+import { WebContainer, type FileSystemTree } from '@webcontainer/api'
 import invariant from 'tiny-invariant'
 
 const ANSI_REGEX =
@@ -49,16 +49,63 @@ async function boot(): Promise<WebContainer> {
   return webcontainer
 }
 
-async function mountFiles(
-  files: Parameters<WebContainer['mount']>[0]
-): Promise<void> {
+async function mountFromServer(): Promise<number> {
   invariant(webcontainer, 'WebContainer not booted')
 
-  console.log(`[wc-build] Mounting ${Object.keys(files).length} entries...`)
+  const manifestRes = await fetch('/api/files')
+  if (!manifestRes.ok) {
+    throw new Error(`Failed to fetch file manifest: ${manifestRes.status}`)
+  }
 
-  await webcontainer.mount(files)
+  const paths: string[] = await manifestRes.json()
 
-  console.log('[wc-build] Files mounted.')
+  console.log(`[wc-build] Fetching ${paths.length} files...`)
+
+  const tree: FileSystemTree = {}
+
+  for (const filePath of paths) {
+    const fileRes = await fetch(
+      `/api/files/raw?path=${encodeURIComponent(filePath)}`
+    )
+    if (!fileRes.ok) {
+      throw new Error(`Failed to fetch file ${filePath}: ${fileRes.status}`)
+    }
+
+    const contents = new Uint8Array(await fileRes.arrayBuffer())
+    insertIntoTree(tree, filePath, contents)
+  }
+
+  await webcontainer.mount(tree)
+
+  console.log(`[wc-build] Mounted ${paths.length} files.`)
+
+  return paths.length
+}
+
+function insertIntoTree(
+  tree: FileSystemTree,
+  filePath: string,
+  contents: Uint8Array
+): void {
+  const parts = filePath.split('/').filter(Boolean)
+  let node = tree
+
+  for (let i = 0; i < parts.length - 1; i++) {
+    const dir = parts[i]
+    const existing = node[dir]
+
+    if (!existing) {
+      const child: FileSystemTree = {}
+      node[dir] = { directory: child }
+      node = child
+    } else if ('directory' in existing) {
+      node = existing.directory
+    } else {
+      throw new Error(`Path conflict: ${dir} is a file, expected a directory`)
+    }
+  }
+
+  node[parts[parts.length - 1]] = { file: { contents } }
 }
 
 async function runCommand(cmd: string, args: string[]): Promise<number> {
@@ -113,31 +160,11 @@ async function writeFile(path: string, content: string): Promise<void> {
   console.log(`[wc-build] File written: ${path}`)
 }
 
-async function readFile(path: string): Promise<string> {
-  invariant(webcontainer, 'WebContainer not booted')
-
-  return await webcontainer.fs.readFile(path, 'utf-8')
-}
-
-async function readFileRaw(path: string): Promise<Uint8Array> {
-  invariant(webcontainer, 'WebContainer not booted')
-
-  return await webcontainer.fs.readFile(path)
-}
-
-async function readDir(path: string): Promise<string[]> {
-  invariant(webcontainer, 'WebContainer not booted')
-
-  return await webcontainer.fs.readdir(path)
-}
-
-async function readDirRecursive(
-  basePath: string
-): Promise<Record<string, number[]>> {
+async function uploadDist(distPath: string): Promise<number> {
   invariant(webcontainer, 'WebContainer not booted')
 
   const wc = webcontainer
-  const results: Record<string, number[]> = {}
+  let count = 0
 
   async function traverse(currentPath: string): Promise<void> {
     const entries = await wc.fs.readdir(currentPath, {
@@ -151,24 +178,36 @@ async function readDirRecursive(
       if (entry.isDirectory()) {
         await traverse(fullPath)
       } else {
-        try {
-          const content = await wc.fs.readFile(fullPath)
+        const content = await wc.fs.readFile(fullPath)
+        const relative = fullPath.slice(distPath.length).replace(/^\//, '')
+        const body = content.buffer.slice(
+          content.byteOffset,
+          content.byteOffset + content.byteLength
+        ) as ArrayBuffer
 
-          results[fullPath] = Array.from(content)
-        } catch {
-          console.error(`[wc-build] Failed to read: ${fullPath}`)
+        const res = await fetch(
+          `/api/dist?path=${encodeURIComponent(relative)}`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/octet-stream' },
+            body,
+          }
+        )
+
+        if (!res.ok) {
+          throw new Error(`Failed to upload ${relative}: ${res.status}`)
         }
+
+        count++
       }
     }
   }
 
-  try {
-    await traverse(basePath)
-  } catch {
-    console.error(`[wc-build] Directory not found: ${basePath}`)
-  }
+  await traverse(distPath)
 
-  return results
+  console.log(`[wc-build] Uploaded ${count} dist files.`)
+
+  return count
 }
 
 async function getServerUrl(): Promise<{ port: number; url: string }> {
@@ -190,14 +229,11 @@ async function getServerUrl(): Promise<{ port: number; url: string }> {
 
 const wcRunner = {
   boot,
-  mountFiles,
+  mountFromServer,
   runCommand,
   spawnCommand,
   writeFile,
-  readFile,
-  readFileRaw,
-  readDir,
-  readDirRecursive,
+  uploadDist,
   getServerUrl,
 }
 

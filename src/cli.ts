@@ -8,7 +8,7 @@ const program = new Command()
 program
   .name('wc-exe')
   .description('WebContainer Executor - Headless build tool for frontend projects')
-  .version('0.1.0')
+  .version('0.1.1')
 
 program
   .command('build', { isDefault: true })

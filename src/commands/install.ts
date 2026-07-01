@@ -2,18 +2,23 @@ import ora from 'ora'
 import chalk from 'chalk'
 import { startServer, type ServerInfo } from '../core/server.js'
 import { WCBrowser } from '../core/browser.js'
-import { readProjectFiles } from '../core/file-sync.js'
+import { listProjectFiles, readProjectFileBytes } from '../core/file-sync.js'
 import { withSpin } from '../utils/spinner.js'
-import type { InstallOptions } from '../types.js'
+import type { InstallOptions, ServerHandlers } from '../types.js'
 
 export async function install(options: InstallOptions): Promise<void> {
   const { cache: _cache = false } = options
 
-  console.log(chalk.cyan('\n  wc-build install - Dependency Installation\n'))
+  console.log(chalk.cyan('\n  wc-exe install - Dependency Installation\n'))
 
   const spinner = ora()
   let serverInfo: ServerInfo | undefined
   let browser: WCBrowser | null = null
+
+  const handlers: ServerHandlers = {
+    listFiles: () => listProjectFiles('.'),
+    readFile: (relPath) => readProjectFileBytes('.', relPath),
+  }
 
   const cleanup = async (): Promise<void> => {
     spinner.stop()
@@ -34,7 +39,7 @@ export async function install(options: InstallOptions): Promise<void> {
     serverInfo = await withSpin({
       spinner,
       message: 'Starting local server...',
-      fn: () => startServer(),
+      fn: () => startServer(handlers),
       successMessage: (info) => `Server started on ${info.url}`,
       failMessage: 'Failed to start server',
     })
@@ -48,19 +53,11 @@ export async function install(options: InstallOptions): Promise<void> {
       failMessage: 'Failed to launch browser',
     })
 
-    const files = await withSpin({
-      spinner,
-      message: 'Reading project files...',
-      fn: () => readProjectFiles('.'),
-      successMessage: 'Project files loaded',
-      failMessage: 'Failed to read project files',
-    })
-
     await withSpin({
       spinner,
       message: 'Mounting files...',
-      fn: () => browser!.mountFiles(files),
-      successMessage: 'Files mounted',
+      fn: () => browser!.mountFromServer(),
+      successMessage: (count) => `Mounted ${count} files`,
       failMessage: 'Failed to mount files',
     })
 

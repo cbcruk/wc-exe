@@ -37,3 +37,9 @@ export interface WCMessage {
   data?: string
   code?: number
 }
+
+export interface ServerHandlers {
+  listFiles: () => Promise<string[]>
+  readFile: (relPath: string) => Promise<Uint8Array>
+  writeDistFile?: (relPath: string, data: Uint8Array) => Promise<void>
+}
