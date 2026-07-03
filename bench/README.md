@@ -61,11 +61,11 @@ vscode-container-wasm actually use. So:
 
 ## Recording results
 
-| engine                            | project         | buildMs | machine / notes          |
-| --------------------------------- | --------------- | ------- | ------------------------ |
-| webcontainer                      | sample-vite-app | \_      |                          |
-| container2wasm (wasmtime)         | sample-vite-app | \_      | conservative upper bound |
-| container2wasm (browser, --to-js) | sample-vite-app | \_      | faithful                 |
+| engine                            | project         | buildMs | machine / notes                             |
+| --------------------------------- | --------------- | ------- | ------------------------------------------- |
+| webcontainer                      | sample-vite-app | ~1596   | macOS, avg of 3; install ~11.1s, boot ~5.4s |
+| container2wasm (wasmtime)         | sample-vite-app | \_      | conservative upper bound                    |
+| container2wasm (browser, --to-js) | sample-vite-app | \_      | faithful                                    |
 
 Decision rule (`docs/virtual-filesystem.md` §5, §7):
 
