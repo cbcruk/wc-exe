@@ -23,7 +23,7 @@
 
 ## 2. 접근 방식의 스펙트럼 (에뮬레이션 깊이 순)
 
-아래로 갈수록 "진짜 컴퓨터에 가까워지고" 무거워진다. wc-exe에 필요한 건 *어느 층까지 내려가야 하는가* 의 판단이다.
+아래로 갈수록 "진짜 컴퓨터에 가까워지고" 무거워진다. wc-exe에 필요한 건 _어느 층까지 내려가야 하는가_ 의 판단이다.
 
 ### 계층 A — 순수 JS 인메모리 VFS (저장소만)
 
@@ -53,7 +53,7 @@
 
 ### 계층 D — 전체 시스템 에뮬레이션 (질문의 QEMU 방향)
 
-**진짜 CPU + 진짜 리눅스 커널을 브라우저에서 에뮬레이트**하고, 그 안에서 평범한 `node`/`npm`을 돌린다. 파일시스템은 게스트 리눅스의 진짜 ext4/9p이고, 브라우저는 그 디스크 이미지를 메모리(또는 OPFS)에 들고 있을 뿐이다. → **"가상 fs"를 가장 근본적으로 구현하는 방법.** 파일시스템을 흉내 내는 게 아니라 *실제 커널의 fs를 그대로 쓴다.*
+**진짜 CPU + 진짜 리눅스 커널을 브라우저에서 에뮬레이트**하고, 그 안에서 평범한 `node`/`npm`을 돌린다. 파일시스템은 게스트 리눅스의 진짜 ext4/9p이고, 브라우저는 그 디스크 이미지를 메모리(또는 OPFS)에 들고 있을 뿐이다. → **"가상 fs"를 가장 근본적으로 구현하는 방법.** 파일시스템을 흉내 내는 게 아니라 _실제 커널의 fs를 그대로 쓴다._
 
 대표 프로젝트:
 
@@ -84,12 +84,12 @@
 
 ## 4. wc-exe 관점 비교표
 
-| 접근 | 범용 빌드 | 호스트 디스크 쓰기 | 무게 | 성숙도 | WebContainer 탈피 |
-|---|---|---|---|---|---|
-| A. memfs/ZenFS | ❌ 실행 불가 | 없음 | 매우 가벼움 | 높음 | 부분(캐시용) |
-| B. WebContainer (현행) | ✅ | 없음 | 중간 | 높음 | — |
-| C. wasm 도구 + WASI fs | △ 고정 파이프라인만 | 없음 | 가벼움 | 중간 | 부분 |
-| D. QEMU-wasm/container2wasm | ✅✅ (진짜 리눅스) | 없음 | 무거움 | 실험적·발전중 | 완전 |
+| 접근                        | 범용 빌드           | 호스트 디스크 쓰기 | 무게        | 성숙도        | WebContainer 탈피 |
+| --------------------------- | ------------------- | ------------------ | ----------- | ------------- | ----------------- |
+| A. memfs/ZenFS              | ❌ 실행 불가        | 없음               | 매우 가벼움 | 높음          | 부분(캐시용)      |
+| B. WebContainer (현행)      | ✅                  | 없음               | 중간        | 높음          | —                 |
+| C. wasm 도구 + WASI fs      | △ 고정 파이프라인만 | 없음               | 가벼움      | 중간          | 부분              |
+| D. QEMU-wasm/container2wasm | ✅✅ (진짜 리눅스)  | 없음               | 무거움      | 실험적·발전중 | 완전              |
 
 ---
 
@@ -113,9 +113,77 @@
 
 ---
 
+## 6. WebContainer는 오픈소스인가? — "얇은 레이어만 떼오기"는 불가능
+
+"WebContainer에서 재사용 가능한 얇은 fs 레이어만 가져오면 좋겠다"는 발상은 자연스럽지만, 공개 범위를 확인하면 **공개된 부분과 가치 있는 부분이 정확히 반대로 나뉜다.**
+
+StackBlitz 조직의 `webcontainer-*` 리포를 실제로 까보면:
+
+| 리포                                                             | 정체                                                                                                                                          | 소스            |
+| ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
+| `stackblitz/webcontainer-core` (⭐4.6k, MIT)                     | 이름은 core지만 **이슈 트래커**. README에 "central hub for GitHub issues and bug reports"라고 명시. 루트에 `README.md`·`repro.md`·`LICENSE`뿐 | ❌              |
+| `webcontainer-docs` / `webcontainer-api-starter` / `tutorialkit` | 문서·예제·튜토리얼                                                                                                                            | ❌              |
+| `@webcontainer/api` (npm, 현재 의존)                             | 실제 런타임에 붙는 **클라이언트 스텁(RPC 글루)**                                                                                              | 배포만, 소스 ❌ |
+
+레이어링이 우리가 원하는 것과 뒤집혀 있다:
+
+```
+[@webcontainer/api]        ← 공개. 하지만 원격 호출 스텁 (알맹이 없음)
+─────────────────────────  ← 폐쇄 경계
+[VFS + Node 에뮬 + wasm]   ← 부팅 시 StackBlitz 인프라에서 내려받음. 완전 폐쇄
+```
+
+즉 **공개된 얇은 층은 껍데기고, 탐내는 fs/런타임 알맹이가 정확히 닫힌 부분**이다. 라이선스도 StackBlitz Terms of Service(OSS 무료, 기업 상용 라이선스)라 리버스 엔지니어링도 걸린다. → WebContainer에서 얇게 떼오기는 성립하지 않는다.
+
+**대신 "얇은 레이어" 직관은 대상만 바꾸면 옳다:**
+
+- **VFS 층만** 원한다 → [ZenFS](https://github.com/zen-fs/core) / [memfs](https://github.com/streamich/memfs) (둘 다 MIT, `fs` 호환, 진짜 얇음). OPFS 캐시(§5 단기)를 이걸로 바로 구현.
+- **실행 층까지** 원한다 → 오픈으로 같은 걸 얻으려면 [container2wasm](https://github.com/container2wasm/container2wasm)뿐이고, "얇지" 않다.
+
+핵심: **실행 엔진을 "얇게, 오픈으로" 떼올 방법은 존재하지 않는다.** 그래서 WebContainer가 닫아 사업화했고 container2wasm은 커널째 에뮬레이트하느라 무겁다. 얇게 떼올 수 있는 건 VFS 저장 층(ZenFS/memfs)까지고, 그 위 실행은 "WebContainer(닫힘·가벼움) vs container2wasm(열림·무거움)"의 양자택일이다.
+
+---
+
+## 7. 성능은 실제로 문제인가 — 레퍼런스와 실측 계획
+
+container2wasm의 성숙도/plumbing 리스크는 이미 실전 레퍼런스로 상당히 내려갔다:
+
+- **[vscode-container-wasm](https://github.com/ktock/vscode-container-wasm)** — container2wasm으로 변환한 컨테이너를 **VS Code for the Web 안에서** 실행하는 확장. Microsoft `vscode-wasm` + `browser_wasi_shim`을 패치해 쓰며, SharedArrayBuffer(`?vscode-coi=on`)·워크스페이스 마운트(`/workspace`)·Fetch 기반 네트워킹이 **동작**한다. 즉 부팅·fs·네트워킹 plumbing은 오픈 스택으로 재현 가능함이 입증됨.
+
+다만 "그러니 성능도 문제없다"는 아직 **절반만 맞다** — workload가 정반대이기 때문:
+
+|             | vscode-container-wasm    | wc-exe                            |
+| ----------- | ------------------------ | --------------------------------- |
+| 주 작업     | 편집 + 가끔 터미널       | **`npm install` + 프로덕션 빌드** |
+| CPU 특성    | 대부분 idle, 짧은 버스트 | **길고 무거운 CPU 버스트**        |
+| 느림의 체감 | "느려도 편집은 쾌적"     | 그대로 총 빌드 시간               |
+
+에뮬레이션 오버헤드(네이티브 대비 수 배~수십 배)는 CPU 바운드에서만 정직하게 드러나는데, wc-exe의 존재 이유가 바로 그 CPU 바운드 버스트다. 레퍼런스들도 "부팅에 시간이 걸린다"고만 하고 **install/build 벤치마크는 없다.** 결국 반증도 입증도 안 된 유일한 변수는 **wc-exe 실제 workload의 CPU 시간** 하나다.
+
+### 네트워킹 — 남의 약점이 우리한텐 이점
+
+vscode-container-wasm은 브라우저 네트워킹을 "CORS 제한 + Forbidden header 제어 불가"로 단점 표기한다. 이는 github.dev 같은 순수 브라우저 배포의 한계다. wc-exe는 **이미 로컬 Hono 서버가 있어** npm 레지스트리를 그 서버로 프록시하면 CORS/헤더 문제를 우회할 수 있다.
+
+### 실측 계획 (go/no-go)
+
+말싸움 대신 숫자 하나로 결판낸다. `test/fixtures/sample-vite-app`을 대상으로 `npm install && npm run build`의 **벽시계 시간**을 두 방식으로 잰다:
+
+1. **WebContainer 기준선** — 현행 인프라 재사용 (`bench/webcontainer.mjs`)
+2. **container2wasm** — Node 컨테이너를 `c2w`로 변환 → COI 헤더로 서빙 → headless로 workload 실행·측정 (`bench/container2wasm/`)
+
+> 측정은 **보안 소프트웨어가 있는 실제 사용자 머신**에서 의미가 있다(이 프로젝트의 존재 이유가 그 환경이므로). 하네스는 리포에 재현 가능하게 두고 로컬에서 돌린다. `bench/README.md` 참조.
+
+판정:
+
+- 감당 가능 → container2wasm으로 WebContainer 독립 진행 (§5 장기를 앞당김)
+- 너무 느림 → WebContainer 유지 + OPFS 캐시(§5 단기)로 실익 확보
+
+---
+
 ## 참고
 
 - [container2wasm](https://github.com/container2wasm/container2wasm) — 컨테이너 → wasm 변환기 (NTT, ktock)
+- [vscode-container-wasm](https://github.com/ktock/vscode-container-wasm) — container2wasm을 VS Code for the Web에서 실행하는 확장 (실전 레퍼런스)
 - [qemu-wasm](https://github.com/ktock/qemu-wasm) / [브라우저 데모](https://ktock.github.io/qemu-wasm-demo/)
 - [container2wasm 데모](https://ktock.github.io/container2wasm-demo/)
 - ["Running QEMU Inside Browser" (FOSDEM 2025)](https://archive.fosdem.org/2025/events/attachments/fosdem-2025-6290-running-qemu-inside-browser/slides/238760/slides_1dDtpcS.pdf)
