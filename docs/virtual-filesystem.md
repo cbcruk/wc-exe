@@ -97,8 +97,13 @@
 
 축을 나눠서 접근하는 걸 권한다. **"WebContainer를 당장 갈아엎기"가 아니라 "VFS 축을 우리가 통제하기"** 부터.
 
-**단기 — 현행 유지 + 영속 캐시 계층 도입 (계층 A 활용)**
-지금 가장 큰 불편은 매 실행마다 `npm install`을 처음부터 하는 것. `node_modules`를 **OPFS/IndexedDB에 스냅샷**해두고 재사용하면 체감이 크게 는다. 이미 `install --cache` 플래그 자리가 있다. ZenFS의 OPFS 백엔드나 OPFS 직접 접근으로, WebContainer 마운트 전에 캐시를 복원 → 빌드 후 갱신. **WebContainer는 그대로 두고 그 아래 저장 계층만 우리가 소유.**
+**단기 — 현행 유지 + 영속 캐시 계층 도입 (계층 A 활용)** ✅ **구현됨**
+지금 가장 큰 불편은 매 실행마다 `npm install`을 처음부터 하는 것. `node_modules`를 **OPFS에 스냅샷**해두고 재사용한다. `--cache` 플래그(`build`/`install`)로 켠다.
+
+- 동작: lockfile(`package-lock.json`→…→`package.json`) 해시를 키로, WebContainer의 `export('node_modules','binary')` 스냅샷을 OPFS에 저장. 다음 실행에서 키가 같으면 `mount(snapshot,{mountPoint:'node_modules'})`로 복원하고 **`npm install`을 통째로 건너뛴다.**
+- **실측(sample-vite-app, macOS)**: cold(캐시 없음) 17.5s → **warm(캐시 히트) 2.7s** (~6.5×, install 전체 스킵). lockfile 변경 시 키가 바뀌어 자동 무효화(재설치·재캐시) 확인.
+- 제약(정직하게): OPFS는 **origin 스코프**라 러너 포트를 고정(`5199`)해야 하고, 브라우저 프로파일이 유지돼야 해 **puppeteer userDataDir를 영속 디렉터리**(`~/.cache/wc-exe/chrome-profile`)로 둔다. 즉 "호스트 디스크에 아무것도 안 쓴다"가 완벽히 지켜지는 건 아니고, **프로젝트 dir엔 여전히 아무것도 안 쓰되** node_modules는 크롬 프로파일 안 불투명 blob(대용량 순차 쓰기, 수만 개 소파일 아님)으로만 남는다. 백신 I/O 관점에선 여전히 큰 이득.
+- **WebContainer는 그대로 두고 그 아래 저장 계층만 우리가 소유** — 이 문서의 핵심 전략을 최소 비용으로 실현.
 
 **중기 — 자체 VFS 추상화로 결합도 낮추기**
 `src/runner`가 지금은 WebContainer API에 직접 묶여 있다 (`webcontainer.mount`, `wc.fs.*`, `spawn`). 이걸 얇은 **VFS/Runtime 인터페이스**(`mount`, `readFile`, `writeFile`, `readdir`, `spawn`) 뒤로 숨겨두면, 나중에 백엔드를 WebContainer ↔ container2wasm ↔ 순수 wasm 도구로 교체하기 쉬워진다. 지금 하면 비용이 작고 나중에 자유도가 커진다.

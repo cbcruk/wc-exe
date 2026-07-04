@@ -135,6 +135,100 @@ async function runCommand(cmd: string, args: string[]): Promise<number> {
   return exitCode
 }
 
+type CacheResult = { cached: boolean; key: string; bytes?: number }
+
+const LOCK_FILES = [
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'yarn.lock',
+  'package.json',
+]
+
+async function sha256Hex(data: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', data as BufferSource)
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+async function computeCacheKey(): Promise<string> {
+  invariant(webcontainer, 'WebContainer not booted')
+
+  for (const file of LOCK_FILES) {
+    try {
+      const contents = await webcontainer.fs.readFile(file)
+      return (await sha256Hex(contents)).slice(0, 32)
+    } catch {
+      continue
+    }
+  }
+
+  throw new Error('No lockfile or package.json found to key the cache on')
+}
+
+async function opfsRoot(): Promise<FileSystemDirectoryHandle> {
+  return navigator.storage.getDirectory()
+}
+
+async function restoreNodeModules(key: string): Promise<boolean> {
+  invariant(webcontainer, 'WebContainer not booted')
+
+  const root = await opfsRoot()
+  let handle: FileSystemFileHandle
+  try {
+    handle = await root.getFileHandle(`nm-${key}.bin`)
+  } catch {
+    return false
+  }
+
+  const file = await handle.getFile()
+  const snapshot = new Uint8Array(await file.arrayBuffer())
+  await webcontainer.mount(snapshot, { mountPoint: 'node_modules' })
+
+  return true
+}
+
+async function saveNodeModules(key: string): Promise<number> {
+  invariant(webcontainer, 'WebContainer not booted')
+
+  const snapshot = await webcontainer.export('node_modules', {
+    format: 'binary',
+  })
+
+  const root = await opfsRoot()
+  const handle = await root.getFileHandle(`nm-${key}.bin`, { create: true })
+  const writable = await handle.createWritable()
+  await writable.write(snapshot as FileSystemWriteChunkType)
+  await writable.close()
+
+  return snapshot.byteLength
+}
+
+async function installWithCache(): Promise<CacheResult> {
+  invariant(webcontainer, 'WebContainer not booted')
+
+  const key = await computeCacheKey()
+
+  if (await restoreNodeModules(key)) {
+    console.log(`[wc-build] node_modules cache HIT (${key.slice(0, 12)})`)
+    return { cached: true, key }
+  }
+
+  console.log(`[wc-build] node_modules cache MISS (${key.slice(0, 12)})`)
+
+  const code = await runCommand('npm', ['install'])
+  if (code !== 0) {
+    throw new Error(`npm install failed with exit code ${code}`)
+  }
+
+  const bytes = await saveNodeModules(key)
+  console.log(
+    `[wc-build] Cached node_modules snapshot: ${(bytes / 1048576).toFixed(1)} MB`
+  )
+
+  return { cached: false, key, bytes }
+}
+
 function spawnCommand(cmd: string, args: string[]): void {
   invariant(webcontainer, 'WebContainer not booted')
 
@@ -231,6 +325,7 @@ const wcRunner = {
   boot,
   mountFromServer,
   runCommand,
+  installWithCache,
   spawnCommand,
   writeFile,
   uploadDist,

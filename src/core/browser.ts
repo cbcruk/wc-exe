@@ -4,9 +4,11 @@ export class WCBrowser {
   private browser: Browser | null = null
   private page: Page | null = null
   private verbose: boolean = false
+  private userDataDir: string | undefined
 
-  constructor(options?: { verbose?: boolean }) {
+  constructor(options?: { verbose?: boolean; userDataDir?: string }) {
     this.verbose = options?.verbose ?? false
+    this.userDataDir = options?.userDataDir
   }
 
   async launch(serverUrl: string): Promise<void> {
@@ -16,6 +18,8 @@ export class WCBrowser {
       headless: true,
       executablePath,
       protocolTimeout: 600000,
+      // A persistent profile keeps OPFS (the node_modules cache) across runs.
+      userDataDir: this.userDataDir,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -96,6 +100,28 @@ export class WCBrowser {
           wcRunner: { mountFromServer: () => Promise<number> }
         }
       ).wcRunner.mountFromServer()
+    })
+  }
+
+  async installWithCache(): Promise<{
+    cached: boolean
+    key: string
+    bytes?: number
+  }> {
+    if (!this.page) throw new Error('Browser not launched')
+
+    return await this.page.evaluate(async () => {
+      return await (
+        window as unknown as {
+          wcRunner: {
+            installWithCache: () => Promise<{
+              cached: boolean
+              key: string
+              bytes?: number
+            }>
+          }
+        }
+      ).wcRunner.installWithCache()
     })
   }
 
