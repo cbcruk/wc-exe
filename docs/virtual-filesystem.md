@@ -178,6 +178,23 @@ vscode-container-wasm은 브라우저 네트워킹을 "CORS 제한 + Forbidden h
 - 감당 가능 → container2wasm으로 WebContainer 독립 진행 (§5 장기를 앞당김)
 - 너무 느림 → WebContainer 유지 + OPFS 캐시(§5 단기)로 실익 확보
 
+### 실측 결과 (2026-07, macOS M-series / 16GB, sample-vite-app)
+
+| 엔진                                         | `npm run build` | 비고                                                    |
+| -------------------------------------------- | --------------- | ------------------------------------------------------- |
+| WebContainer                                 | **~1.6s**       | install ~11.1s, boot ~5.4s(1회성)                       |
+| container2wasm (wasmtime / Bochs)            | **~56s**        | host wallclock: 실행 ~61s − 부팅 ~5.3s. **약 35× 느림** |
+| container2wasm (browser `--to-js`, QEMU-JIT) | 미측정          | 위 Bochs보다는 빠를 것                                  |
+
+측정 과정에서 얻은 실전 교훈(하네스 `bench/container2wasm/run.sh`에 반영):
+
+- **macOS엔 c2w 네이티브 바이너리가 없다** → linux c2w를 Docker 소켓 연결한 컨테이너 안에서 실행.
+- c2w 내장 Dockerfile이 **낡은 repo에서 assets를 git clone**(`ktock/...`의 v0.8.4 태그 404) → 로컬 clone 후 `--assets`로 우회.
+- **게스트 클럭 스큐**: 에뮬 게스트의 `date`·vite "built in 11.55s"는 실시간과 불일치 → host wallclock으로 측정, 부팅분 차감.
+- **stdin EOF**: stdin이 닫히면 게스트가 부팅 중 EOF 읽고 exit 1 → c2w `-no-stdin` + `</dev/null`.
+
+**판정: WebContainer 유지.** Bochs/WASI는 보수적 상한이지만 1.6s→56s(35×)라, 브라우저 QEMU-JIT가 수 배 빨라도 동률까지 좁히긴 어렵다. 빌드 버스트 성능만 놓고 보면 WebContainer가 앞선다. 대신 **§5 단기 OPFS 캐시**로 재발 비용인 install(~11s)을 줄이는 게 확실한 실익. container2wasm은 "성능"이 아니라 "WebContainer 독립성" 또는 "네이티브/비-JS 툴체인"이 동인이 될 때만, 그것도 `--to-js` 브라우저 경로를 먼저 재고 재검토한다.
+
 ---
 
 ## 참고
