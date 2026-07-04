@@ -3,6 +3,7 @@ export interface BuildOptions {
   output: string
   distDir?: string
   noInstall?: boolean
+  cache?: boolean
   verbose?: boolean
   timeout?: number
 }

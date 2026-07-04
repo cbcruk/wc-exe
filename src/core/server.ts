@@ -91,3 +91,19 @@ export function startServer(
     }
   })
 }
+
+// Prefer a fixed port so the runner origin stays stable (required for the OPFS
+// cache). Fall back to a random port if it's taken — the cache just won't hit.
+export async function startServerWithFallback(
+  handlers: ServerHandlers,
+  preferredPort: number
+): Promise<{ info: ServerInfo; stablePort: boolean }> {
+  try {
+    return {
+      info: await startServer(handlers, preferredPort),
+      stablePort: true,
+    }
+  } catch {
+    return { info: await startServer(handlers, 0), stablePort: false }
+  }
+}

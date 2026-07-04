@@ -97,6 +97,7 @@ Build Options:
   -t, --timeout <ms>      Timeout for npm commands (default: 600000)
   --no-timeout            Disable timeout for npm commands
   --no-install            Skip npm install
+  --cache                 Cache node_modules in OPFS; skip install when the lockfile is unchanged
   --verbose               Show detailed logs
 
 Dev Options:
@@ -104,17 +105,34 @@ Dev Options:
   --open                  Open browser automatically
 
 Install Options:
-  --cache                 Use cached node_modules
+  --cache                 Cache node_modules in OPFS; skip install when the lockfile is unchanged
 ```
+
+## node_modules cache (`--cache`)
+
+`npm install` runs every time and is the slowest step. With `--cache`, the
+first run snapshots `node_modules` into the browser's Origin Private File System
+(OPFS), keyed by a hash of the lockfile (`package-lock.json` → `pnpm-lock.yaml`
+→ `yarn.lock` → `package.json`). Later runs restore the snapshot and skip
+install entirely; changing the lockfile invalidates the cache automatically.
+
+Measured on a sample Vite app: cold ~17.5s → warm ~2.7s (install skipped).
+
+To keep OPFS across runs, the cache mode pins the runner to a fixed port
+(`5199`, so the origin is stable) and uses a persistent Chrome profile under
+`~/.cache/wc-exe/`. Your project directory is never written to; the cache lives
+as an opaque blob inside that profile.
 
 ## Environment Variables
 
-| Variable      | Description                               |
-| ------------- | ----------------------------------------- |
-| `CHROME_PATH` | Custom path to Chrome/Chromium executable |
+| Variable            | Description                                                    |
+| ------------------- | -------------------------------------------------------------- |
+| `CHROME_PATH`       | Custom path to Chrome/Chromium executable                      |
+| `WC_EXE_CACHE_DIR`  | Override the cache directory (default: `~/.cache/wc-exe`)      |
+| `WC_EXE_CACHE_PORT` | Override the fixed runner port for `--cache` (default: `5199`) |
 
 Example:
 
 ```bash
-CHROME_PATH=/usr/bin/chromium wc-exe build
+CHROME_PATH=/usr/bin/chromium wc-exe build --cache
 ```

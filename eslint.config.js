@@ -23,6 +23,6 @@ export default tseslint.config(
     },
   },
   {
-    ignores: ['dist/', 'node_modules/', 'runner/'],
+    ignores: ['**/dist/', '**/node_modules/'],
   }
 )

@@ -7,7 +7,9 @@ const program = new Command()
 
 program
   .name('wc-exe')
-  .description('WebContainer Executor - Headless build tool for frontend projects')
+  .description(
+    'WebContainer Executor - Headless build tool for frontend projects'
+  )
   .version('0.1.1')
 
 program
@@ -19,6 +21,10 @@ program
   .option('-t, --timeout <ms>', 'Timeout for npm commands (ms)', '600000')
   .option('--no-timeout', 'Disable timeout for npm commands')
   .option('--no-install', 'Skip npm install')
+  .option(
+    '--cache',
+    'Cache node_modules in OPFS and reuse when the lockfile is unchanged'
+  )
   .option('--verbose', 'Show detailed logs')
   .action(async (options) => {
     try {
@@ -29,6 +35,7 @@ program
         timeout:
           options.timeout === false ? undefined : parseInt(options.timeout, 10),
         noInstall: !options.install,
+        cache: options.cache,
         verbose: options.verbose,
       })
     } catch (error) {
