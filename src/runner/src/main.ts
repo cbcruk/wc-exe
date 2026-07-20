@@ -142,7 +142,15 @@ async function runCommand(cmd: string, args: string[]): Promise<number> {
   return exitCode
 }
 
-type CacheResult = { cached: boolean; key: string; bytes?: number }
+type CacheResult = {
+  cached: boolean
+  key: string
+  bytes?: number
+  // Tarball-level cache (npm's own content-addressed cacache) stats, present
+  // on a node_modules MISS when the tarball cache participated.
+  npmCacheRestored?: boolean
+  npmCacheBytes?: number
+}
 
 const LOCK_FILES = [
   'package-lock.json',
@@ -150,6 +158,20 @@ const LOCK_FILES = [
   'yarn.lock',
   'package.json',
 ]
+
+// The npm tarball cache (cacache) lives at a fixed path inside the runtime so
+// we can snapshot it to OPFS and restore it before an install. Unlike the
+// node_modules snapshot (keyed by lockfile hash), this is a SINGLE global blob
+// that accumulates tarballs across lockfile versions — so when the lockfile
+// changes, only the newly-added packages hit the network; everything unchanged
+// replays from cache. This is the WebContainer-real-npm equivalent of burrow's
+// offline lockfile replay (see docs/virtual-filesystem.md §8).
+// Project-root relative, NOT absolute: the runtime's filesystem root is not
+// writable (npm fails with EACCES on mkdir /.npm-cache), and mount points are
+// resolved against the project root anyway — so the same relative path works
+// for the mount point, the `npm --cache` flag, and the export.
+const NPM_CACHE_DIR = '.npm-cache'
+const NPM_CACHE_OPFS = 'npm-cacache.bin' // single global OPFS blob
 
 async function sha256Hex(data: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', data as BufferSource)
@@ -177,8 +199,132 @@ async function opfsRoot(): Promise<FileSystemDirectoryHandle> {
   return navigator.storage.getDirectory()
 }
 
+// --- cache eviction -------------------------------------------------------
+// Both caches grow without bound: a new nm-<key>.bin appears for every distinct
+// lockfile (~21 MB each, so this multiplies), and the single cacache blob keeps
+// accumulating tarballs (~69 MB for one small app). Snapshots get a proper LRU
+// byte budget; the cacache gets a hard cap and is simply dropped when it exceeds
+// it, since it is fully regenerable and only costs one online install to reseed.
+const MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024
+const MAX_CACACHE_BYTES = 256 * 1024 * 1024
+const CACHE_INDEX = 'cache-index.json'
+const SNAPSHOT_PREFIX = 'nm-'
+
+// OPFS exposes no usable access time, so last-used is tracked here.
+type CacheIndex = Record<string, { lastUsed: number }>
+
+// `entries()` is present on OPFS directory handles but missing from the DOM lib
+// types in this TS version.
+type DirWithEntries = FileSystemDirectoryHandle & {
+  entries(): AsyncIterableIterator<[string, FileSystemHandle]>
+}
+
+async function readCacheIndex(): Promise<CacheIndex> {
+  const root = await opfsRoot()
+  try {
+    const handle = await root.getFileHandle(CACHE_INDEX)
+    return JSON.parse(await (await handle.getFile()).text()) as CacheIndex
+  } catch {
+    return {}
+  }
+}
+
+async function writeCacheIndex(index: CacheIndex): Promise<void> {
+  const root = await opfsRoot()
+  const handle = await root.getFileHandle(CACHE_INDEX, { create: true })
+  const writable = await handle.createWritable()
+  await writable.write(JSON.stringify(index))
+  await writable.close()
+}
+
+async function touchCacheEntry(name: string): Promise<void> {
+  const index = await readCacheIndex()
+  index[name] = { lastUsed: Date.now() }
+  await writeCacheIndex(index)
+}
+
+async function listCacheBlobs(): Promise<{ name: string; size: number }[]> {
+  const root = (await opfsRoot()) as DirWithEntries
+  const blobs: { name: string; size: number }[] = []
+
+  for await (const [name, handle] of root.entries()) {
+    if (handle.kind !== 'file') continue
+    if (name !== NPM_CACHE_OPFS && !name.startsWith(SNAPSHOT_PREFIX)) continue
+    const file = await (handle as FileSystemFileHandle).getFile()
+    blobs.push({ name, size: file.size })
+  }
+
+  return blobs
+}
+
+// Enforce both budgets. `protect` is the entry written by the current run — it
+// must survive eviction even if it is the least-recently-used one.
+async function evictCache(protect: string): Promise<void> {
+  const root = await opfsRoot()
+  const blobs = await listCacheBlobs()
+  const index = await readCacheIndex()
+
+  const cacache = blobs.find((b) => b.name === NPM_CACHE_OPFS)
+  if (cacache && cacache.size > MAX_CACACHE_BYTES) {
+    await root.removeEntry(NPM_CACHE_OPFS)
+    delete index[NPM_CACHE_OPFS]
+    console.log(
+      `[wc-build] tarball cache ${(cacache.size / 1048576).toFixed(0)} MB over ` +
+        `${MAX_CACACHE_BYTES / 1048576} MB cap — dropped (reseeds next install)`
+    )
+  }
+
+  const snapshots = blobs
+    .filter((b) => b.name.startsWith(SNAPSHOT_PREFIX))
+    .map((b) => ({ ...b, lastUsed: index[b.name]?.lastUsed ?? 0 }))
+    .sort((a, b) => a.lastUsed - b.lastUsed)
+
+  let total = snapshots.reduce((sum, b) => sum + b.size, 0)
+
+  for (const snapshot of snapshots) {
+    if (total <= MAX_SNAPSHOT_BYTES) break
+    if (snapshot.name === protect) continue
+
+    await root.removeEntry(snapshot.name)
+    delete index[snapshot.name]
+    total -= snapshot.size
+    console.log(
+      `[wc-build] evicted LRU snapshot ${snapshot.name} ` +
+        `(${(snapshot.size / 1048576).toFixed(1)} MB)`
+    )
+  }
+
+  // drop index entries whose blob no longer exists
+  const present = new Set(blobs.map((b) => b.name))
+  for (const name of Object.keys(index)) {
+    if (!present.has(name) && name !== protect) delete index[name]
+  }
+
+  await writeCacheIndex(index)
+}
+
+// Mounting a snapshot requires the mount point to already exist — otherwise the
+// runtime logs "invalid mount point" and resolves anyway, silently leaving the
+// directory empty. Create it first, then verify the restore actually produced
+// files so a failed mount reports as a MISS instead of a broken HIT.
+async function restoreSnapshotInto(
+  rt: Runtime & SnapshotProvider,
+  snapshot: Uint8Array,
+  dir: string
+): Promise<boolean> {
+  await rt.mkdir(dir, { recursive: true })
+  await rt.importSnapshot(snapshot, dir)
+
+  try {
+    const entries = await rt.readdir(dir)
+    return entries.length > 0
+  } catch {
+    return false
+  }
+}
+
 async function restoreNodeModules(
-  provider: SnapshotProvider,
+  rt: Runtime & SnapshotProvider,
   key: string
 ): Promise<boolean> {
   const root = await opfsRoot()
@@ -191,9 +337,11 @@ async function restoreNodeModules(
 
   const file = await handle.getFile()
   const snapshot = new Uint8Array(await file.arrayBuffer())
-  await provider.importSnapshot(snapshot, 'node_modules')
 
-  return true
+  const restored = await restoreSnapshotInto(rt, snapshot, 'node_modules')
+  if (restored) await touchCacheEntry(`nm-${key}.bin`)
+
+  return restored
 }
 
 async function saveNodeModules(
@@ -207,6 +355,43 @@ async function saveNodeModules(
   const writable = await handle.createWritable()
   await writable.write(snapshot as FileSystemWriteChunkType)
   await writable.close()
+  await touchCacheEntry(`nm-${key}.bin`)
+
+  return snapshot.byteLength
+}
+
+// Restore the global npm tarball cache (cacache) from OPFS into the runtime, so
+// the upcoming install can replay unchanged packages offline. Best-effort:
+// returns false (and installs online) if there is no cache yet.
+async function restoreNpmCache(
+  rt: Runtime & SnapshotProvider
+): Promise<boolean> {
+  const root = await opfsRoot()
+  let handle: FileSystemFileHandle
+  try {
+    handle = await root.getFileHandle(NPM_CACHE_OPFS)
+  } catch {
+    return false
+  }
+
+  const file = await handle.getFile()
+  const snapshot = new Uint8Array(await file.arrayBuffer())
+
+  return restoreSnapshotInto(rt, snapshot, NPM_CACHE_DIR)
+}
+
+// Persist the (now-updated) npm tarball cache back to OPFS as a single global
+// blob. Grows over time as new packages are seen; that's the storage cost of
+// offline replay.
+async function saveNpmCache(provider: SnapshotProvider): Promise<number> {
+  const snapshot = await provider.exportDir(NPM_CACHE_DIR)
+
+  const root = await opfsRoot()
+  const handle = await root.getFileHandle(NPM_CACHE_OPFS, { create: true })
+  const writable = await handle.createWritable()
+  await writable.write(snapshot as FileSystemWriteChunkType)
+  await writable.close()
+  await touchCacheEntry(NPM_CACHE_OPFS)
 
   return snapshot.byteLength
 }
@@ -236,7 +421,21 @@ async function installWithCache(): Promise<CacheResult> {
 
   console.log(`[wc-build] node_modules cache MISS (${key.slice(0, 12)})`)
 
-  const code = await runCommand('npm', ['install'])
+  // Even on a full node_modules miss, prime npm's own content-addressed tarball
+  // cache from OPFS so only packages new to *this* lockfile hit the network.
+  const npmCacheRestored = await restoreNpmCache(runtime)
+  console.log(
+    npmCacheRestored
+      ? '[wc-build] npm tarball cache restored; installing --prefer-offline'
+      : '[wc-build] no npm tarball cache yet; installing online (will seed it)'
+  )
+
+  const code = await runCommand('npm', [
+    'install',
+    '--prefer-offline',
+    '--cache',
+    NPM_CACHE_DIR,
+  ])
   if (code !== 0) {
     throw new Error(`npm install failed with exit code ${code}`)
   }
@@ -246,7 +445,14 @@ async function installWithCache(): Promise<CacheResult> {
     `[wc-build] Cached node_modules snapshot: ${(bytes / 1048576).toFixed(1)} MB`
   )
 
-  return { cached: false, key, bytes }
+  const npmCacheBytes = await saveNpmCache(runtime)
+  console.log(
+    `[wc-build] Updated npm tarball cache: ${(npmCacheBytes / 1048576).toFixed(1)} MB`
+  )
+
+  await evictCache(`nm-${key}.bin`)
+
+  return { cached: false, key, bytes, npmCacheRestored, npmCacheBytes }
 }
 
 function spawnCommand(cmd: string, args: string[]): void {

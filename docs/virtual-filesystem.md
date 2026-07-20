@@ -102,10 +102,46 @@
 지금 가장 큰 불편은 매 실행마다 `npm install`을 처음부터 하는 것. `node_modules`를 **OPFS에 스냅샷**해두고 재사용한다. `--cache` 플래그(`build`/`install`)로 켠다.
 
 - 동작: lockfile(`package-lock.json`→…→`package.json`) 해시를 키로, WebContainer의 `export('node_modules','binary')` 스냅샷을 OPFS에 저장. 다음 실행에서 키가 같으면 `mount(snapshot,{mountPoint:'node_modules'})`로 복원하고 **`npm install`을 통째로 건너뛴다.**
-- **실측(sample-vite-app, macOS)**: cold(캐시 없음) 17.5s → **warm(캐시 히트) 2.7s** (~6.5×, install 전체 스킵). lockfile 변경 시 키가 바뀌어 자동 무효화(재설치·재캐시) 확인.
+- **실측(sample-vite-app, macOS)**: cold(캐시 없음) install 11.7s → **warm(캐시 히트) install 0.3s** (install 전체 스킵). lockfile 변경 시 키가 바뀌어 자동 무효화(재설치·재캐시) 확인.
+- ⚠️ **HIT 경로에 잠복 버그가 있었고 실측 중 발견·수정했다**: `mount(snapshot,{mountPoint})`는 **마운트 지점이 미리 존재해야** 한다. 없으면 런타임이 `[FS] invalid mount point`를 **로그만 찍고 resolve**해버려서, `restoreNodeModules`가 빈 디렉터리를 두고 `true`(=HIT)를 반환했다. 결과적으로 install은 건너뛰지만 `node_modules`가 비어 `npm run build`가 `vite: command not found`(exit 127)로 죽는다. 수정: 마운트 전에 `mkdir(recursive)`, 그리고 **복원 후 `readdir`로 실제 내용물을 검증**해 실패를 HIT이 아닌 MISS로 강등. (`Runtime` 인터페이스에 `mkdir` 추가)
 - 제약(정직하게): OPFS는 **origin 스코프**라 러너 포트를 고정(`5199`)해야 하고, 브라우저 프로파일이 유지돼야 해 **puppeteer userDataDir를 영속 디렉터리**(`~/.cache/wc-exe/chrome-profile`)로 둔다. 즉 "호스트 디스크에 아무것도 안 쓴다"가 완벽히 지켜지는 건 아니고, **프로젝트 dir엔 여전히 아무것도 안 쓰되** node_modules는 크롬 프로파일 안 불투명 blob(대용량 순차 쓰기, 수만 개 소파일 아님)으로만 남는다. 백신 I/O 관점에선 여전히 큰 이득.
 - **WebContainer는 그대로 두고 그 아래 저장 계층만 우리가 소유** — 이 문서의 핵심 전략을 최소 비용으로 실현.
-- 같은 문제를 푼 독립 참조 구현: burrow의 `src/vfs`(IndexedDB debounced 스냅샷) + `src/npm`(락파일 기반 오프라인 install 재생, §8). 캐시를 고도화할 때(부분 무효화, 레지스트리 타르볼 레벨 캐시) 참고할 것.
+- 참조: burrow의 `src/vfs`(IndexedDB debounced 스냅샷, `snapshot.ts`/`persistence.ts`)가 같은 "추출된 트리를 통째 영속화" 발상. 단 burrow는 **타르볼 캐시가 없다**(§8, 아래 단기+에서 정정).
+
+**단기+ — 타르볼 레벨 캐시로 부분 무효화 (계층 A 심화)** ✅ **구현됨**
+위 스냅샷 캐시는 **all-or-nothing**이다: lockfile이 한 글자만 바뀌어도 키가 달라져 MISS → 전체 재설치. 큰 프로젝트에서 의존성 하나 bump할 때마다 install 전체를 다시 내려받는 게 아깝다. 그래서 **npm 자신의 content-addressed 캐시(cacache)를 OPFS에 스냅샷**해, MISS에서도 **바뀐 패키지만 네트워크로** 가져오게 했다.
+
+- 동작(runner `installWithCache`, MISS 경로): 전역 OPFS blob `npm-cacache.bin`을 `.npm-cache`로 복원 → `npm install --prefer-offline --cache .npm-cache` (변경 없는 타르볼은 cacache에서 재생, 새/변경분만 다운로드) → node_modules 스냅샷(lockfile 키)과 **갱신된 cacache blob(전역, 키 없음)**을 함께 저장.
+- 경로는 **프로젝트 루트 상대**여야 한다. 런타임 파일시스템 **루트(`/`)는 쓰기 불가**라 절대경로 `/.npm-cache`를 쓰면 npm이 `EACCES: mkdir /.npm-cache/_cacache/tmp`로 죽는다(실측 중 발견). 마운트 지점도 프로젝트 루트 기준으로 해석되므로 상대 경로 하나로 mount·`--cache`·export를 모두 맞춘다.
+- **캐시 축이 둘로 갈린다**: node_modules 스냅샷은 lockfile별(정확한 결과 복원용), 타르볼 cacache는 **전역 누적**(lockfile 버전 간 공유). 이 분리가 "부분 무효화"의 핵심 — lockfile이 바뀌어도 타르볼 캐시는 살아남는다.
+- burrow 대비: burrow는 락파일을 synthetic packument로 바꿔 **메타데이터(packument) fetch만** 스킵하고 타르볼은 매번 재다운로드한다(에이전트 확인). wc-exe는 npm의 cacache가 이미 **integrity 해시로 키잉된 타르볼+메타 캐시**라, 그걸 스냅샷하는 것만으로 burrow가 못 채운 갭(타르볼 재사용)까지 공짜로 얻는다. "진짜 npm 유지" 제약이 오히려 유리하게 작용한 케이스.
+
+### 실측 결과 (2026-07, macOS, sample-vite-app, `bench/cache-scenarios.mjs`)
+
+대조 실험으로 잰다. C와 D는 **완전히 같은 작업**(의존성 하나 추가된 프로젝트를 설치)이고 차이는 타르볼 캐시 유무뿐이다.
+
+| 시나리오                              | install   | 상태                        |
+| ------------------------------------- | --------- | --------------------------- |
+| A cold-base (캐시 없음)               | 11.66s    | snapshot MISS, cacache 시딩 |
+| B warm-base (lockfile 동일)           | **0.30s** | snapshot HIT (install 스킵) |
+| C warm-changed (dep 하나 추가)        | **5.74s** | snapshot MISS + tarball HIT |
+| D cold-changed (동일 작업, 캐시 없음) | 11.35s    | snapshot MISS               |
+
+**결론: 타르볼 캐시가 실제로 동작한다 — C vs D에서 11.35s → 5.74s (1.98×, 5.6s 절약).** lockfile이 바뀌어 스냅샷이 무효화돼도 install 비용이 절반으로 줄었다.
+
+- 저장 비용 — cacache blob이 이 작은 vite 앱 하나에 **69MB**로 node_modules 스냅샷(21MB)의 **3.3배**다. 게다가 `nm-<key>.bin`은 **lockfile마다 하나씩 새로 생겨** 곱으로 늘어난다. → 아래 축출로 상한을 걸었다.
+- 정직한 한계 2 — 2× 는 좋지만 **B의 0.3s에는 한참 못 미친다**. 타르볼 캐시는 네트워크만 없애고 npm의 해석·node_modules 재구성은 그대로 하기 때문. lockfile이 거의 안 바뀌는 프로젝트라면 이득이 드물게만 발생한다.
+- `--prefer-offline`이라 캐시에 없으면 조용히 네트워크로 degrade(견고).
+- 재현: `node bench/cache-scenarios.mjs` (격리된 임시 캐시 디렉터리·프로파일 사용, 실제 `~/.cache/wc-exe`는 건드리지 않음).
+
+### 캐시 축출 (용량 상한) ✅ **구현됨**
+
+두 캐시 모두 무한 증가하므로 성격에 맞게 다르게 상한을 건다.
+
+- **`nm-*.bin` 스냅샷 → LRU 바이트 예산** (`MAX_SNAPSHOT_BYTES`, 기본 512MB). lockfile마다 새 blob이 생겨 곱으로 늘어나는 쪽이라 제대로 된 LRU가 필요하다. OPFS엔 쓸만한 access time이 없어 `cache-index.json`에 `lastUsed`를 직접 기록하고, 오래된 것부터 예산 이하가 될 때까지 삭제한다. **이번 실행이 쓴 항목은 축출에서 보호**된다.
+- **cacache blob → 하드 캡 후 드롭** (`MAX_CACACHE_BYTES`, 기본 256MB). 단일 blob이라 LRU 개념이 없고, 전부 **재생성 가능**하므로 상한을 넘으면 그냥 지운다. 대가는 다음 install 한 번이 온라인이 되는 것뿐.
+- 인덱스는 실제 OPFS 목록을 기준으로 정리해 파일이 사라져도 드리프트하지 않는다.
+- **검증**: 상한을 임시로 25MB/50MB로 낮춰 lockfile 3종을 연속 실행 → cacache는 매번 `69 MB over 50 MB cap — dropped` 후 재시딩(`tarballHit=false`), 스냅샷은 매번 직전 것이 `evicted LRU snapshot ...(20.2 MB)`로 축출되고 최신 것만 남아 OPFS가 예산을 넘지 않음을 확인. 운영값 복귀 후 벤치 재실행에서 회귀 없음(C vs D 2.32×).
 
 **중기 — 자체 VFS 추상화로 결합도 낮추기** ✅ **구현됨**
 `src/runner`가 WebContainer API에 직접 묶여 있던 것을 백엔드 중립 인터페이스 뒤로 격리했다:
