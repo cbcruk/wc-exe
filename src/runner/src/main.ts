@@ -142,7 +142,15 @@ async function runCommand(cmd: string, args: string[]): Promise<number> {
   return exitCode
 }
 
-type CacheResult = { cached: boolean; key: string; bytes?: number }
+type CacheResult = {
+  cached: boolean
+  key: string
+  bytes?: number
+  // Tarball-level cache (npm's own content-addressed cacache) stats, present
+  // on a node_modules MISS when the tarball cache participated.
+  npmCacheRestored?: boolean
+  npmCacheBytes?: number
+}
 
 const LOCK_FILES = [
   'package-lock.json',
@@ -150,6 +158,17 @@ const LOCK_FILES = [
   'yarn.lock',
   'package.json',
 ]
+
+// The npm tarball cache (cacache) lives at a fixed path inside the runtime so
+// we can snapshot it to OPFS and restore it before an install. Unlike the
+// node_modules snapshot (keyed by lockfile hash), this is a SINGLE global blob
+// that accumulates tarballs across lockfile versions — so when the lockfile
+// changes, only the newly-added packages hit the network; everything unchanged
+// replays from cache. This is the WebContainer-real-npm equivalent of burrow's
+// offline lockfile replay (see docs/virtual-filesystem.md §8).
+const NPM_CACHE_MOUNT = '.npm-cache' // mount point (root-relative)
+const NPM_CACHE_DIR = '/.npm-cache' // absolute path passed to `npm --cache`
+const NPM_CACHE_OPFS = 'npm-cacache.bin' // single global OPFS blob
 
 async function sha256Hex(data: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', data as BufferSource)
@@ -211,6 +230,40 @@ async function saveNodeModules(
   return snapshot.byteLength
 }
 
+// Restore the global npm tarball cache (cacache) from OPFS into the runtime, so
+// the upcoming install can replay unchanged packages offline. Best-effort:
+// returns false (and installs online) if there is no cache yet.
+async function restoreNpmCache(provider: SnapshotProvider): Promise<boolean> {
+  const root = await opfsRoot()
+  let handle: FileSystemFileHandle
+  try {
+    handle = await root.getFileHandle(NPM_CACHE_OPFS)
+  } catch {
+    return false
+  }
+
+  const file = await handle.getFile()
+  const snapshot = new Uint8Array(await file.arrayBuffer())
+  await provider.importSnapshot(snapshot, NPM_CACHE_MOUNT)
+
+  return true
+}
+
+// Persist the (now-updated) npm tarball cache back to OPFS as a single global
+// blob. Grows over time as new packages are seen; that's the storage cost of
+// offline replay.
+async function saveNpmCache(provider: SnapshotProvider): Promise<number> {
+  const snapshot = await provider.exportDir(NPM_CACHE_MOUNT)
+
+  const root = await opfsRoot()
+  const handle = await root.getFileHandle(NPM_CACHE_OPFS, { create: true })
+  const writable = await handle.createWritable()
+  await writable.write(snapshot as FileSystemWriteChunkType)
+  await writable.close()
+
+  return snapshot.byteLength
+}
+
 async function installWithCache(): Promise<CacheResult> {
   invariant(runtime, 'Runtime not booted')
 
@@ -236,7 +289,21 @@ async function installWithCache(): Promise<CacheResult> {
 
   console.log(`[wc-build] node_modules cache MISS (${key.slice(0, 12)})`)
 
-  const code = await runCommand('npm', ['install'])
+  // Even on a full node_modules miss, prime npm's own content-addressed tarball
+  // cache from OPFS so only packages new to *this* lockfile hit the network.
+  const npmCacheRestored = await restoreNpmCache(runtime)
+  console.log(
+    npmCacheRestored
+      ? '[wc-build] npm tarball cache restored; installing --prefer-offline'
+      : '[wc-build] no npm tarball cache yet; installing online (will seed it)'
+  )
+
+  const code = await runCommand('npm', [
+    'install',
+    '--prefer-offline',
+    '--cache',
+    NPM_CACHE_DIR,
+  ])
   if (code !== 0) {
     throw new Error(`npm install failed with exit code ${code}`)
   }
@@ -246,7 +313,12 @@ async function installWithCache(): Promise<CacheResult> {
     `[wc-build] Cached node_modules snapshot: ${(bytes / 1048576).toFixed(1)} MB`
   )
 
-  return { cached: false, key, bytes }
+  const npmCacheBytes = await saveNpmCache(runtime)
+  console.log(
+    `[wc-build] Updated npm tarball cache: ${(npmCacheBytes / 1048576).toFixed(1)} MB`
+  )
+
+  return { cached: false, key, bytes, npmCacheRestored, npmCacheBytes }
 }
 
 function spawnCommand(cmd: string, args: string[]): void {

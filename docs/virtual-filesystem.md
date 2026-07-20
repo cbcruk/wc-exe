@@ -105,7 +105,16 @@
 - **실측(sample-vite-app, macOS)**: cold(캐시 없음) 17.5s → **warm(캐시 히트) 2.7s** (~6.5×, install 전체 스킵). lockfile 변경 시 키가 바뀌어 자동 무효화(재설치·재캐시) 확인.
 - 제약(정직하게): OPFS는 **origin 스코프**라 러너 포트를 고정(`5199`)해야 하고, 브라우저 프로파일이 유지돼야 해 **puppeteer userDataDir를 영속 디렉터리**(`~/.cache/wc-exe/chrome-profile`)로 둔다. 즉 "호스트 디스크에 아무것도 안 쓴다"가 완벽히 지켜지는 건 아니고, **프로젝트 dir엔 여전히 아무것도 안 쓰되** node_modules는 크롬 프로파일 안 불투명 blob(대용량 순차 쓰기, 수만 개 소파일 아님)으로만 남는다. 백신 I/O 관점에선 여전히 큰 이득.
 - **WebContainer는 그대로 두고 그 아래 저장 계층만 우리가 소유** — 이 문서의 핵심 전략을 최소 비용으로 실현.
-- 같은 문제를 푼 독립 참조 구현: burrow의 `src/vfs`(IndexedDB debounced 스냅샷) + `src/npm`(락파일 기반 오프라인 install 재생, §8). 캐시를 고도화할 때(부분 무효화, 레지스트리 타르볼 레벨 캐시) 참고할 것.
+- 참조: burrow의 `src/vfs`(IndexedDB debounced 스냅샷, `snapshot.ts`/`persistence.ts`)가 같은 "추출된 트리를 통째 영속화" 발상. 단 burrow는 **타르볼 캐시가 없다**(§8, 아래 단기+에서 정정).
+
+**단기+ — 타르볼 레벨 캐시로 부분 무효화 (계층 A 심화)** ✅ **구현됨**
+위 스냅샷 캐시는 **all-or-nothing**이다: lockfile이 한 글자만 바뀌어도 키가 달라져 MISS → 전체 재설치. 큰 프로젝트에서 의존성 하나 bump할 때마다 install 전체를 다시 내려받는 게 아깝다. 그래서 **npm 자신의 content-addressed 캐시(cacache)를 OPFS에 스냅샷**해, MISS에서도 **바뀐 패키지만 네트워크로** 가져오게 했다.
+
+- 동작(runner `installWithCache`, MISS 경로): 전역 OPFS blob `npm-cacache.bin`을 `/.npm-cache`로 복원 → `npm install --prefer-offline --cache /.npm-cache` (변경 없는 타르볼은 cacache에서 재생, 새/변경분만 다운로드) → node_modules 스냅샷(lockfile 키)과 **갱신된 cacache blob(전역, 키 없음)**을 함께 저장.
+- **캐시 축이 둘로 갈린다**: node_modules 스냅샷은 lockfile별(정확한 결과 복원용), 타르볼 cacache는 **전역 누적**(lockfile 버전 간 공유). 이 분리가 "부분 무효화"의 핵심 — lockfile이 바뀌어도 타르볼 캐시는 살아남는다.
+- burrow 대비: burrow는 락파일을 synthetic packument로 바꿔 **메타데이터(packument) fetch만** 스킵하고 타르볼은 매번 재다운로드한다(에이전트 확인). wc-exe는 npm의 cacache가 이미 **integrity 해시로 키잉된 타르볼+메타 캐시**라, 그걸 스냅샷하는 것만으로 burrow가 못 채운 갭(타르볼 재사용)까지 공짜로 얻는다. "진짜 npm 유지" 제약이 오히려 유리하게 작용한 케이스.
+- 정직한 한계: cacache blob은 본 적 있는 타르볼을 계속 쌓아 **무한 증가**한다(오프라인성의 저장 비용). 추후 LRU/용량 상한이 필요. `--prefer-offline`이라 캐시에 없으면 조용히 네트워크로 degrade(견고).
+- 측정 레시피(로컬, WebContainer 부팅 필요 — 샌드박스 불가): (1) `wc-exe build --cache` cold → 두 캐시 시딩, (2) `package.json`에서 의존성 하나 bump, (3) `wc-exe build --cache` 재실행 → node_modules는 MISS지만 **install 시간이 cold보다 크게 짧아야** 정상(변경분만 네트워크). 러너 콘솔의 `npm tarball cache restored` / `Updated npm tarball cache: N MB` 로그로 캐시 참여 확인.
 
 **중기 — 자체 VFS 추상화로 결합도 낮추기** ✅ **구현됨**
 `src/runner`가 WebContainer API에 직접 묶여 있던 것을 백엔드 중립 인터페이스 뒤로 격리했다:
