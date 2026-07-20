@@ -166,8 +166,11 @@ const LOCK_FILES = [
 // changes, only the newly-added packages hit the network; everything unchanged
 // replays from cache. This is the WebContainer-real-npm equivalent of burrow's
 // offline lockfile replay (see docs/virtual-filesystem.md §8).
-const NPM_CACHE_MOUNT = '.npm-cache' // mount point (root-relative)
-const NPM_CACHE_DIR = '/.npm-cache' // absolute path passed to `npm --cache`
+// Project-root relative, NOT absolute: the runtime's filesystem root is not
+// writable (npm fails with EACCES on mkdir /.npm-cache), and mount points are
+// resolved against the project root anyway — so the same relative path works
+// for the mount point, the `npm --cache` flag, and the export.
+const NPM_CACHE_DIR = '.npm-cache'
 const NPM_CACHE_OPFS = 'npm-cacache.bin' // single global OPFS blob
 
 async function sha256Hex(data: Uint8Array): Promise<string> {
@@ -196,8 +199,28 @@ async function opfsRoot(): Promise<FileSystemDirectoryHandle> {
   return navigator.storage.getDirectory()
 }
 
+// Mounting a snapshot requires the mount point to already exist — otherwise the
+// runtime logs "invalid mount point" and resolves anyway, silently leaving the
+// directory empty. Create it first, then verify the restore actually produced
+// files so a failed mount reports as a MISS instead of a broken HIT.
+async function restoreSnapshotInto(
+  rt: Runtime & SnapshotProvider,
+  snapshot: Uint8Array,
+  dir: string
+): Promise<boolean> {
+  await rt.mkdir(dir, { recursive: true })
+  await rt.importSnapshot(snapshot, dir)
+
+  try {
+    const entries = await rt.readdir(dir)
+    return entries.length > 0
+  } catch {
+    return false
+  }
+}
+
 async function restoreNodeModules(
-  provider: SnapshotProvider,
+  rt: Runtime & SnapshotProvider,
   key: string
 ): Promise<boolean> {
   const root = await opfsRoot()
@@ -210,9 +233,8 @@ async function restoreNodeModules(
 
   const file = await handle.getFile()
   const snapshot = new Uint8Array(await file.arrayBuffer())
-  await provider.importSnapshot(snapshot, 'node_modules')
 
-  return true
+  return restoreSnapshotInto(rt, snapshot, 'node_modules')
 }
 
 async function saveNodeModules(
@@ -233,7 +255,9 @@ async function saveNodeModules(
 // Restore the global npm tarball cache (cacache) from OPFS into the runtime, so
 // the upcoming install can replay unchanged packages offline. Best-effort:
 // returns false (and installs online) if there is no cache yet.
-async function restoreNpmCache(provider: SnapshotProvider): Promise<boolean> {
+async function restoreNpmCache(
+  rt: Runtime & SnapshotProvider
+): Promise<boolean> {
   const root = await opfsRoot()
   let handle: FileSystemFileHandle
   try {
@@ -244,16 +268,15 @@ async function restoreNpmCache(provider: SnapshotProvider): Promise<boolean> {
 
   const file = await handle.getFile()
   const snapshot = new Uint8Array(await file.arrayBuffer())
-  await provider.importSnapshot(snapshot, NPM_CACHE_MOUNT)
 
-  return true
+  return restoreSnapshotInto(rt, snapshot, NPM_CACHE_DIR)
 }
 
 // Persist the (now-updated) npm tarball cache back to OPFS as a single global
 // blob. Grows over time as new packages are seen; that's the storage cost of
 // offline replay.
 async function saveNpmCache(provider: SnapshotProvider): Promise<number> {
-  const snapshot = await provider.exportDir(NPM_CACHE_MOUNT)
+  const snapshot = await provider.exportDir(NPM_CACHE_DIR)
 
   const root = await opfsRoot()
   const handle = await root.getFileHandle(NPM_CACHE_OPFS, { create: true })

@@ -33,6 +33,7 @@ export interface Runtime {
   readFile(path: string): Promise<Uint8Array>
   writeFile(path: string, data: string | Uint8Array): Promise<void>
   readdir(path: string): Promise<RuntimeDirEnt[]>
+  mkdir(path: string, options?: { recursive?: boolean }): Promise<void>
   onServerReady(listener: (port: number, url: string) => void): void
 }
 

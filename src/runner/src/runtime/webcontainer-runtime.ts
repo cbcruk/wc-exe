@@ -42,6 +42,16 @@ export class WebContainerRuntime implements Runtime, SnapshotProvider {
     return this.wc.fs.readdir(path, { withFileTypes: true })
   }
 
+  async mkdir(path: string, options?: { recursive?: boolean }): Promise<void> {
+    // WebContainer splits recursive into a separate overload with a different
+    // return type, so the branch is required rather than passing options through.
+    if (options?.recursive) {
+      await this.wc.fs.mkdir(path, { recursive: true })
+    } else {
+      await this.wc.fs.mkdir(path)
+    }
+  }
+
   onServerReady(listener: (port: number, url: string) => void): void {
     this.wc.on('server-ready', listener)
   }
