@@ -84,12 +84,13 @@
 
 ## 4. wc-exe 관점 비교표
 
-| 접근                        | 범용 빌드           | 호스트 디스크 쓰기 | 무게        | 성숙도        | WebContainer 탈피 |
-| --------------------------- | ------------------- | ------------------ | ----------- | ------------- | ----------------- |
-| A. memfs/ZenFS              | ❌ 실행 불가        | 없음               | 매우 가벼움 | 높음          | 부분(캐시용)      |
-| B. WebContainer (현행)      | ✅                  | 없음               | 중간        | 높음          | —                 |
-| C. wasm 도구 + WASI fs      | △ 고정 파이프라인만 | 없음               | 가벼움      | 중간          | 부분              |
-| D. QEMU-wasm/container2wasm | ✅✅ (진짜 리눅스)  | 없음               | 무거움      | 실험적·발전중 | 완전              |
+| 접근                        | 범용 빌드            | 호스트 디스크 쓰기 | 무게        | 성숙도        | WebContainer 탈피  |
+| --------------------------- | -------------------- | ------------------ | ----------- | ------------- | ------------------ |
+| A. memfs/ZenFS              | ❌ 실행 불가         | 없음               | 매우 가벼움 | 높음          | 부분(캐시용)       |
+| B. WebContainer (현행)      | ✅                   | 없음               | 중간        | 높음          | —                  |
+| B'. burrow (§8)             | △ 자체 런타임 의미론 | 없음               | 중간        | 초기          | 완전(단, 범용성 ↓) |
+| C. wasm 도구 + WASI fs      | △ 고정 파이프라인만  | 없음               | 가벼움      | 중간          | 부분               |
+| D. QEMU-wasm/container2wasm | ✅✅ (진짜 리눅스)   | 없음               | 무거움      | 실험적·발전중 | 완전               |
 
 ---
 
@@ -104,9 +105,16 @@
 - **실측(sample-vite-app, macOS)**: cold(캐시 없음) 17.5s → **warm(캐시 히트) 2.7s** (~6.5×, install 전체 스킵). lockfile 변경 시 키가 바뀌어 자동 무효화(재설치·재캐시) 확인.
 - 제약(정직하게): OPFS는 **origin 스코프**라 러너 포트를 고정(`5199`)해야 하고, 브라우저 프로파일이 유지돼야 해 **puppeteer userDataDir를 영속 디렉터리**(`~/.cache/wc-exe/chrome-profile`)로 둔다. 즉 "호스트 디스크에 아무것도 안 쓴다"가 완벽히 지켜지는 건 아니고, **프로젝트 dir엔 여전히 아무것도 안 쓰되** node_modules는 크롬 프로파일 안 불투명 blob(대용량 순차 쓰기, 수만 개 소파일 아님)으로만 남는다. 백신 I/O 관점에선 여전히 큰 이득.
 - **WebContainer는 그대로 두고 그 아래 저장 계층만 우리가 소유** — 이 문서의 핵심 전략을 최소 비용으로 실현.
+- 같은 문제를 푼 독립 참조 구현: burrow의 `src/vfs`(IndexedDB debounced 스냅샷) + `src/npm`(락파일 기반 오프라인 install 재생, §8). 캐시를 고도화할 때(부분 무효화, 레지스트리 타르볼 레벨 캐시) 참고할 것.
 
-**중기 — 자체 VFS 추상화로 결합도 낮추기**
-`src/runner`가 지금은 WebContainer API에 직접 묶여 있다 (`webcontainer.mount`, `wc.fs.*`, `spawn`). 이걸 얇은 **VFS/Runtime 인터페이스**(`mount`, `readFile`, `writeFile`, `readdir`, `spawn`) 뒤로 숨겨두면, 나중에 백엔드를 WebContainer ↔ container2wasm ↔ 순수 wasm 도구로 교체하기 쉬워진다. 지금 하면 비용이 작고 나중에 자유도가 커진다.
+**중기 — 자체 VFS 추상화로 결합도 낮추기** ✅ **구현됨**
+`src/runner`가 WebContainer API에 직접 묶여 있던 것을 백엔드 중립 인터페이스 뒤로 격리했다:
+
+- `src/runner/src/runtime/runtime.types.ts` — `Runtime` 인터페이스(`boot`/`mount`/`spawn`/`readFile`/`writeFile`/`readdir`/`onServerReady`) + 선택적 `SnapshotProvider`(`exportDir`/`importSnapshot`)와 `isSnapshotCapable` 타입가드. 스냅샷은 WebContainer 고유(binary export)라 **필수가 아닌 능력**으로 분리 — 스냅샷 없는 백엔드는 캐시가 자동으로 평범한 install로 degrade.
+- `src/runner/src/runtime/webcontainer-runtime.ts` — `@webcontainer/api`를 참조하는 **유일한** 모듈(`WebContainerRuntime implements Runtime, SnapshotProvider`).
+- `main.ts` 오케스트레이션은 인터페이스만 바라봄. 백엔드 추가 = 이 인터페이스 구현 하나.
+
+burrow의 `src/contract`(타입드 서비스 레지스트리)가 같은 발상의 큰 규모 예시지만, 러너 규모엔 단일 인터페이스 파일이 맞는 고도다.
 
 **장기 — container2wasm PoC로 WebContainer 독립성 검증**
 독점 의존과 Node 환경 제약이 실제로 발목을 잡는 시점이 오면, container2wasm `--to-js`로 "node 이미지 + 샘플 vite 앱 빌드"를 브라우저에서 돌려 **실측**(부팅 시간, install 시간, build 시간)한다. 네트워킹은 기존 Hono 서버에 npm 레지스트리 WebSocket 프록시를 붙여 해결. 성능이 감당되면 진짜 리눅스라 범용성/네이티브 애드온 문제가 근본적으로 풀린다.
@@ -202,6 +210,43 @@ vscode-container-wasm은 브라우저 네트워킹을 "CORS 제한 + Forbidden h
 
 ---
 
+## 8. 참고 사례: burrow — "에뮬레이트하지 말고 주변만 가상화하라"
+
+[dhravya/burrow](https://github.com/dhravya/burrow) (MIT) — "브라우저 탭 안의 완전한 dev 머신". 진짜 Bun 트랜스파일러·git·셸·라이브 프리뷰·로컬 AI 에이전트를 전부 페이지 안에서 돌리는, **자칭 오픈소스 WebContainer 대안**이다.
+
+### 핵심 설계 결정
+
+Bun은 JavaScriptCore 위의 Zig라 wasm으로 통째 컴파일이 불가능하다. burrow의 답:
+
+> **CPU를 에뮬레이트하지 말고, 브라우저 자체 JS 엔진 위에서 JS를 돌리고 그 주변만 가상화한다.**
+
+- `bun.wasm` — Bun의 Rust 트랜스파일러만 wasm+WASI 심으로 (진짜 TS/JSX 의미론)
+- `src/vfs` — 인메모리 POSIX 트리, 에디터·셸·git·런타임이 공유, **debounced 스냅샷 → IndexedDB 영속**
+- `src/npm` — **from-scratch 브라우저 패키지 매니저**: 의존성 해석 → npm 타르볼 다운로드 → 자체 tarball 리더 → flat-hoisted `node_modules` 생성. `burrow-lock.json`으로 **오프라인 재생** 가능
+- Web Worker = 프로세스, 서비스워커 = 네트워킹 (`Bun.serve()`를 실제 fetch 가능 URL로, per-port 라우팅)
+- `src/contract` — 9개 모듈이 서로 직접 import하지 않고 **타입드 서비스 레지스트리**로만 통신
+
+이는 §2 스펙트럼에서 **B와 C 사이의 새 지점(B')**이다: container2wasm(D)의 CPU 병목을 아예 회피하면서(에뮬을 안 하니까) 오픈소스를 달성했다. 대가는 **범용성** — 진짜 Node/vite가 아니라 독자 런타임 의미론이고, README 스스로 "far less complete, TCP·native addon·일부 Bun API 갭"을 인정한다.
+
+### wc-exe 관점 판정
+
+- **엔진 통째 교체 후보 ❌** — wc-exe의 임무는 "임의 프로젝트를 `npm install && vite build`"인데, burrow는 vite build(esbuild/rollup 스폰, 플러그인, config 해석)를 그대로 못 돌린다.
+- **부품 광산 ✅✅** — 가치 순:
+  1. **`src/npm`** ⭐ — install 자체를 브라우저에서 재현 + 락파일 오프라인 재생. §5 단기(캐시)의 한 발 앞 형태. WebContainer의 npm install을 이 방식으로 대체/보완하면 CPU 에뮬 없이 install을 고속화할 수 있다.
+  2. **`src/vfs`** — §5 단기 "IndexedDB 스냅샷"의 동작하는 MIT 참조 구현. 디바운스 전략·락파일 연동을 그대로 참고.
+  3. **`src/contract`** — §5 중기 "인터페이스로 결합도 낮추기"의 실물 예시. 백엔드 교체(WebContainer ↔ container2wasm)를 위한 경계 설계 모델.
+  4. 서비스워커 네트워킹 — wc-exe는 진짜 로컬 Hono 서버가 있어 불필요. dev 프리뷰 프록시 설계 시 참고만.
+
+### 전략적 의미
+
+burrow의 존재는 "오픈 + 빠름"이 container2wasm(오픈 + 느림) 말고도 가능함을 보여주지만, 그 대가가 범용성임을 동시에 확인해준다. §7 실측(에뮬 35×)으로 container2wasm이 성능에서 탈락한 지금, burrow는 **"오픈으로 가는 유일한 현실적 경로가 B'식(에뮬 없는 주변 가상화)임"**을 보여주는 사례이기도 하다 — 다만 wc-exe가 그 길을 가려면 진짜 vite 의미론을 포기해야 하므로 여전히 엔진 후보는 아니다.
+
+wc-exe의 확정 결론: **실행 엔진은 WebContainer 유지(§7 판정), install/캐시 계층만 burrow식으로 흡수.** OPFS 캐시(§5 단기, 구현됨)를 고도화할 때 — 부분 무효화, 레지스트리 타르볼 레벨 캐시, 오프라인 락파일 재생 — burrow `src/npm`이 첫 참조다.
+
+---
+
+---
+
 ## 참고
 
 - [container2wasm](https://github.com/container2wasm/container2wasm) — 컨테이너 → wasm 변환기 (NTT, ktock)
@@ -209,6 +254,7 @@ vscode-container-wasm은 브라우저 네트워킹을 "CORS 제한 + Forbidden h
 - [qemu-wasm](https://github.com/ktock/qemu-wasm) / [브라우저 데모](https://ktock.github.io/qemu-wasm-demo/)
 - [container2wasm 데모](https://ktock.github.io/container2wasm-demo/)
 - ["Running QEMU Inside Browser" (FOSDEM 2025)](https://archive.fosdem.org/2025/events/attachments/fosdem-2025-6290-running-qemu-inside-browser/slides/238760/slides_1dDtpcS.pdf)
+- [burrow](https://github.com/dhravya/burrow) — 오픈소스(MIT) WebContainer 대안: 네이티브 JS 엔진 + 주변 가상화 (§8)
 - [ZenFS](https://github.com/zen-fs/core) (구 [BrowserFS](https://github.com/jvilk/BrowserFS)) — 플러그블 백엔드 VFS
 - [v86](https://github.com/copy/v86) — x86 브라우저 에뮬레이터
 - [OPFS 설명](https://renderlog.in/blog/origin-private-file-system-opfs/)
