@@ -129,10 +129,19 @@
 
 **결론: 타르볼 캐시가 실제로 동작한다 — C vs D에서 11.35s → 5.74s (1.98×, 5.6s 절약).** lockfile이 바뀌어 스냅샷이 무효화돼도 install 비용이 절반으로 줄었다.
 
-- 정직한 한계 1 — **저장 비용이 크다**: cacache blob이 이 작은 vite 앱 하나에 **69MB**로, node_modules 스냅샷(21MB)의 **3.3배**다. 본 적 있는 타르볼을 계속 쌓아 무한 증가하므로 **LRU/용량 상한이 사실상 필수**(후속 과제).
+- 저장 비용 — cacache blob이 이 작은 vite 앱 하나에 **69MB**로 node_modules 스냅샷(21MB)의 **3.3배**다. 게다가 `nm-<key>.bin`은 **lockfile마다 하나씩 새로 생겨** 곱으로 늘어난다. → 아래 축출로 상한을 걸었다.
 - 정직한 한계 2 — 2× 는 좋지만 **B의 0.3s에는 한참 못 미친다**. 타르볼 캐시는 네트워크만 없애고 npm의 해석·node_modules 재구성은 그대로 하기 때문. lockfile이 거의 안 바뀌는 프로젝트라면 이득이 드물게만 발생한다.
 - `--prefer-offline`이라 캐시에 없으면 조용히 네트워크로 degrade(견고).
 - 재현: `node bench/cache-scenarios.mjs` (격리된 임시 캐시 디렉터리·프로파일 사용, 실제 `~/.cache/wc-exe`는 건드리지 않음).
+
+### 캐시 축출 (용량 상한) ✅ **구현됨**
+
+두 캐시 모두 무한 증가하므로 성격에 맞게 다르게 상한을 건다.
+
+- **`nm-*.bin` 스냅샷 → LRU 바이트 예산** (`MAX_SNAPSHOT_BYTES`, 기본 512MB). lockfile마다 새 blob이 생겨 곱으로 늘어나는 쪽이라 제대로 된 LRU가 필요하다. OPFS엔 쓸만한 access time이 없어 `cache-index.json`에 `lastUsed`를 직접 기록하고, 오래된 것부터 예산 이하가 될 때까지 삭제한다. **이번 실행이 쓴 항목은 축출에서 보호**된다.
+- **cacache blob → 하드 캡 후 드롭** (`MAX_CACACHE_BYTES`, 기본 256MB). 단일 blob이라 LRU 개념이 없고, 전부 **재생성 가능**하므로 상한을 넘으면 그냥 지운다. 대가는 다음 install 한 번이 온라인이 되는 것뿐.
+- 인덱스는 실제 OPFS 목록을 기준으로 정리해 파일이 사라져도 드리프트하지 않는다.
+- **검증**: 상한을 임시로 25MB/50MB로 낮춰 lockfile 3종을 연속 실행 → cacache는 매번 `69 MB over 50 MB cap — dropped` 후 재시딩(`tarballHit=false`), 스냅샷은 매번 직전 것이 `evicted LRU snapshot ...(20.2 MB)`로 축출되고 최신 것만 남아 OPFS가 예산을 넘지 않음을 확인. 운영값 복귀 후 벤치 재실행에서 회귀 없음(C vs D 2.32×).
 
 **중기 — 자체 VFS 추상화로 결합도 낮추기** ✅ **구현됨**
 `src/runner`가 WebContainer API에 직접 묶여 있던 것을 백엔드 중립 인터페이스 뒤로 격리했다:

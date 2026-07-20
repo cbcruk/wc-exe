@@ -199,6 +199,110 @@ async function opfsRoot(): Promise<FileSystemDirectoryHandle> {
   return navigator.storage.getDirectory()
 }
 
+// --- cache eviction -------------------------------------------------------
+// Both caches grow without bound: a new nm-<key>.bin appears for every distinct
+// lockfile (~21 MB each, so this multiplies), and the single cacache blob keeps
+// accumulating tarballs (~69 MB for one small app). Snapshots get a proper LRU
+// byte budget; the cacache gets a hard cap and is simply dropped when it exceeds
+// it, since it is fully regenerable and only costs one online install to reseed.
+const MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024
+const MAX_CACACHE_BYTES = 256 * 1024 * 1024
+const CACHE_INDEX = 'cache-index.json'
+const SNAPSHOT_PREFIX = 'nm-'
+
+// OPFS exposes no usable access time, so last-used is tracked here.
+type CacheIndex = Record<string, { lastUsed: number }>
+
+// `entries()` is present on OPFS directory handles but missing from the DOM lib
+// types in this TS version.
+type DirWithEntries = FileSystemDirectoryHandle & {
+  entries(): AsyncIterableIterator<[string, FileSystemHandle]>
+}
+
+async function readCacheIndex(): Promise<CacheIndex> {
+  const root = await opfsRoot()
+  try {
+    const handle = await root.getFileHandle(CACHE_INDEX)
+    return JSON.parse(await (await handle.getFile()).text()) as CacheIndex
+  } catch {
+    return {}
+  }
+}
+
+async function writeCacheIndex(index: CacheIndex): Promise<void> {
+  const root = await opfsRoot()
+  const handle = await root.getFileHandle(CACHE_INDEX, { create: true })
+  const writable = await handle.createWritable()
+  await writable.write(JSON.stringify(index))
+  await writable.close()
+}
+
+async function touchCacheEntry(name: string): Promise<void> {
+  const index = await readCacheIndex()
+  index[name] = { lastUsed: Date.now() }
+  await writeCacheIndex(index)
+}
+
+async function listCacheBlobs(): Promise<{ name: string; size: number }[]> {
+  const root = (await opfsRoot()) as DirWithEntries
+  const blobs: { name: string; size: number }[] = []
+
+  for await (const [name, handle] of root.entries()) {
+    if (handle.kind !== 'file') continue
+    if (name !== NPM_CACHE_OPFS && !name.startsWith(SNAPSHOT_PREFIX)) continue
+    const file = await (handle as FileSystemFileHandle).getFile()
+    blobs.push({ name, size: file.size })
+  }
+
+  return blobs
+}
+
+// Enforce both budgets. `protect` is the entry written by the current run — it
+// must survive eviction even if it is the least-recently-used one.
+async function evictCache(protect: string): Promise<void> {
+  const root = await opfsRoot()
+  const blobs = await listCacheBlobs()
+  const index = await readCacheIndex()
+
+  const cacache = blobs.find((b) => b.name === NPM_CACHE_OPFS)
+  if (cacache && cacache.size > MAX_CACACHE_BYTES) {
+    await root.removeEntry(NPM_CACHE_OPFS)
+    delete index[NPM_CACHE_OPFS]
+    console.log(
+      `[wc-build] tarball cache ${(cacache.size / 1048576).toFixed(0)} MB over ` +
+        `${MAX_CACACHE_BYTES / 1048576} MB cap — dropped (reseeds next install)`
+    )
+  }
+
+  const snapshots = blobs
+    .filter((b) => b.name.startsWith(SNAPSHOT_PREFIX))
+    .map((b) => ({ ...b, lastUsed: index[b.name]?.lastUsed ?? 0 }))
+    .sort((a, b) => a.lastUsed - b.lastUsed)
+
+  let total = snapshots.reduce((sum, b) => sum + b.size, 0)
+
+  for (const snapshot of snapshots) {
+    if (total <= MAX_SNAPSHOT_BYTES) break
+    if (snapshot.name === protect) continue
+
+    await root.removeEntry(snapshot.name)
+    delete index[snapshot.name]
+    total -= snapshot.size
+    console.log(
+      `[wc-build] evicted LRU snapshot ${snapshot.name} ` +
+        `(${(snapshot.size / 1048576).toFixed(1)} MB)`
+    )
+  }
+
+  // drop index entries whose blob no longer exists
+  const present = new Set(blobs.map((b) => b.name))
+  for (const name of Object.keys(index)) {
+    if (!present.has(name) && name !== protect) delete index[name]
+  }
+
+  await writeCacheIndex(index)
+}
+
 // Mounting a snapshot requires the mount point to already exist — otherwise the
 // runtime logs "invalid mount point" and resolves anyway, silently leaving the
 // directory empty. Create it first, then verify the restore actually produced
@@ -234,7 +338,10 @@ async function restoreNodeModules(
   const file = await handle.getFile()
   const snapshot = new Uint8Array(await file.arrayBuffer())
 
-  return restoreSnapshotInto(rt, snapshot, 'node_modules')
+  const restored = await restoreSnapshotInto(rt, snapshot, 'node_modules')
+  if (restored) await touchCacheEntry(`nm-${key}.bin`)
+
+  return restored
 }
 
 async function saveNodeModules(
@@ -248,6 +355,7 @@ async function saveNodeModules(
   const writable = await handle.createWritable()
   await writable.write(snapshot as FileSystemWriteChunkType)
   await writable.close()
+  await touchCacheEntry(`nm-${key}.bin`)
 
   return snapshot.byteLength
 }
@@ -283,6 +391,7 @@ async function saveNpmCache(provider: SnapshotProvider): Promise<number> {
   const writable = await handle.createWritable()
   await writable.write(snapshot as FileSystemWriteChunkType)
   await writable.close()
+  await touchCacheEntry(NPM_CACHE_OPFS)
 
   return snapshot.byteLength
 }
@@ -340,6 +449,8 @@ async function installWithCache(): Promise<CacheResult> {
   console.log(
     `[wc-build] Updated npm tarball cache: ${(npmCacheBytes / 1048576).toFixed(1)} MB`
   )
+
+  await evictCache(`nm-${key}.bin`)
 
   return { cached: false, key, bytes, npmCacheRestored, npmCacheBytes }
 }
