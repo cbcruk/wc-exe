@@ -1,16 +1,37 @@
 import puppeteer, { type Browser, type Page } from 'puppeteer-core'
 
+/**
+ * Drives the headless Chrome instance that hosts the runner page.
+ *
+ * Every method below is a thin bridge to the corresponding `window.wcRunner`
+ * function evaluated inside the page — this class holds no runtime state of its
+ * own, only the browser and page handles. Call {@link launch} before anything
+ * else, and {@link close} when done.
+ */
 export class WCBrowser {
   private browser: Browser | null = null
   private page: Page | null = null
   private verbose: boolean = false
   private userDataDir: string | undefined
 
+  /**
+   * @param options.verbose Mirror browser console and failed requests to stdout.
+   * @param options.userDataDir Persistent Chrome profile. Required for the OPFS
+   *   cache to survive across runs; omit for a throwaway profile.
+   */
   constructor(options?: { verbose?: boolean; userDataDir?: string }) {
     this.verbose = options?.verbose ?? false
     this.userDataDir = options?.userDataDir
   }
 
+  /**
+   * Launches Chrome, opens the runner page and waits for the runtime to boot.
+   *
+   * @param serverUrl Origin the runner is served from, i.e. the local server's
+   *   `url`.
+   * @throws If Chrome cannot be located, or the runtime does not signal ready
+   *   within 60s.
+   */
   async launch(serverUrl: string): Promise<void> {
     const executablePath = await this.findChrome()
 
@@ -54,6 +75,10 @@ export class WCBrowser {
     )
   }
 
+  /**
+   * Resolves a Chrome executable: `CHROME_PATH` if set, otherwise the first hit
+   * among the well-known install locations for macOS, Linux and Windows.
+   */
   private async findChrome(): Promise<string> {
     const { access } = await import('node:fs/promises')
 
@@ -91,6 +116,12 @@ export class WCBrowser {
     )
   }
 
+  /**
+   * Has the runner pull the project from the local server and mount it into the
+   * runtime.
+   *
+   * @returns Number of files mounted.
+   */
   async mountFromServer(): Promise<number> {
     if (!this.page) throw new Error('Browser not launched')
 
@@ -103,6 +134,19 @@ export class WCBrowser {
     })
   }
 
+  /**
+   * Installs dependencies through the OPFS cache: restores a `node_modules`
+   * snapshot when one matches the lockfile, otherwise installs and snapshots it
+   * for next time.
+   *
+   * Only useful when the instance was constructed with a persistent
+   * `userDataDir` and the server bound its fixed cache port; otherwise OPFS
+   * starts empty and every run is a miss.
+   *
+   * @returns `cached` whether the snapshot was reused, `key` the lockfile hash
+   *   it is stored under, and on a miss `bytes` the snapshot size.
+   * @throws If the install fails.
+   */
   async installWithCache(): Promise<{
     cached: boolean
     key: string
@@ -125,6 +169,16 @@ export class WCBrowser {
     })
   }
 
+  /**
+   * Runs a command inside the runtime and waits for it to exit.
+   *
+   * @param cmd Executable name, e.g. `npm`.
+   * @param args Arguments, e.g. `['run', 'build']`.
+   * @param timeout Milliseconds before giving up. Omit to wait indefinitely.
+   * @returns The process exit code — a non-zero code resolves, it does not throw.
+   * @throws If `timeout` elapses first. Note the command keeps running in the
+   *   page; the timeout only stops us waiting on it.
+   */
   async runCommand(
     cmd: string,
     args: string[],
@@ -163,6 +217,13 @@ export class WCBrowser {
     return Promise.race([commandPromise, timeoutPromise])
   }
 
+  /**
+   * Walks the build output inside the runtime and POSTs each file back to the
+   * local server, which writes it to the host output directory.
+   *
+   * @param distPath Absolute path inside the runtime. Defaults to `/dist`.
+   * @returns Number of files uploaded.
+   */
   async uploadDist(distPath: string = '/dist'): Promise<number> {
     if (!this.page) throw new Error('Browser not launched')
 
@@ -175,6 +236,13 @@ export class WCBrowser {
     }, distPath)
   }
 
+  /**
+   * Starts a long-running command inside the runtime without waiting for it to
+   * exit — for dev servers and watchers. Pair with {@link waitForServerReady}.
+   *
+   * Resolves as soon as the spawn is issued; a failure inside the runtime
+   * surfaces in the page console, not here.
+   */
   async spawnCommand(cmd: string, args: string[]): Promise<void> {
     if (!this.page) throw new Error('Browser not launched')
 
@@ -193,6 +261,13 @@ export class WCBrowser {
     )
   }
 
+  /**
+   * Waits for a server started inside the runtime (via {@link spawnCommand}) to
+   * come up.
+   *
+   * @returns The runtime-internal port and the proxied URL to forward traffic
+   *   to. Never rejects on its own — it waits indefinitely if no server starts.
+   */
   async waitForServerReady(): Promise<{ port: number; url: string }> {
     if (!this.page) throw new Error('Browser not launched')
 
@@ -207,6 +282,13 @@ export class WCBrowser {
     })
   }
 
+  /**
+   * Writes a single file inside the runtime — how host edits are pushed in for
+   * HMR.
+   *
+   * @param path Absolute path inside the runtime, e.g. `/src/main.ts`.
+   * @param content UTF-8 text. Binary files are not supported here.
+   */
   async writeFile(path: string, content: string): Promise<void> {
     if (!this.page) throw new Error('Browser not launched')
 
@@ -225,6 +307,7 @@ export class WCBrowser {
     )
   }
 
+  /** Closes the browser and drops the handles. Safe to call when not launched. */
   async close(): Promise<void> {
     await this.browser?.close()
     this.browser = null

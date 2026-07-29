@@ -20,6 +20,18 @@ import {
 import { withSpin } from '../utils/spinner.js'
 import type { BuildOptions, ServerHandlers } from '../types.js'
 
+/**
+ * Builds a project inside the browser runtime and writes the output to disk.
+ *
+ * Serves the project over a local server, boots the runtime in headless Chrome,
+ * mounts the files, installs dependencies, runs `npm run build`, then copies the
+ * artifacts back out.
+ *
+ * @param options See {@link BuildOptions}.
+ * @throws If any step fails. The server and browser are always torn down first.
+ * @remarks Calls `process.exit(0)` on success, so it never resolves — this is
+ *   the CLI entry point, not a reusable library call.
+ */
 export async function build(options: BuildOptions): Promise<void> {
   const {
     source = '.',

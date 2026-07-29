@@ -28,6 +28,12 @@ const SPINNER_CHARS = [
   '⠏',
 ]
 
+/**
+ * Drops noise from a process output chunk so the host log stays readable.
+ *
+ * @returns The chunk unchanged (escapes and all), or `null` if it was blank or
+ *   a lone spinner frame.
+ */
 function filterOutput(chunk: string): string | null {
   const cleaned = chunk.replace(ANSI_REGEX, '').trim()
 
@@ -47,6 +53,10 @@ declare global {
 
 let runtime: Runtime | null = null
 
+/**
+ * Boots the runtime and flags the page ready. Runs automatically on load; the
+ * host waits on `window.__WC_READY__` before calling anything else.
+ */
 async function boot(): Promise<void> {
   console.log('[wc-build] Booting runtime...')
   const instance = new WebContainerRuntime()
@@ -56,6 +66,15 @@ async function boot(): Promise<void> {
   window.__WC_READY__ = true
 }
 
+/**
+ * Fetches the project from the host server and mounts it into the runtime.
+ *
+ * Files are fetched one at a time and assembled into a single tree, then
+ * mounted in one call.
+ *
+ * @returns Number of files mounted.
+ * @throws If the manifest or any file fails to fetch.
+ */
 async function mountFromServer(): Promise<number> {
   invariant(runtime, 'Runtime not booted')
 
@@ -89,6 +108,12 @@ async function mountFromServer(): Promise<number> {
   return paths.length
 }
 
+/**
+ * Inserts a file into a {@link FileTree}, creating intermediate directories.
+ *
+ * @param filePath Slash-separated path relative to the tree root.
+ * @throws If a path segment is already occupied by a file.
+ */
 function insertIntoTree(
   tree: FileTree,
   filePath: string,
@@ -115,6 +140,12 @@ function insertIntoTree(
   node[parts[parts.length - 1]] = { file: { contents } }
 }
 
+/**
+ * Runs a command to completion, streaming its output to the page console (where
+ * the host picks it up in verbose mode).
+ *
+ * @returns The exit code — a non-zero code is returned, not thrown.
+ */
 async function runCommand(cmd: string, args: string[]): Promise<number> {
   invariant(runtime, 'Runtime not booted')
 
@@ -142,9 +173,13 @@ async function runCommand(cmd: string, args: string[]): Promise<number> {
   return exitCode
 }
 
+/** Outcome of {@link installWithCache}. */
 type CacheResult = {
+  /** Whether `node_modules` was restored from a snapshot instead of installed. */
   cached: boolean
+  /** Lockfile hash the snapshot is keyed on. */
   key: string
+  /** Size of the snapshot just written. Absent on a cache HIT. */
   bytes?: number
   // Tarball-level cache (npm's own content-addressed cacache) stats, present
   // on a node_modules MISS when the tarball cache participated.
@@ -152,6 +187,9 @@ type CacheResult = {
   npmCacheBytes?: number
 }
 
+// Candidate cache-key sources, most authoritative first: the first one present
+// is hashed. package.json is the last resort for projects without a lockfile —
+// a coarser key, but still invalidates when dependencies change.
 const LOCK_FILES = [
   'package-lock.json',
   'pnpm-lock.yaml',
@@ -173,6 +211,7 @@ const LOCK_FILES = [
 const NPM_CACHE_DIR = '.npm-cache'
 const NPM_CACHE_OPFS = 'npm-cacache.bin' // single global OPFS blob
 
+/** Hashes bytes to a lowercase hex SHA-256 digest. */
 async function sha256Hex(data: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', data as BufferSource)
   return Array.from(new Uint8Array(digest))
@@ -180,6 +219,13 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
     .join('')
 }
 
+/**
+ * Derives the `node_modules` cache key from the first {@link LOCK_FILES} entry
+ * present in the project.
+ *
+ * @returns A 32-char hex prefix of the file's SHA-256.
+ * @throws If the project has none of those files.
+ */
 async function computeCacheKey(): Promise<string> {
   invariant(runtime, 'Runtime not booted')
 
@@ -219,6 +265,7 @@ type DirWithEntries = FileSystemDirectoryHandle & {
   entries(): AsyncIterableIterator<[string, FileSystemHandle]>
 }
 
+/** Reads the LRU index, treating a missing or corrupt one as empty. */
 async function readCacheIndex(): Promise<CacheIndex> {
   const root = await opfsRoot()
   try {
@@ -229,6 +276,7 @@ async function readCacheIndex(): Promise<CacheIndex> {
   }
 }
 
+/** Overwrites the LRU index. */
 async function writeCacheIndex(index: CacheIndex): Promise<void> {
   const root = await opfsRoot()
   const handle = await root.getFileHandle(CACHE_INDEX, { create: true })
@@ -237,12 +285,21 @@ async function writeCacheIndex(index: CacheIndex): Promise<void> {
   await writable.close()
 }
 
+/**
+ * Marks a blob most-recently-used, so eviction reaches it last.
+ *
+ * @param name OPFS blob name, e.g. `nm-<key>.bin`.
+ */
 async function touchCacheEntry(name: string): Promise<void> {
   const index = await readCacheIndex()
   index[name] = { lastUsed: Date.now() }
   await writeCacheIndex(index)
 }
 
+/**
+ * Lists the cache blobs in OPFS with their sizes, ignoring unrelated files at
+ * the same origin.
+ */
 async function listCacheBlobs(): Promise<{ name: string; size: number }[]> {
   const root = (await opfsRoot()) as DirWithEntries
   const blobs: { name: string; size: number }[] = []
@@ -257,8 +314,14 @@ async function listCacheBlobs(): Promise<{ name: string; size: number }[]> {
   return blobs
 }
 
-// Enforce both budgets. `protect` is the entry written by the current run — it
-// must survive eviction even if it is the least-recently-used one.
+/**
+ * Enforces both budgets: drops the tarball cache outright if it is over its cap,
+ * then evicts snapshots least-recently-used first until they fit theirs. Also
+ * prunes index entries whose blob is gone.
+ *
+ * @param protect Blob written by the current run. Survives eviction even if it
+ *   is the least-recently-used one.
+ */
 async function evictCache(protect: string): Promise<void> {
   const root = await opfsRoot()
   const blobs = await listCacheBlobs()
@@ -303,10 +366,16 @@ async function evictCache(protect: string): Promise<void> {
   await writeCacheIndex(index)
 }
 
-// Mounting a snapshot requires the mount point to already exist — otherwise the
-// runtime logs "invalid mount point" and resolves anyway, silently leaving the
-// directory empty. Create it first, then verify the restore actually produced
-// files so a failed mount reports as a MISS instead of a broken HIT.
+/**
+ * Mounts a snapshot into `dir`, creating the mount point first and verifying
+ * the result.
+ *
+ * Mounting requires the mount point to already exist — otherwise the runtime
+ * logs "invalid mount point" and resolves anyway, silently leaving the directory
+ * empty. Hence the check: a failed mount must report as a MISS, not a broken HIT.
+ *
+ * @returns Whether the restore actually produced files.
+ */
 async function restoreSnapshotInto(
   rt: Runtime & SnapshotProvider,
   snapshot: Uint8Array,
@@ -323,6 +392,13 @@ async function restoreSnapshotInto(
   }
 }
 
+/**
+ * Restores the `node_modules` snapshot for `key` from OPFS into the runtime and
+ * marks it most-recently-used.
+ *
+ * @returns `false` if no snapshot exists for that key, or the mount produced
+ *   nothing — either way, a cache miss.
+ */
 async function restoreNodeModules(
   rt: Runtime & SnapshotProvider,
   key: string
@@ -344,6 +420,12 @@ async function restoreNodeModules(
   return restored
 }
 
+/**
+ * Snapshots the installed `node_modules` to OPFS under `key`, replacing any
+ * existing snapshot for that key.
+ *
+ * @returns Size of the snapshot in bytes.
+ */
 async function saveNodeModules(
   provider: SnapshotProvider,
   key: string
@@ -360,9 +442,15 @@ async function saveNodeModules(
   return snapshot.byteLength
 }
 
-// Restore the global npm tarball cache (cacache) from OPFS into the runtime, so
-// the upcoming install can replay unchanged packages offline. Best-effort:
-// returns false (and installs online) if there is no cache yet.
+/**
+ * Restores the global npm tarball cache (cacache) from OPFS into the runtime,
+ * so the upcoming install can replay unchanged packages offline.
+ *
+ * Best-effort.
+ *
+ * @returns `false` if no cache exists yet, or the mount produced nothing — the
+ *   install then goes online and seeds one.
+ */
 async function restoreNpmCache(
   rt: Runtime & SnapshotProvider
 ): Promise<boolean> {
@@ -380,9 +468,13 @@ async function restoreNpmCache(
   return restoreSnapshotInto(rt, snapshot, NPM_CACHE_DIR)
 }
 
-// Persist the (now-updated) npm tarball cache back to OPFS as a single global
-// blob. Grows over time as new packages are seen; that's the storage cost of
-// offline replay.
+/**
+ * Persists the (now-updated) npm tarball cache back to OPFS as a single global
+ * blob. Grows over time as new packages are seen; that's the storage cost of
+ * offline replay.
+ *
+ * @returns Size of the blob in bytes.
+ */
 async function saveNpmCache(provider: SnapshotProvider): Promise<number> {
   const snapshot = await provider.exportDir(NPM_CACHE_DIR)
 
@@ -396,6 +488,18 @@ async function saveNpmCache(provider: SnapshotProvider): Promise<number> {
   return snapshot.byteLength
 }
 
+/**
+ * Installs dependencies through the two-level OPFS cache.
+ *
+ * On a `node_modules` HIT nothing is installed at all. On a MISS the npm
+ * tarball cache is primed first, so only packages new to this lockfile hit the
+ * network, both caches are written back afterwards, and eviction runs to keep
+ * them inside their budgets. Backends without snapshot support fall back to a
+ * plain install.
+ *
+ * @throws If the install exits non-zero, or the project has no lockfile or
+ *   package.json to key the cache on.
+ */
 async function installWithCache(): Promise<CacheResult> {
   invariant(runtime, 'Runtime not booted')
 
@@ -455,6 +559,13 @@ async function installWithCache(): Promise<CacheResult> {
   return { cached: false, key, bytes, npmCacheRestored, npmCacheBytes }
 }
 
+/**
+ * Starts a long-running command without waiting for it to exit — for dev
+ * servers and watchers. Output is streamed to the page console.
+ *
+ * Returns immediately; a spawn failure surfaces as an unhandled rejection, not
+ * to the caller.
+ */
 function spawnCommand(cmd: string, args: string[]): void {
   invariant(runtime, 'Runtime not booted')
 
@@ -472,6 +583,12 @@ function spawnCommand(cmd: string, args: string[]): void {
   })
 }
 
+/**
+ * Writes a single file into the runtime — how host edits reach the dev server.
+ *
+ * @param path Absolute path inside the runtime, e.g. `/src/main.ts`.
+ * @param content UTF-8 text. Binary files are not supported here.
+ */
 async function writeFile(path: string, content: string): Promise<void> {
   invariant(runtime, 'Runtime not booted')
 
@@ -480,6 +597,16 @@ async function writeFile(path: string, content: string): Promise<void> {
   console.log(`[wc-build] File written: ${path}`)
 }
 
+/**
+ * Walks the build output and POSTs every file to the host server, which writes
+ * it to the output directory.
+ *
+ * @param distPath Absolute path inside the runtime, e.g. `/dist`. Paths are
+ *   made relative to it before upload.
+ * @returns Number of files uploaded.
+ * @throws If `distPath` does not exist, or any upload is rejected. Files
+ *   uploaded before the failure are already on disk.
+ */
 async function uploadDist(distPath: string): Promise<number> {
   invariant(runtime, 'Runtime not booted')
 
@@ -528,6 +655,14 @@ async function uploadDist(distPath: string): Promise<number> {
   return count
 }
 
+/**
+ * Resolves when a process inside the runtime starts listening on a port.
+ *
+ * @returns The runtime-internal port and the URL the host can proxy to. Only
+ *   the first server to come up is reported; later ones are ignored.
+ * @remarks Never rejects — it waits indefinitely if no server starts, so
+ *   callers should impose their own timeout.
+ */
 async function getServerUrl(): Promise<{ port: number; url: string }> {
   invariant(runtime, 'Runtime not booted')
 
@@ -545,6 +680,11 @@ async function getServerUrl(): Promise<{ port: number; url: string }> {
   })
 }
 
+/**
+ * The page's API, exposed on `window` and driven by the host over Puppeteer.
+ * Its shape is the contract mirrored by `WCBrowser` on the Node side — changing
+ * a signature here means changing it there too.
+ */
 const wcRunner = {
   boot,
   mountFromServer,

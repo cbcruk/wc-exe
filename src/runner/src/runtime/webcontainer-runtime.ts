@@ -8,8 +8,16 @@ import type {
   RuntimeDirEnt,
 } from './runtime.types'
 
-// The single place WebContainer is referenced. Everything WebContainer-specific
-// lives behind the Runtime / SnapshotProvider interfaces.
+/**
+ * {@link Runtime} backed by WebContainer.
+ *
+ * The single place WebContainer is referenced — everything WebContainer-specific
+ * lives behind the {@link Runtime} / {@link SnapshotProvider} interfaces. Only
+ * one instance can be booted per page, a WebContainer limitation.
+ *
+ * Every method other than {@link WebContainerRuntime.boot} throws until boot
+ * has completed.
+ */
 export class WebContainerRuntime implements Runtime, SnapshotProvider {
   private webcontainer: WebContainer | null = null
 

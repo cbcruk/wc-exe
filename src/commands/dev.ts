@@ -11,6 +11,19 @@ import { listProjectFiles, readProjectFileBytes } from '../core/file-sync.js'
 import { withSpin } from '../utils/spinner.js'
 import type { DevOptions, ServerHandlers } from '../types.js'
 
+/**
+ * Runs the project's dev server inside the browser runtime and proxies it to a
+ * local port.
+ *
+ * Mounts the current directory, installs dependencies, spawns `npm run dev`,
+ * then proxies HTTP and WebSocket traffic to the runtime. A file watcher pushes
+ * host edits back in so HMR works against real files on disk.
+ *
+ * @param options See {@link DevOptions}.
+ * @throws If any startup step fails. The watcher, proxy and browser are torn
+ *   down first.
+ * @remarks Never resolves — it runs until interrupted (SIGINT).
+ */
 export async function dev(options: DevOptions): Promise<void> {
   const { port = 5173 } = options
 
