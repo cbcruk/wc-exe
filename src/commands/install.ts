@@ -15,6 +15,19 @@ import {
 import { withSpin } from '../utils/spinner.js'
 import type { InstallOptions, ServerHandlers } from '../types.js'
 
+/**
+ * Installs the current project's dependencies inside the browser runtime,
+ * without building.
+ *
+ * Mainly useful with `cache: true` to warm the OPFS `node_modules` snapshot
+ * ahead of a build — nothing is written back to the host, the install lives in
+ * the runtime.
+ *
+ * @param options See {@link InstallOptions}.
+ * @throws If any step fails. The server and browser are always torn down first.
+ * @remarks Calls `process.exit(0)` on success, so it never resolves — this is
+ *   the CLI entry point, not a reusable library call.
+ */
 export async function install(options: InstallOptions): Promise<void> {
   const { cache = false } = options
 
