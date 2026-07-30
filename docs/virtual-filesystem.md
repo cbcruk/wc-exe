@@ -361,6 +361,36 @@ wc-exe의 확정 결론: **실행 엔진은 WebContainer 유지(§7 판정), ins
 1. **§9의 분해가 실증됐다.** 추측이 아니라 동작하는 코드로 "1~4는 shim으로 되고 5에서 막힌다"가 확인된다.
 2. **번들러 인터셉트 기법**이 "브라우저에서 진짜 빌드"의 구체적 경로다. 훗날 WebContainer 독립이 목표가 되면 container2wasm(§7, 35× 느림)보다 **이 길이 현실적일 수 있다** — 대가는 `execSync`·네이티브 애드온·install 훅 포기.
 
+### PoC: 번들러 인터셉트로 프로덕션 빌드 (✅ 동작 확인, `poc/vite-build-intercept/`)
+
+almostnode가 dev server까지만 보여주고 **행사하지 않은** 그 경로(프로덕션 빌드)를 직접 만들어 돌려봤다. `rollup`→`@rollup/browser`, `esbuild`→`esbuild-wasm`(TS 변환 **및** minify 둘 다), `node:fs`→인메모리 VFS.
+
+**결과: 브라우저에서 동작하는 프로덕션 `dist/`가 나온다.**
+
+- 산출물을 다시 브라우저에 띄워 **런타임 검증까지 통과** — 앱이 렌더되고, 추출된 스타일시트가 적용되고, 카운터 클릭이 증가한다(= 변환된 TS가 실제로 동작).
+- **minify된 CSS가 진짜 `vite build` 출력과 바이트 단위로 동일**(673 B). JS 차이(413 B vs 1101 B)는 거의 전부 vite가 주입하는 modulepreload 폴리필이다. 이 픽스처에서 충실도는 높다.
+- **COOP/COEP 불필요** — esbuild-wasm 비동기 API와 `@rollup/browser`는 `SharedArrayBuffer`를 안 쓴다. WebContainer·container2wasm 양쪽이 요구하는 제약이 사라진다.
+- **CDN 불필요** — 번들러를 로컬 `node_modules`에서 서빙했다(almostnode의 esm.sh/unpkg 의존을 피함). 번들러를 wc-exe가 들고 다니므로 프로젝트별 `npm install`도 필요 없다.
+- 타이밍(이 Linux 샌드박스, rollup 경로): 번들+minify 버스트 ~0.37–0.51s, 총 ~0.81–0.93s. ⚠️ `bench/README.md`의 수치는 macOS에서 잰 것이라 **직접 비교 금지**(WebContainer는 이 샌드박스에서 부팅 불가).
+
+#### vite 8 = rolldown 경로도 구현·검증 (`--bundler=rolldown`)
+
+**vite 8.1.5의 의존성은 `rolldown`·`lightningcss`·`postcss` — rollup도 esbuild도 없다.** 즉 지금 vite를 인터셉트한다는 건 rolldown을 인터셉트한다는 뜻이다. `@rolldown/browser`(1.2.1)가 실제로 존재하고, `lightningcss-wasm`도 있다 — vite 8 툴체인 전체에 브라우저 빌드가 있다.
+
+- **결과: 이쪽도 static·runtime 검증 통과.** rolldown은 TS 변환과 minify를 자체(oxc)로 하므로 **esbuild-wasm이 아예 불필요**하다.
+- **번들 버스트 144–153ms vs rollup 366–511ms → 약 2.4~3.5× 빠름.** 초기화가 더 무거운데도(10MB wasm, ~0.5s) 총 시간도 앞선다(0.75s vs 0.81–0.93s). 참고로 같은 머신 네이티브 `vite build`(v5)가 157ms 자체 보고 → **브라우저 rolldown 버스트가 네이티브 vite 5와 같은 범위**다.
+- **대가는 배선 비용이다.** `@rollup/browser`는 페이지에서 그냥 `import`되지만 rolldown은 전부 실패를 거쳐야 했다: ① 브라우저 엔트리가 `node:fs`·`node:url`을 정적 import하고 wasi 바인딩이 `@napi-rs/wasm-runtime`을 bare로 끌어와 **사전 번들링 필수** ② wasi **워커도 별도 사전 번들링**(워커는 페이지 import map을 물려받지 않음) + 파일명 유지 ③ `process` 전역 필요 ④ **COOP/COEP 필수**(워커에 SharedArrayBuffer 전송) — rollup 경로의 이점이 사라진다 ⑤ **CSS 입력을 아예 거부**("Bundling CSS is no longer supported")해 가상 모듈로 우회해야 하고 그 id가 `.css`로 끝나서도 안 된다 ⑥ **모듈 로딩이 `generate()`로 지연**돼, 그 전에 수집한 CSS를 읽으면 오류 없이 **조용히 빈 결과**가 나온다 ⑦ 10MB wasm + 1.5MB JS + 1.2MB 워커.
+- rolldown 경로는 CSS를 minify하지 않는다(거기엔 esbuild를 안 띄움). vite 8과 맞추려면 `lightningcss-wasm`을 붙이면 된다.
+
+**증명하지 못한 것 (중요)**
+
+- **이건 `vite build`가 도는 게 아니다.** vanilla `index.html` 앱에 대해 vite가 하는 일(엔트리 발견, TS 변환, CSS 추출, 해시 애셋, HTML 재작성)을 재구현한 것이다. vite의 config 해석·플러그인 생태계·프레임워크 플러그인·multi-page·legacy 타겟은 전부 없다.
+- **의존성이 검증되지 않았다.** 픽스처에 런타임 의존성이 0개라 bare specifier 해석 경로가 아예 안 돌았다. 실제 프로젝트엔 조건부 `exports` 맵과 CJS→ESM interop이 필요하고, **거기가 이 접근의 진짜 난관**이다.
+
+**왜 vite를 포팅하지 않는가 (실측)**: vite 5.4의 `dist/node`는 node 빌트인 **24개**(`child_process`·`worker_threads`·`net`·`tls`·`dns`·`inspector`·`module` 포함)를 import하고, 최소 한 청크가 `execSync`/`spawnSync`를 쓴다 — almostnode가 막히는 바로 그 벽이다. 인터셉트 방식은 vite를 **실행하는 대신 대체**하므로 그 24개가 전부 불필요하다. **vite를 우회하는 게 포팅보다 훨씬 싸다** — 대신 생태계 호환성으로 값을 치르고, "임의 프로젝트를 빌드"가 약속인 wc-exe에겐 그 청구서가 곧 핵심 질문이다.
+
+**다음에 결판낼 것**: ① 한 머신에서 WebContainer `npm run build`와 동일 조건 비교 ② 실제 의존성이 있는 프로젝트(React 등)로 bare specifier·`exports`·CJS interop 시험 — 여기서 깨질 것으로 예상. 자세한 내용은 `poc/vite-build-intercept/README.md`.
+
 ### 하이브리드 착지점 (제안 — 미구현)
 
 전면 대체가 아니라 **분업**. 우리는 이미 타르볼 캐시로 1~3의 일부를 가져왔으니(§5 단기+), 그 연장선이다:
