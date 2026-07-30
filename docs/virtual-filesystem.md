@@ -385,7 +385,7 @@ almostnode가 dev server까지만 보여주고 **행사하지 않은** 그 경�
 **증명하지 못한 것 (중요)**
 
 - **이건 `vite build`가 도는 게 아니다.** vanilla `index.html` 앱에 대해 vite가 하는 일(엔트리 발견, TS 변환, CSS 추출, 해시 애셋, HTML 재작성)을 재구현한 것이다. vite의 config 해석·플러그인 생태계·프레임워크 플러그인·multi-page·legacy 타겟은 전부 없다.
-- ~~의존성이 검증되지 않았다~~ → **React로 시험 완료(아래).** 다만 픽스처가 두 개뿐이라 `browser` 필드 remap·깊은 `exports` 와일드카드·worker/wasm import·동적 `import()` 청킹은 여전히 미검증이다.
+- ~~의존성이 검증되지 않았다~~ → **React·동적 import 청킹 모두 시험 완료(아래).** 남은 미검증: `browser` 필드 remap, 깊은 `exports` 와일드카드, worker/wasm import, CSS `@import`/`url()` 애셋 참조.
 
 **왜 vite를 포팅하지 않는가 (실측)**: vite 5.4의 `dist/node`는 node 빌트인 **24개**(`child_process`·`worker_threads`·`net`·`tls`·`dns`·`inspector`·`module` 포함)를 import하고, 최소 한 청크가 `execSync`/`spawnSync`를 쓴다 — almostnode가 막히는 바로 그 벽이다. 인터셉트 방식은 vite를 **실행하는 대신 대체**하므로 그 24개가 전부 불필요하다. **vite를 우회하는 게 포팅보다 훨씬 싸다** — 대신 생태계 호환성으로 값을 치르고, "임의 프로젝트를 빌드"가 약속인 wc-exe에겐 그 청구서가 곧 핵심 질문이다.
 
@@ -393,10 +393,11 @@ almostnode가 dev server까지만 보여주고 **행사하지 않은** 그 경�
 
 실제 의존성이 있는 프로젝트(`test/fixtures/sample-react-app`: React 18 + react-dom, TSX, CSS import)로 시험했더니 **두 파이프라인이 깨끗하게 갈렸다.**
 
-| 픽스처     | rollup (vite 5)  | rolldown (vite 8)     |
-| ---------- | ---------------- | --------------------- |
-| vanilla TS | ✅ 645ms · 413 B | ✅ 172ms · 384 B      |
-| **React**  | ❌ **실패**      | ✅ **505ms · 141 KB** |
+| 픽스처          | rollup (vite 5)     | rolldown (vite 8)     |
+| --------------- | ------------------- | --------------------- |
+| vanilla TS      | ✅ 314ms · 413 B    | ✅ 161ms · 384 B      |
+| 동적 `import()` | ✅ 440ms · 청크 2개 | ✅ 160ms · 청크 2개   |
+| **React**       | ❌ **실패**         | ✅ **470ms · 141 KB** |
 
 - **rolldown은 React를 빌드하고 결과가 동작한다.** 런타임 검증 통과 — 컴포넌트가 마운트되고 스타일시트가 적용되고 클릭 시 카운터가 증가한다(= JSX·hooks·state 정상). bare specifier 해석, 조건부 `exports` 맵, **CJS→ESM interop**이 전부 통했다.
 - **rollup은 예측한 그 지점에서 실패한다**: `RollupError: "useState" is not exported by "node_modules/react/index.js"`. React가 CommonJS로 배포되고 rollup은 `module.exports`를 자체적으로 소비하지 못한다 — `@rollup/plugin-commonjs`가 필요하고, 그 플러그인의 의존 체인(`glob`·`resolve` 등)은 rolldown이 요구했던 것과 같은 사전 번들링을 또 요구한다. rolldown은 oxc로 CJS를 native 처리해 이 문제가 아예 없다.
@@ -406,7 +407,23 @@ almostnode가 dev server까지만 보여주고 **행사하지 않은** 그 경�
 
 **실제 의존성을 풀려면 무엇이 필요했나** (전부 실제로 부딪혀 추가): ① **지연 VFS** — node_modules 2,150개 파일을 다 받으면 빌드보다 오래 걸려서, 경로 매니페스트만 미리 받고(해석은 동기 유지) 내용은 그래프가 닿는 파일만 fetch ② **조건부 `exports` 맵** — `browser → import → module → default → require` 순서 + 단일 `*` 패턴, `react/jsx-runtime`·`react-dom/client` 같은 서브패스 ③ **`process.env.NODE_ENV` 치환** — React가 이걸로 dev/prod 빌드를 고르는데 페이지엔 `process`가 없다(vite의 `define`이 하는 일) ④ **JSX** — rollup 경로는 esbuild `jsx:'automatic'`, rolldown은 자동 추론.
 
-**다음에 결판낼 것**: ① 한 머신에서 WebContainer `npm run build`와 동일 조건 비교 ② rolldown 경로에 `lightningcss-wasm`(vite 8의 CSS 처리 일치) ③ 그 다음에 플러그인 호환성·sourcemap·multi-page. 자세한 내용은 `poc/vite-build-intercept/README.md`.
+#### 동적 `import()` 청킹 — 양쪽 다 분리되지만 한 가지 미비
+
+`test/fixtures/sample-dynamic-app`으로 버튼 뒤에 `await import('./lazy')`를 두고 시험했다. **두 번들러 모두 진짜 별도 청크를 만든다.** 하네스가 두 방향으로 검증한다 — 정적으로(lazy 마커가 정확히 한 청크에만 있고 **엔트리엔 없으며**, 모든 `import()` 대상이 디스크에 존재) 그리고 런타임으로(클릭 시 청크를 실제로 fetch해 export가 렌더됨).
+
+|           | 네이티브 vite 5 | rollup 경로             | rolldown 경로      |
+| --------- | --------------- | ----------------------- | ------------------ |
+| 엔트리    | 2346 B          | 591 B                   | 560 B              |
+| lazy 청크 | 76 B            | **76 B — 바이트 동일**  | 64 B               |
+| CSS       | 159 B           | **159 B — 바이트 동일** | 215 B (unminified) |
+
+rollup 경로는 lazy 청크와 CSS **둘 다 진짜 `vite build`와 바이트 동일**하다.
+
+**엔트리 차이는 미관이 아니라 기능이다.** vite의 2346 B 엔트리엔 modulepreload 폴리필과 **`__vitePreload`**가 들어있고, 후자가 모든 동적 import를 감싸 **그 청크의 의존성까지 병렬로 preload**한다. PoC는 맨 `import()`만 emit한다. 이 픽스처의 lazy 청크는 의존성이 없어 차이가 없지만, 공유 청크가 있는 실제 앱에선 vite가 피하는 **요청 워터폴**을 PoC는 그대로 맞는다. 정직한 미비점이라 다음 할 일에 넣었다.
+
+**알아둘 차이 하나**: oxc(rolldown의 minifier)는 문자열 리터럴을 **백틱 템플릿**으로 emit한다 — esbuild가 `import("./lazy-BymLrvT9.js")`를 쓰는 자리에 ``import(`./lazy-hLdNd2Sa.js`)``. 따옴표만 받는 청크 참조 검사는 **정상 빌드를 실패로 오탐**하는데, 이 하네스가 정확히 그걸 겪었다.
+
+**다음에 결판낼 것**: ① 한 머신에서 WebContainer `npm run build`와 동일 조건 비교 ② rolldown 경로에 `lightningcss-wasm`(vite 8의 CSS 처리 일치) ③ `__vitePreload` 상당물(lazy 청크의 의존성 preload) ④ 그 다음에 플러그인 호환성·sourcemap·multi-page. 자세한 내용은 `poc/vite-build-intercept/README.md`.
 
 ### 하이브리드 착지점 (제안 — 미구현)
 

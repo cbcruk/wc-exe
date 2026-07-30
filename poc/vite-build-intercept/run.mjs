@@ -188,7 +188,7 @@ function createApp({ projectDir, outDir, vendor, needsCoi }) {
  * must point at files that exist, the JS must be transformed (no TypeScript
  * left) and must contain the app's own code, and the CSS must be real.
  */
-async function verify(outDir) {
+async function verify(outDir, { usesDynamicImport = false } = {}) {
   const problems = []
   const read = (p) => fs.readFile(path.join(outDir, p), 'utf8')
 
@@ -232,6 +232,50 @@ async function verify(outDir) {
     // CSS property names, so testing for 'font-family' false-positives.
     if (js.includes('#213547')) {
       problems.push('CSS leaked into the JS bundle instead of being extracted')
+    }
+
+    // Code-splitting: when the fixture uses a dynamic import(), the lazy module
+    // must end up in a separate chunk that the entry references and that
+    // actually exists on disk — not inlined into the entry.
+    const jsFiles = (
+      await fs.readdir(path.join(outDir, 'assets')).catch(() => [])
+    ).filter((f) => f.endsWith('.js'))
+
+    if (usesDynamicImport) {
+      if (jsFiles.length < 2) {
+        problems.push(
+          `dynamic import did not produce a separate chunk (${jsFiles.length} JS file(s))`
+        )
+      }
+      if (js.includes('LAZY_CHUNK_LOADED')) {
+        problems.push('lazy module was inlined into the entry chunk')
+      }
+      // oxc (rolldown's minifier) emits string literals as backtick templates,
+      // esbuild uses double quotes — accept either.
+      const refs = [
+        ...js.matchAll(/import\(\s*["'`]([^"'`]+\.js)["'`]\s*\)/g),
+      ].map((m) => m[1])
+      if (refs.length === 0) {
+        problems.push('entry chunk contains no dynamic import() of a chunk')
+      }
+      for (const ref of refs) {
+        const file = path.basename(ref)
+        if (!jsFiles.includes(file)) {
+          problems.push(`entry imports a chunk that is missing on disk: ${ref}`)
+        }
+      }
+      const marked = []
+      for (const f of jsFiles) {
+        const body = await fs
+          .readFile(path.join(outDir, 'assets', f), 'utf8')
+          .catch(() => '')
+        if (body.includes('LAZY_CHUNK_LOADED')) marked.push(f)
+      }
+      if (marked.length !== 1) {
+        problems.push(
+          `expected exactly one chunk to carry the lazy module, found ${marked.length}`
+        )
+      }
     }
   }
 
@@ -308,6 +352,29 @@ async function verifyBuiltAppRuns(outDir, chromePath) {
     )
     if (!/Inter|system-ui/.test(font)) {
       problems.push(`stylesheet not applied (font-family: ${font})`)
+    }
+
+    // Code-splitting at runtime: clicking must fetch and execute the lazy
+    // chunk. This is what proves the split chunk is genuinely loadable, not
+    // merely present on disk.
+    const hasLazy = (await page.$('#lazy')) !== null
+    if (hasLazy) {
+      const before = await page.$eval('#lazy-out', (el) => el.textContent)
+      if (before !== '') {
+        problems.push(`lazy output was populated before loading: "${before}"`)
+      }
+      await page.click('#lazy')
+      try {
+        await page.waitForFunction(
+          () =>
+            document.querySelector('#lazy-out')?.textContent ===
+            'LAZY_CHUNK_LOADED',
+          { timeout: 10000 }
+        )
+      } catch {
+        const got = await page.$eval('#lazy-out', (el) => el.textContent)
+        problems.push(`lazy chunk never loaded (#lazy-out = "${got}")`)
+      }
     }
 
     // The transformed TypeScript actually works: click increments the counter.
@@ -425,7 +492,9 @@ async function main() {
     process.exit(1)
   }
 
-  const staticProblems = await verify(outDir)
+  const usesDynamicImport =
+    result.outputs.filter((o) => o.path.endsWith('.js')).length > 1
+  const staticProblems = await verify(outDir, { usesDynamicImport })
   const runtimeProblems = await verifyBuiltAppRuns(outDir, await findChrome())
   const problems = [...staticProblems, ...runtimeProblems]
 

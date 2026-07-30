@@ -153,9 +153,9 @@ Also note the size: 10 MB of wasm plus ~1.5 MB of JS for rolldown, plus another
   hashed assets, HTML rewrite). Vite's config resolution, plugin ecosystem,
   framework plugins (`@vitejs/plugin-react`, svelte, …), `publicDir`, multi-page
   input, legacy targets and env/`define` handling are all absent.
-- **Only two fixtures.** React works (below), but plenty of ecosystem shapes are
-  still untried: packages with `browser` field remaps, deep `exports` wildcards,
-  worker/wasm imports, dynamic `import()` chunking.
+- **Three fixtures.** React and code-splitting work (below), but ecosystem
+  shapes remain untried: packages with `browser` field remaps, deep `exports`
+  wildcards, worker/wasm imports, CSS `@import`/`url()` asset references.
 - Nothing about `postinstall`, native addons, or anything else needing a real
   process.
 
@@ -179,10 +179,11 @@ but you pay for it in ecosystem compatibility, and for wc-exe (whose promise is
 test that actually stresses dependency resolution — and it splits the two
 pipelines cleanly:
 
-| fixture    | rollup (vite 5)   | rolldown (vite 8)      |
-| ---------- | ----------------- | ---------------------- |
-| vanilla TS | ✅ 645 ms · 413 B | ✅ 172 ms · 384 B      |
-| **React**  | ❌ **fails**      | ✅ **505 ms · 141 KB** |
+| fixture            | rollup (vite 5)      | rolldown (vite 8)      |
+| ------------------ | -------------------- | ---------------------- |
+| vanilla TS         | ✅ 314 ms · 413 B    | ✅ 161 ms · 384 B      |
+| dynamic `import()` | ✅ 440 ms · 2 chunks | ✅ 160 ms · 2 chunks   |
+| **React**          | ❌ **fails**         | ✅ **470 ms · 141 KB** |
 
 **rolldown builds React and the result works.** The runtime check passes: the
 component mounts, the stylesheet applies, and clicking increments the counter —
@@ -235,10 +236,43 @@ Beyond the vanilla case, React forced four additions to `browser/build.js`:
 4. **JSX**: `jsx: 'automatic'` for esbuild-wasm on the rollup path; rolldown
    infers it.
 
+## Code splitting: both pipelines split, one caveat
+
+`test/fixtures/sample-dynamic-app` adds `await import('./lazy')` behind a
+button. Both bundlers produce a genuinely separate chunk, and the harness
+proves it two ways — statically (the lazy marker appears in exactly one chunk
+and _not_ in the entry, and every `import()` target exists on disk) and at
+runtime (clicking fetches the chunk and its export renders).
+
+|            | native vite 5 | rollup path                | rolldown path      |
+| ---------- | ------------- | -------------------------- | ------------------ |
+| entry      | 2346 B        | 591 B                      | 560 B              |
+| lazy chunk | 76 B          | **76 B — byte-identical**  | 64 B               |
+| CSS        | 159 B         | **159 B — byte-identical** | 215 B (unminified) |
+
+On the rollup path both the lazy chunk **and** the CSS come out byte-identical
+to a real `vite build`.
+
+**The entry gap is functional, not cosmetic.** vite's 2346 B entry carries the
+modulepreload polyfill _and_ `__vitePreload`, which wraps every dynamic import
+so the chunk's own dependencies are preloaded in parallel. The PoC emits a bare
+`import()`. For this fixture the lazy chunk has no dependencies so nothing
+differs, but for a real app with shared chunks vite avoids a request waterfall
+that this PoC would incur. That is the honest missing piece, now item 4 in the
+next steps.
+
+**One difference worth knowing:** oxc (rolldown's minifier) emits string
+literals as **backtick templates** — `import(\`./lazy-hLdNd2Sa.js\`)`where
+esbuild writes`import("./lazy-BymLrvT9.js")`. A chunk-reference check that only
+accepts quotes reports a false failure on a build that is actually correct; this
+harness hit exactly that.
+
 ## Next steps, in order of what they would settle
 
 1. **Same-machine benchmark** against WebContainer's `npm run build` — the only
    number that decides whether this is faster in practice.
-2. ~~A project with real dependencies~~ — **done, see below.**
+2. ~~A project with real dependencies~~ / ~~dynamic-import chunking~~ — **done.**
 3. `lightningcss-wasm` on the rolldown path, to match vite 8's CSS handling.
-4. Only then: plugin compatibility, sourcemaps, multi-page input.
+4. A `__vitePreload`-equivalent, so a lazy chunk's own dependencies get
+   preloaded instead of discovered as a request waterfall (see below).
+5. Only then: plugin compatibility, sourcemaps, multi-page input.
