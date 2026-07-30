@@ -41,6 +41,13 @@ function parseArgs(argv) {
     // Skips lightningcss on the rolldown path. Exists because loading a second
     // wasm module measurably slows the bundle burst — see README.
     cssMinify: !rest.includes('--no-css-minify'),
+    // Disables the __vitePreload equivalent, so its effect can be A/B'd.
+    preload: !rest.includes('--no-preload'),
+    // Artificial per-chunk latency when serving the built app for the runtime
+    // check. Makes a request waterfall visible; 0 keeps normal runs fast.
+    chunkDelayMs: Number(
+      rest.find((a) => a.startsWith('--chunk-delay='))?.split('=')[1] ?? 0
+    ),
   }
 }
 
@@ -191,7 +198,10 @@ function createApp({ projectDir, outDir, vendor, needsCoi }) {
  * must point at files that exist, the JS must be transformed (no TypeScript
  * left) and must contain the app's own code, and the CSS must be real.
  */
-async function verify(outDir, { usesDynamicImport = false } = {}) {
+async function verify(
+  outDir,
+  { usesDynamicImport = false, expectPreload = false } = {}
+) {
   const problems = []
   const read = (p) => fs.readFile(path.join(outDir, p), 'utf8')
 
@@ -279,6 +289,38 @@ async function verify(outDir, { usesDynamicImport = false } = {}) {
           `expected exactly one chunk to carry the lazy module, found ${marked.length}`
         )
       }
+
+      // Preload: when a lazily-imported chunk has its own dependencies, the
+      // entry must ship the helper and a non-empty dep list for it, otherwise
+      // the browser only discovers them after fetching the chunk.
+      if (expectPreload) {
+        if (!js.includes('__wcPreload')) {
+          problems.push('entry chunk is missing the __wcPreload helper')
+        }
+        const depLists = [...js.matchAll(/__wcPreload\([^,]+,\s*(\[[^\]]*\])/g)]
+          .map((m) => {
+            try {
+              return JSON.parse(m[1])
+            } catch {
+              return null
+            }
+          })
+          .filter(Boolean)
+        if (depLists.length === 0) {
+          problems.push('no __wcPreload call with a dep list found in entry')
+        }
+        const allDeps = depLists.flat()
+        if (allDeps.length === 0) {
+          problems.push(
+            'preload dep lists are all empty despite chunks having dependencies'
+          )
+        }
+        for (const dep of allDeps) {
+          if (!jsFiles.includes(path.basename(dep))) {
+            problems.push(`preload dep does not exist on disk: ${dep}`)
+          }
+        }
+      }
     }
   }
 
@@ -290,7 +332,7 @@ async function verify(outDir, { usesDynamicImport = false } = {}) {
  * Proves the HTML, the bundled JS and the extracted CSS are wired together and
  * that the transformed TypeScript behaves — not merely that files were written.
  */
-async function verifyBuiltAppRuns(outDir, chromePath) {
+async function verifyBuiltAppRuns(outDir, chromePath, chunkDelayMs = 0) {
   const app = new Hono()
   const types = {
     '.html': 'text/html; charset=utf-8',
@@ -303,6 +345,11 @@ async function verifyBuiltAppRuns(outDir, chromePath) {
       ''
     )
     if (rel === '') rel = 'index.html'
+    // Latency on chunk requests only — enough to expose a waterfall without
+    // slowing the page load itself.
+    if (chunkDelayMs > 0 && rel.startsWith('assets/') && rel.endsWith('.js')) {
+      await new Promise((r) => setTimeout(r, chunkDelayMs))
+    }
     try {
       const body = await fs.readFile(safeJoin(outDir, rel))
       const type = types[path.extname(rel)] ?? 'application/octet-stream'
@@ -330,6 +377,7 @@ async function verifyBuiltAppRuns(outDir, chromePath) {
   })
 
   const problems = []
+  let lazyLoadMs = null
   try {
     const page = await browser.newPage()
     page.on('pageerror', (e) => problems.push(`runtime error: ${e.message}`))
@@ -366,14 +414,16 @@ async function verifyBuiltAppRuns(outDir, chromePath) {
       if (before !== '') {
         problems.push(`lazy output was populated before loading: "${before}"`)
       }
+      const started = performance.now()
       await page.click('#lazy')
       try {
         await page.waitForFunction(
           () =>
             document.querySelector('#lazy-out')?.textContent ===
             'LAZY_CHUNK_LOADED',
-          { timeout: 10000 }
+          { timeout: 15000 }
         )
+        lazyLoadMs = Math.round(performance.now() - started)
       } catch {
         const got = await page.$eval('#lazy-out', (el) => el.textContent)
         problems.push(`lazy chunk never loaded (#lazy-out = "${got}")`)
@@ -392,11 +442,12 @@ async function verifyBuiltAppRuns(outDir, chromePath) {
     await new Promise((r) => srv.server.close(() => r()))
   }
 
-  return problems
+  return { problems, lazyLoadMs }
 }
 
 async function main() {
-  const { project, keep, bundler, cssMinify } = parseArgs(process.argv)
+  const { project, keep, bundler, cssMinify, preload, chunkDelayMs } =
+    parseArgs(process.argv)
   const projectDir = path.resolve(REPO_ROOT, project)
   const outDir = path.join(HERE, 'out')
 
@@ -490,9 +541,11 @@ async function main() {
       timeout: 60000,
     })
     result = await page.evaluate(
-      (b, css) => window.__pocBuild({ bundler: b, cssMinify: css }),
+      (b, css, pre) =>
+        window.__pocBuild({ bundler: b, cssMinify: css, preload: pre }),
       bundler,
-      cssMinify
+      cssMinify,
+      preload
     )
     result.hostWallclockMs = Math.round(performance.now() - hostStart)
   } finally {
@@ -508,8 +561,18 @@ async function main() {
 
   const usesDynamicImport =
     result.outputs.filter((o) => o.path.endsWith('.js')).length > 1
-  const staticProblems = await verify(outDir, { usesDynamicImport })
-  const runtimeProblems = await verifyBuiltAppRuns(outDir, await findChrome())
+  // Preload only matters when a lazily-imported chunk has dependencies of its
+  // own, i.e. the bundler emitted a shared chunk beyond entry + one lazy chunk.
+  const jsOutputs = result.outputs.filter((o) => o.path.endsWith('.js'))
+  const staticProblems = await verify(outDir, {
+    usesDynamicImport,
+    expectPreload: preload && jsOutputs.length > 2,
+  })
+  const { problems: runtimeProblems, lazyLoadMs } = await verifyBuiltAppRuns(
+    outDir,
+    await findChrome(),
+    chunkDelayMs
+  )
   const problems = [...staticProblems, ...runtimeProblems]
 
   console.log('\n=== OUTPUT ===')
@@ -525,6 +588,14 @@ async function main() {
       2
     )
   )
+
+  if (lazyLoadMs !== null) {
+    console.log(
+      `\n=== LAZY LOAD ===\n  click -> rendered: ${lazyLoadMs} ms` +
+        (chunkDelayMs ? `  (per-chunk delay ${chunkDelayMs} ms)` : '') +
+        `  preload: ${preload ? 'on' : 'off'}`
+    )
+  }
 
   console.log('\n=== VERIFY ===')
   if (staticProblems.length === 0) {

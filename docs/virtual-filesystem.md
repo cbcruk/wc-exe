@@ -393,11 +393,12 @@ almostnode가 dev server까지만 보여주고 **행사하지 않은** 그 경�
 
 실제 의존성이 있는 프로젝트(`test/fixtures/sample-react-app`: React 18 + react-dom, TSX, CSS import)로 시험했더니 **두 파이프라인이 깨끗하게 갈렸다.**
 
-| 픽스처          | rollup (vite 5)     | rolldown (vite 8)     |
-| --------------- | ------------------- | --------------------- |
-| vanilla TS      | ✅ 314ms · 413 B    | ✅ 161ms · 384 B      |
-| 동적 `import()` | ✅ 440ms · 청크 2개 | ✅ 160ms · 청크 2개   |
-| **React**       | ❌ **실패**         | ✅ **470ms · 141 KB** |
+| 픽스처            | rollup (vite 5)     | rolldown (vite 8)     |
+| ----------------- | ------------------- | --------------------- |
+| vanilla TS        | ✅ 314ms · 413 B    | ✅ 161ms · 384 B      |
+| 동적 `import()`   | ✅ 440ms · 청크 2개 | ✅ 160ms · 청크 2개   |
+| 공유 청크 preload | ✅ 414ms · 청크 4개 | ✅ 231ms · 청크 4개   |
+| **React**         | ❌ **실패**         | ✅ **470ms · 141 KB** |
 
 - **rolldown은 React를 빌드하고 결과가 동작한다.** 런타임 검증 통과 — 컴포넌트가 마운트되고 스타일시트가 적용되고 클릭 시 카운터가 증가한다(= JSX·hooks·state 정상). bare specifier 해석, 조건부 `exports` 맵, **CJS→ESM interop**이 전부 통했다.
 - **rollup은 예측한 그 지점에서 실패한다**: `RollupError: "useState" is not exported by "node_modules/react/index.js"`. React가 CommonJS로 배포되고 rollup은 `module.exports`를 자체적으로 소비하지 못한다 — `@rollup/plugin-commonjs`가 필요하고, 그 플러그인의 의존 체인(`glob`·`resolve` 등)은 rolldown이 요구했던 것과 같은 사전 번들링을 또 요구한다. rolldown은 oxc로 CJS를 native 처리해 이 문제가 아예 없다.
@@ -440,7 +441,28 @@ init이 두 배(+~500ms, lightningcss 자체 인스턴스화 — 예상됨)인 �
 
 **판단**: 작은 스타일시트에선 나쁜 거래다 — **204 B 줄이려고 ~690ms**를 쓴다. CSS가 무거운 프로젝트에서만 값을 한다. rolldown 경로는 vite 8을 반영하는 게 목적이므로 lightningcss를 **기본 ON**으로 두고 `--no-css-minify`로 끌 수 있게 했다(번들러 단독 측정을 복구하는 용도로도 필요하다).
 
-**다음에 결판낼 것**: ① 한 머신에서 WebContainer `npm run build`와 동일 조건 비교 ② `__vitePreload` 상당물(lazy 청크의 의존성 preload) ③ 그 다음에 플러그인 호환성·sourcemap·multi-page. 자세한 내용은 `poc/vite-build-intercept/README.md`.
+#### `__vitePreload` 상당물 — 구현했고 워터폴이 사라진다
+
+맨 `import()`만 emit하면 브라우저는 lazy 청크의 의존성을 **그 청크를 받아 파싱한 뒤에야** 알게 된다 — 단계마다 왕복이 하나씩 는다. vite는 `__vitePreload`가 대상의 의존성에 `<link rel="modulepreload">`를 먼저 꽂아 이걸 없앤다. PoC도 `__wcPreload`로 같은 일을 하게 했다.
+
+`test/fixtures/sample-preload-app`이 워터폴을 실제로 만든다: 동적 import 대상 둘(`featureA`/`featureB`)이 모두 `./shared`를 정적 import → 번들러가 `shared`를 별도 청크로 끌어올리고, feature 청크가 그걸 의존한다.
+
+**측정**(청크 요청에 인위적 200ms 지연, 교차 A/B 3쌍, 클릭→렌더 시간):
+
+|          | preload ON        | preload OFF (`--no-preload`) |
+| -------- | ----------------- | ---------------------------- |
+| rollup   | 230 / 237 / 241ms | 439 / 442 / 444ms            |
+| rolldown | 234 / 236 / 238ms | 435 / 441 / 444ms            |
+
+**왕복 2회 → 1회, ~1.9× 빨라지고 ~200ms(한 홉)를 통째로 절약**한다. 주입한 지연의 1배 대 2배로 이론값과 정확히 맞는다.
+
+emit 형태도 vite와 같다: `__wcPreload(() => import("./featureA-….js"), ["/assets/shared-….js"])`. 네이티브 vite도 같은 픽스처에서 같은 청크 그래프를 만들고(그 `shared` 청크는 우리 것과 해시까지 바이트 동일) 엔트리에 `modulepreload`와 shared 청크 이름을 싣는다 — 즉 파일 배치뿐 아니라 **동작까지** 일치한다.
+
+**rolldown은 `renderDynamicImport`를 호출하지 않는다.** rollup 경로는 vite와 같은 2단계 방식(`renderDynamicImport`로 마커를 넣고, 최종 파일명이 확정되는 `generateBundle`에서 의존성 목록으로 치환)을 쓴다. rolldown에선 이 훅이 아예 안 불려서, preload를 켰는데도 엔트리가 감싸이지 않은 채(766 B, 헬퍼 없음) lazy 로드가 442ms — 워터폴 그대로였다. `generateBundle`은 호출되므로, 그쪽에서 이미 emit된 `import("./chunk.js")`를 직접 재작성하는 폴백을 넣어 228ms로 rollup과 동률을 만들었다.
+
+**남은 정직한 한계**: `generateBundle` 재작성은 청크 해시가 계산된 **뒤**라, 엔트리 해시가 주입된 헬퍼를 반영하지 못한다. vite는 rollup의 해시 플레이스홀더로 이걸 피한다 — 다음 개선 지점이다.
+
+**다음에 결판낼 것**: ① 한 머신에서 WebContainer `npm run build`와 동일 조건 비교 ② 헬퍼 주입 후 재해시 ③ 그 다음에 플러그인 호환성·sourcemap·multi-page. 자세한 내용은 `poc/vite-build-intercept/README.md`.
 
 ### 하이브리드 착지점 (제안 — 미구현)
 
