@@ -4,9 +4,10 @@
 // headless Chromium through the build, writes the produced dist/ to disk, and
 // verifies the output is a real, self-consistent bundle.
 //
-// Notably it needs NO COOP/COEP headers: esbuild-wasm's async API and
-// @rollup/browser both work without SharedArrayBuffer, unlike WebContainer and
-// container2wasm. And no CDN — the bundlers are served from local node_modules.
+// On the rollup path it needs NO COOP/COEP headers: esbuild-wasm's async API
+// and @rollup/browser both work without SharedArrayBuffer, unlike WebContainer
+// and container2wasm. The rolldown path DOES need them — its wasi binding
+// transfers a SharedArrayBuffer to a worker. Neither path uses a CDN.
 //
 // Usage:
 //   pnpm --dir poc/vite-build-intercept install   # once
@@ -36,6 +37,7 @@ function parseArgs(argv) {
     project:
       rest.find((a) => !a.startsWith('--')) ?? 'test/fixtures/sample-vite-app',
     keep: rest.includes('--keep'),
+    bundler: rest.includes('--bundler=rolldown') ? 'rolldown' : 'rollup',
   }
 }
 
@@ -81,8 +83,19 @@ async function findChrome() {
   throw new Error('Chrome not found — set CHROME_PATH')
 }
 
-function createApp({ projectDir, outDir, vendor }) {
+function createApp({ projectDir, outDir, vendor, needsCoi }) {
   const app = new Hono()
+
+  // Only the rolldown path needs this: its wasi binding posts a
+  // SharedArrayBuffer to a worker, which requires cross-origin isolation.
+  // @rollup/browser + esbuild-wasm need no such headers.
+  if (needsCoi) {
+    app.use('*', async (c, next) => {
+      await next()
+      c.header('Cross-Origin-Embedder-Policy', 'require-corp')
+      c.header('Cross-Origin-Opener-Policy', 'same-origin')
+    })
+  }
 
   app.get('/', async (c) =>
     c.html(await fs.readFile(path.join(HERE, 'browser/index.html'), 'utf8'))
@@ -110,6 +123,22 @@ function createApp({ projectDir, outDir, vendor }) {
       return new Response(body, { headers: { 'content-type': type } })
     } catch {
       return c.text(`not found: ${file}`, 404)
+    }
+  })
+
+  // Browser stubs for the node builtins @rolldown/browser still imports; the
+  // page's import map points node:fs / node:url here.
+  app.get('/shim/:file{.+}', async (c) => {
+    try {
+      const body = await fs.readFile(
+        safeJoin(path.join(HERE, 'browser/shim'), c.req.param('file')),
+        'utf8'
+      )
+      return new Response(body, {
+        headers: { 'content-type': 'text/javascript; charset=utf-8' },
+      })
+    } catch {
+      return c.text('not found', 404)
     }
   })
 
@@ -285,21 +314,27 @@ async function verifyBuiltAppRuns(outDir, chromePath) {
 }
 
 async function main() {
-  const { project, keep } = parseArgs(process.argv)
+  const { project, keep, bundler } = parseArgs(process.argv)
   const projectDir = path.resolve(REPO_ROOT, project)
   const outDir = path.join(HERE, 'out')
 
   const vendor = {
     rollup: path.join(HERE, 'node_modules/@rollup/browser/dist/es'),
     esbuild: path.join(HERE, 'node_modules/esbuild-wasm'),
+    rolldown: path.join(HERE, 'vendor/rolldown'),
   }
-  for (const [k, dir] of Object.entries(vendor)) {
+  const needed = bundler === 'rolldown' ? ['rolldown'] : ['rollup', 'esbuild']
+  for (const [k, dir] of Object.entries(vendor).filter(([k]) =>
+    needed.includes(k)
+  )) {
     try {
       await fs.access(dir)
     } catch {
       throw new Error(
         `${k} browser build not found at ${dir}\n` +
-          `run: pnpm --dir poc/vite-build-intercept install`
+          (k === 'rolldown'
+            ? 'run: node poc/vite-build-intercept/scripts/prebundle-rolldown.mjs'
+            : 'run: pnpm --dir poc/vite-build-intercept install')
       )
     }
   }
@@ -307,16 +342,28 @@ async function main() {
   console.log(
     '\nwc-exe PoC — production build in the browser via bundler interception'
   )
+  console.log(
+    `  bundler: ${bundler}${bundler === 'rolldown' ? '  (vite 8 pipeline: @rolldown/browser)' : '  (vite 5 pipeline: @rollup/browser + esbuild-wasm)'}`
+  )
   console.log(`  project: ${projectDir}`)
   console.log(`  output:  ${outDir}`)
   console.log(
-    '  headers: none (no COOP/COEP needed)  vendors: local node_modules\n'
+    `  headers: ${
+      bundler === 'rolldown'
+        ? 'COOP/COEP (rolldown wasi needs SharedArrayBuffer)'
+        : 'none (no COOP/COEP needed)'
+    }  vendors: local\n`
   )
 
   await fs.rm(outDir, { recursive: true, force: true })
   await fs.mkdir(outDir, { recursive: true })
 
-  const app = createApp({ projectDir, outDir, vendor })
+  const app = createApp({
+    projectDir,
+    outDir,
+    vendor,
+    needsCoi: bundler === 'rolldown',
+  })
   const server = await new Promise((resolve, reject) => {
     const s = serve({ fetch: app.fetch, port: 0 }, (info) =>
       resolve({ server: s, port: info.port })
@@ -350,7 +397,10 @@ async function main() {
     await page.waitForFunction(() => window.__POC_READY__ === true, {
       timeout: 60000,
     })
-    result = await page.evaluate(() => window.__pocBuild())
+    result = await page.evaluate(
+      (b) => window.__pocBuild({ bundler: b }),
+      bundler
+    )
     result.hostWallclockMs = Math.round(performance.now() - hostStart)
   } finally {
     await browser.close()

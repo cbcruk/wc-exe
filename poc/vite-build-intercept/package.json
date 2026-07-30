@@ -6,5 +6,11 @@
   "dependencies": {
     "@rollup/browser": "^4.9.0",
     "esbuild-wasm": "^0.20.0"
+  },
+  "devDependencies": {
+    "@rolldown/browser": "1.2.1"
+  },
+  "scripts": {
+    "prebundle:rolldown": "node scripts/prebundle-rolldown.mjs"
   }
 }

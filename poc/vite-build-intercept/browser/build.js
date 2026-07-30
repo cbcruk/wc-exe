@@ -11,8 +11,30 @@
 // rewrite the HTML). It is NOT vite itself running — see README for why that
 // distinction matters and what it does and does not prove.
 
-import { rollup } from '/vendor/rollup/rollup.browser.js'
-import * as esbuild from '/vendor/esbuild/esm/browser.min.js'
+// Bundlers are imported dynamically so only the selected one is fetched:
+//   rollup   = vite 5's pipeline  (@rollup/browser + esbuild-wasm)
+//   rolldown = vite 8's pipeline  (@rolldown/browser alone — it transforms TS
+//              and minifies itself via oxc, so esbuild is not needed)
+let esbuild = null
+
+async function loadBundler(kind) {
+  if (kind === 'rolldown') {
+    const m = await import('/vendor/rolldown/rolldown.js')
+    return m.rolldown
+  }
+  const m = await import('/vendor/rollup/rollup.browser.js')
+  esbuild = await import('/vendor/esbuild/esm/browser.min.js')
+  return m.rollup
+}
+
+// CSS is routed through a virtual module id so the bundler never sees a `.css`
+// extension. rolldown hard-refuses CSS input ("Bundling CSS is no longer
+// supported"), and vite's own build extracts styles rather than bundling them,
+// so this both fixes rolldown and matches what vite does.
+const CSS_VIRTUAL_PREFIX = 'virtual:wc-css:'
+// The virtual id must not *end* in `.css` either — rolldown picks a module type
+// from the id's suffix, so a trailing `.js` is what makes it treat this as JS.
+const CSS_VIRTUAL_SUFFIX = '.js'
 
 const RESOLVE_EXTENSIONS = ['', '.ts', '.tsx', '.mts', '.js', '.mjs', '.jsx']
 const RESOLVE_INDEX = ['/index.ts', '/index.tsx', '/index.js', '/index.mjs']
@@ -116,7 +138,12 @@ function resolveBare(source) {
 // The vite-like rollup plugin: VFS + esbuild-wasm transforms + CSS extraction
 // ---------------------------------------------------------------------------
 
-function vfsPlugin(collectedCss) {
+function vfsPlugin(collectedCss, kind) {
+  // rolldown transforms TypeScript and minifies itself (oxc); with it we only
+  // supply the VFS and the CSS extraction. With rollup we must also drive
+  // esbuild-wasm for both jobs.
+  const needsEsbuild = kind !== 'rolldown'
+
   return {
     name: 'wc-exe-vfs',
 
@@ -131,7 +158,11 @@ function vfsPlugin(collectedCss) {
       if (source.startsWith('.') || source.startsWith('/')) {
         const base = source.startsWith('/') ? '' : dirnameOf(importer)
         const hit = resolveInVfs(joinPath(base, source))
-        if (hit) return hit
+        if (hit) {
+          return hit.endsWith('.css')
+            ? CSS_VIRTUAL_PREFIX + hit + CSS_VIRTUAL_SUFFIX
+            : hit
+        }
         throw new Error(`cannot resolve "${source}" from "${importer}"`)
       }
 
@@ -145,17 +176,19 @@ function vfsPlugin(collectedCss) {
     },
 
     load(id) {
+      if (id.startsWith(CSS_VIRTUAL_PREFIX)) {
+        const key = id
+          .slice(CSS_VIRTUAL_PREFIX.length)
+          .slice(0, -CSS_VIRTUAL_SUFFIX.length)
+        collectedCss.push(`/* ${key} */\n${vfs.get(key) ?? ''}`)
+        return 'export default ""'
+      }
       if (!vfs.has(id)) return null
       return vfs.get(id)
     },
 
     async transform(code, id) {
-      // CSS: collect it and leave an empty module behind, like vite's build
-      // does when it extracts styles into a standalone asset.
-      if (id.endsWith('.css')) {
-        collectedCss.push(`/* ${id} */\n${code}`)
-        return { code: 'export default ""', map: null }
-      }
+      if (!needsEsbuild) return null
 
       const loader = id.match(/\.tsx$/)
         ? 'tsx'
@@ -181,6 +214,7 @@ function vfsPlugin(collectedCss) {
     // after generate() matters: rollup then hashes the *minified* output, so
     // asset filenames match what a real build would produce.
     async renderChunk(code) {
+      if (!needsEsbuild) return null // rolldown minifies via its output option
       const out = await esbuild.transform(code, {
         minify: true,
         target: 'es2020',
@@ -220,13 +254,16 @@ function rewriteHtml(html, jsFile, cssFile) {
 // Build
 // ---------------------------------------------------------------------------
 
-async function runBuild() {
+async function runBuild(kind) {
   const timings = {}
   const t0 = performance.now()
 
-  await esbuild.initialize({ wasmURL: '/vendor/esbuild/esbuild.wasm' })
-  timings.esbuildInitMs = Math.round(performance.now() - t0)
-  log(`esbuild-wasm ready (${timings.esbuildInitMs}ms)`)
+  const bundleWith = await loadBundler(kind)
+  if (esbuild) {
+    await esbuild.initialize({ wasmURL: '/vendor/esbuild/esbuild.wasm' })
+  }
+  timings.toolInitMs = Math.round(performance.now() - t0)
+  log(`${kind} toolchain ready (${timings.toolInitMs}ms)`)
 
   const tVfs = performance.now()
   const fileCount = await loadProjectIntoVfs()
@@ -240,24 +277,38 @@ async function runBuild() {
   // --- the measured burst: bundle + generate -------------------------------
   const tBuild = performance.now()
   const css = []
-  const bundle = await rollup({
+  const bundle = await bundleWith({
     input: entry,
-    plugins: [vfsPlugin(css)],
-    onwarn: (w) => log('rollup warn:', w.message),
+    plugins: [vfsPlugin(css, kind)],
+    onwarn: (w) => log('bundler warn:', w.message ?? w),
   })
 
-  // esbuild-wasm also handles CSS minification, matching vite's default.
-  const cssJoined = css.join('\n')
-  const cssSource = cssJoined.trim()
-    ? (await esbuild.transform(cssJoined, { loader: 'css', minify: true })).code
-    : ''
-  const { output } = await bundle.generate({
+  const outputOptions = {
     format: 'es',
     entryFileNames: 'assets/[name]-[hash].js',
     chunkFileNames: 'assets/[name]-[hash].js',
     assetFileNames: 'assets/[name]-[hash][extname]',
-  })
+  }
+  // rolldown minifies through an output option rather than a renderChunk hook.
+  if (kind === 'rolldown') outputOptions.minify = true
+
+  const { output } = await bundle.generate(outputOptions)
   await bundle.close()
+
+  // Read the collected CSS only now: rollup populates it during rollup(), but
+  // rolldown defers module loading until generate(), so reading any earlier
+  // silently produces no stylesheet.
+  const cssJoined = css.join('\n')
+  let cssSource = ''
+  if (cssJoined.trim()) {
+    // vite 5 minifies CSS with esbuild; vite 8 uses lightningcss. Only esbuild
+    // is loaded here, so the rolldown path leaves CSS unminified — a difference
+    // called out in the README.
+    cssSource = esbuild
+      ? (await esbuild.transform(cssJoined, { loader: 'css', minify: true }))
+          .code
+      : cssJoined
+  }
   timings.bundleMs = Math.round(performance.now() - tBuild)
 
   // Collect emitted files. CSS is appended by hand (rather than emitFile) so
@@ -321,9 +372,11 @@ async function sha8(text) {
     .join('')
 }
 
-window.__pocBuild = async () => {
+window.__pocBuild = async (options = {}) => {
+  const kind = options.bundler === 'rolldown' ? 'rolldown' : 'rollup'
   try {
-    const result = await runBuild()
+    const result = await runBuild(kind)
+    result.bundler = kind
     log('DONE', JSON.stringify(result.timings))
     return result
   } catch (err) {

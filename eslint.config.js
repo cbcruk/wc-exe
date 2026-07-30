@@ -35,7 +35,8 @@ export default tseslint.config(
     },
   },
   {
-    // poc/*/out/ holds bundles the PoC itself produced — build output, not source.
-    ignores: ['**/dist/', '**/node_modules/', 'poc/*/out/'],
+    // poc/*/out/ holds bundles the PoC produced; poc/*/vendor/ holds prebundled
+    // third-party bundlers. Both are build artifacts, not source.
+    ignores: ['**/dist/', '**/node_modules/', 'poc/*/out/', 'poc/*/vendor/'],
   }
 )

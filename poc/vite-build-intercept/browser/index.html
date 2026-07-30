@@ -3,6 +3,20 @@
   <head>
     <meta charset="UTF-8" />
     <title>wc-exe PoC — browser production build</title>
+    <!--
+      @rolldown/browser's browser entry still statically imports node:fs and
+      node:url. An import map resolves those bare specifiers to browser stubs,
+      which avoids having to pre-bundle the bundler itself. Must come before any
+      module script.
+    -->
+    <script type="importmap">
+      {
+        "imports": {
+          "node:fs": "/shim/node-fs.js",
+          "node:url": "/shim/node-url.js"
+        }
+      }
+    </script>
   </head>
   <body>
     <h1>wc-exe PoC: bundler interception</h1>
