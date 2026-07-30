@@ -460,9 +460,13 @@ emit 형태도 vite와 같다: `__wcPreload(() => import("./featureA-….js"), [
 
 **rolldown은 `renderDynamicImport`를 호출하지 않는다.** rollup 경로는 vite와 같은 2단계 방식(`renderDynamicImport`로 마커를 넣고, 최종 파일명이 확정되는 `generateBundle`에서 의존성 목록으로 치환)을 쓴다. rolldown에선 이 훅이 아예 안 불려서, preload를 켰는데도 엔트리가 감싸이지 않은 채(766 B, 헬퍼 없음) lazy 로드가 442ms — 워터폴 그대로였다. `generateBundle`은 호출되므로, 그쪽에서 이미 emit된 `import("./chunk.js")`를 직접 재작성하는 폴백을 넣어 228ms로 rollup과 동률을 만들었다.
 
-**남은 정직한 한계**: `generateBundle` 재작성은 청크 해시가 계산된 **뒤**라, 엔트리 해시가 주입된 헬퍼를 반영하지 못한다. vite는 rollup의 해시 플레이스홀더로 이걸 피한다 — 다음 개선 지점이다.
+**해시 정합성 — 캐시 오염 버그였고, 고쳤다.** 두 preload 경로 모두 `generateBundle`에서, 즉 번들러가 **해시를 계산한 뒤에** 코드를 바꾼다(rollup은 마커 치환+헬퍼 삽입, rolldown은 재작성 전체). 그래서 청크 이름이 더 이상 그 바이트를 식별하지 못했다. 이론이 아니라 실제로 재현된다 — 같은 픽스처를 preload 켜고/끄고 빌드하면 `main-BuyLOJ80.js`가 **1263 B와 766 B 두 내용**으로 나왔다. URL로 캐싱하는 모든 것(CDN·브라우저·서비스워커)이 한쪽 빌드의 바이트를 다른 쪽으로 내주게 된다.
 
-**다음에 결판낼 것**: ① 한 머신에서 WebContainer `npm run build`와 동일 조건 비교 ② 헬퍼 주입 후 재해시 ③ 그 다음에 플러그인 호환성·sourcemap·multi-page. 자세한 내용은 `poc/vite-build-intercept/README.md`.
+수정: 재작성된 청크를 **재해시해 이름을 바꾸고** HTML 참조도 함께 갱신한다. 다른 청크가 이름으로 import하는 청크를 renaming하려면 그 importer들까지 연쇄 재해시가 필요한데, 픽스처엔 그런 경우가 없으므로 **참조가 끊긴 산출물을 내보내느니 throw**하게 했다. 수정 후 이름이 제대로 갈라진다(rolldown `main-25dff951.js` vs `main-BuyLOJ80.js`, rollup `main-d5c07138.js` vs `main-aC2H4x2L.js`). 재해시 이름은 sha256 앞 8자리 hex라 번들러가 지은 이름과 눈으로 구분되고, 같은 입력을 다시 빌드하면 같은 이름이 나온다.
+
+하네스가 이 불변식을 직접 검사한다 — 헬퍼를 담은 청크는 파일명의 해시가 그 바이트의 해시와 같아야 한다. 재해시를 끄면 이 검사가 실패하므로 실효성이 있다. vite는 rollup의 해시 플레이스홀더로 애초에 최종 내용을 해시해서 같은 결과에 도달한다 — 후처리 파이프라인에선 사후 renaming이 그 등가물이다.
+
+**다음에 결판낼 것**: ① 한 머신에서 WebContainer `npm run build`와 동일 조건 비교 ② 그 다음에 플러그인 호환성·sourcemap·multi-page. 자세한 내용은 `poc/vite-build-intercept/README.md`.
 
 ### 하이브리드 착지점 (제안 — 미구현)
 
