@@ -50,6 +50,7 @@
 - ❌ **"임의의 `package.json` 프로젝트를 npm install 후 빌드"** 라는 wc-exe의 범용성과 안 맞는다. 프로젝트마다 쓰는 번들러·플러그인·postinstall 스크립트가 제각각이라, 개별 wasm 도구를 다 준비할 수 없다. npm 의존성 그래프 해석·네이티브 애드온·라이프사이클 스크립트를 감당 못 한다.
 
 → 범용 빌더가 아니라 "고정된 파이프라인"이면 최선. wc-exe에는 부분 최적화용.
+→ 다만 이 계층을 **얼마나 멀리 밀 수 있는지**는 almostnode가 보여준다(§9): 프로젝트 자신의 `esbuild`→esbuild-wasm, `rollup`→`@rollup/browser`로 **번들러 의존성을 인터셉트해 갈아끼우는** 기법이다. vite 생태계처럼 파이프라인이 수렴된 영역이면 "고정"과 "범용" 사이까지 갈 수 있다.
 
 ### 계층 D — 전체 시스템 에뮬레이션 (질문의 QEMU 방향)
 
@@ -84,13 +85,14 @@
 
 ## 4. wc-exe 관점 비교표
 
-| 접근                        | 범용 빌드            | 호스트 디스크 쓰기 | 무게        | 성숙도        | WebContainer 탈피  |
-| --------------------------- | -------------------- | ------------------ | ----------- | ------------- | ------------------ |
-| A. memfs/ZenFS              | ❌ 실행 불가         | 없음               | 매우 가벼움 | 높음          | 부분(캐시용)       |
-| B. WebContainer (현행)      | ✅                   | 없음               | 중간        | 높음          | —                  |
-| B'. burrow (§8)             | △ 자체 런타임 의미론 | 없음               | 중간        | 초기          | 완전(단, 범용성 ↓) |
-| C. wasm 도구 + WASI fs      | △ 고정 파이프라인만  | 없음               | 가벼움      | 중간          | 부분               |
-| D. QEMU-wasm/container2wasm | ✅✅ (진짜 리눅스)   | 없음               | 무거움      | 실험적·발전중 | 완전               |
+| 접근                        | 범용 빌드                       | 호스트 디스크 쓰기 | 무게              | 성숙도        | WebContainer 탈피                |
+| --------------------------- | ------------------------------- | ------------------ | ----------------- | ------------- | -------------------------------- |
+| A. memfs/ZenFS              | ❌ 실행 불가                    | 없음               | 매우 가벼움       | 높음          | 부분(캐시용)                     |
+| B. WebContainer (현행)      | ✅                              | 없음               | 중간              | 높음          | —                                |
+| B'. burrow (§8)             | △ 자체 런타임 의미론            | 없음               | 중간              | 초기          | 완전(단, 범용성 ↓)               |
+| B''. almostnode (§9)        | △ dev·CLI 중심, **빌드 미검증** | 없음               | 가벼움(250KB+CDN) | 초기          | 완전(단, execSync·네이티브 불가) |
+| C. wasm 도구 + WASI fs      | △ 고정 파이프라인만             | 없음               | 가벼움            | 중간          | 부분                             |
+| D. QEMU-wasm/container2wasm | ✅✅ (진짜 리눅스)              | 없음               | 무거움            | 실험적·발전중 | 완전                             |
 
 ---
 
@@ -330,6 +332,35 @@ wc-exe의 확정 결론: **실행 엔진은 WebContainer 유지(§7 판정), ins
 
 참고로 "패키지 매니저를 fs 추상화 위에 짓는다"는 발상 자체는 검증돼 있다 — Yarn Berry가 [`@yarnpkg/fslib`](https://github.com/yarnpkg/berry)(ZipFS 등)로 fs를 의도적으로 추상화해 패키지를 zip 안에 둔다. 단 Yarn도 스크립트 실행엔 여전히 `child_process`가 필요하다.
 
+### 실증 사례: almostnode — 1~4는 되고 5에서 정확히 막힌다
+
+[macaly/almostnode](https://github.com/macaly/almostnode) (MIT) — "Node.js in your browser". 위 분해에 대한 **가장 진전된 실증**이다. 소스를 직접 확인한 결과:
+
+**해낸 것 (1~4단계)**
+
+- **진짜 npm install** — `registry.npmjs.org`에 브라우저에서 직접 fetch(CORS 허용), 타르볼을 VFS에 풀고, `package.json`의 `bin`을 읽어 `/node_modules/.bin/`에 stub을 만들고 PATH에 추가(`src/npm/registry.ts`, `resolver.ts`, `tarball.ts`). burrow(자체 resolver)보다 한 발 더 나갔다 — 실제 레지스트리 + bin 링킹까지.
+- **40+ node 모듈 shim** + 동기/비동기 VFS(`readFileSync` 등), 967개 호환성 테스트.
+- **번들러 의존성 인터셉트** — `src/shims/esbuild.ts`(→ esbuild-wasm), `src/shims/rollup.ts`(→ `@rollup/browser`, CDN). 프로젝트가 `require('esbuild')`해도 네이티브 바이너리가 아니라 wasm 구현이 물린다. ← 계층 C(§2) 기법의 실제 구현체.
+- **`child_process`는 `just-bash`(wasm 셸)로** — `spawn`이 비동기로 동작하고, vitest·eslint·tsc 같은 bin CLI가 실제로 돈다.
+- Vite/Next **dev server** 내장, Service Worker가 `/__virtual__/<port>/`를 라우팅. ~250KB gzip, 부팅 "instant"(WebContainer 2~5s 대비).
+
+**§9의 벽이 문자 그대로 확인된다 (5~6단계)**
+
+- **`execSync`/`spawnSync`가 throw한다** — `"execSync is not supported in browser environment"`(`src/shims/child_process.ts`). **동기 프로세스 스폰은 shim으로 넘을 수 없다**는 5번 벽의 가장 선명한 증거다. 빌드 스크립트가 `execSync`를 쓰면 그 자리에서 끝난다.
+- IPC 미지원, 네이티브 모듈은 stub only, 실제 TCP/IP 없음(`net`/`tls`/`dns`/`dgram` stub, 가상 포트만).
+- **`npm install`의 install 훅(`preinstall`/`postinstall`)은 돌리지 않는다.** 지원하는 pre/post는 `npm run` 계열(prestart/start/poststart, pretest/…)뿐이다.
+
+**wc-exe 관점: 엔진 대체 후보는 아니다**
+
+- **almostnode README 스스로가** "When to use WebContainers" 절에 **"Complex build pipelines"** 와 "Production-like environments"를 적어 두었다. wc-exe의 임무가 정확히 그것이다.
+- **프로덕션 빌드가 검증되지 않았다** — e2e/유닛 테스트가 전부 dev server·CLI 도구·데모이고 `vite build` 시나리오가 없다. README의 `npm run build` 예시조차 `build: 'echo Building...'`이다. rollup shim이 있어 **원리상 가능할 수는 있어도 행사된 적 없는 경로**다. 우리가 파는 곳이 하필 그 경로(`npm run build` → `dist/`)다.
+- CDN 의존이 있다(esm.sh·unpkg에서 esbuild-wasm·@rollup/browser·react). WebContainer의 StackBlitz 인프라 의존(§1)을 단점으로 셌다면 이쪽도 같은 성격이다 — 다만 공개 CDN이라 자체 호스팅으로 바꿀 여지는 있다.
+
+**그래도 값진 것 둘**
+
+1. **§9의 분해가 실증됐다.** 추측이 아니라 동작하는 코드로 "1~4는 shim으로 되고 5에서 막힌다"가 확인된다.
+2. **번들러 인터셉트 기법**이 "브라우저에서 진짜 빌드"의 구체적 경로다. 훗날 WebContainer 독립이 목표가 되면 container2wasm(§7, 35× 느림)보다 **이 길이 현실적일 수 있다** — 대가는 `execSync`·네이티브 애드온·install 훅 포기.
+
 ### 하이브리드 착지점 (제안 — 미구현)
 
 전면 대체가 아니라 **분업**. 우리는 이미 타르볼 캐시로 1~3의 일부를 가져왔으니(§5 단기+), 그 연장선이다:
@@ -361,6 +392,7 @@ wc-exe의 확정 결론: **실행 엔진은 WebContainer 유지(§7 판정), ins
 - [container2wasm 데모](https://ktock.github.io/container2wasm-demo/)
 - ["Running QEMU Inside Browser" (FOSDEM 2025)](https://archive.fosdem.org/2025/events/attachments/fosdem-2025-6290-running-qemu-inside-browser/slides/238760/slides_1dDtpcS.pdf)
 - [burrow](https://github.com/dhravya/burrow) — 오픈소스(MIT) WebContainer 대안: 네이티브 JS 엔진 + 주변 가상화 (§8)
+- [almostnode](https://github.com/macaly/almostnode) — 오픈소스(MIT) 브라우저 Node: 진짜 npm install + 번들러 인터셉트, dev 중심 (§9)
 - [ZenFS](https://github.com/zen-fs/core) (구 [BrowserFS](https://github.com/jvilk/BrowserFS)) — 플러그블 백엔드 VFS
 - [v86](https://github.com/copy/v86) — x86 브라우저 에뮬레이터
 - [OPFS 설명](https://renderlog.in/blog/origin-private-file-system-opfs/)
