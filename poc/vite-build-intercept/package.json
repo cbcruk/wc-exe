@@ -1,0 +1,10 @@
+{
+  "name": "wc-exe-poc-vite-build-intercept",
+  "private": true,
+  "type": "module",
+  "description": "PoC: produce a production build in the browser via bundler interception (@rollup/browser + esbuild-wasm)",
+  "dependencies": {
+    "@rollup/browser": "^4.9.0",
+    "esbuild-wasm": "^0.20.0"
+  }
+}

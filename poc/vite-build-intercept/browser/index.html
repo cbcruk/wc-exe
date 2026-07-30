@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>wc-exe PoC — browser production build</title>
+  </head>
+  <body>
+    <h1>wc-exe PoC: bundler interception</h1>
+    <p>
+      Driven headlessly by <code>run.mjs</code>. Nothing to click; the host
+      calls <code>window.__pocBuild()</code> once
+      <code>window.__POC_READY__</code> is set.
+    </p>
+    <script type="module" src="/poc/build.js"></script>
+  </body>
+</html>

@@ -23,6 +23,19 @@ export default tseslint.config(
     },
   },
   {
-    ignores: ['**/dist/', '**/node_modules/'],
+    // PoC sources: browser/ runs in the page, and the host driver embeds
+    // page.evaluate() snippets that legitimately reference DOM globals. Plain
+    // JS needs this because no-undef is only switched off for TypeScript.
+    files: ['poc/**/*.js', 'poc/**/*.mjs'],
+    languageOptions: {
+      globals: {
+        ...globals.node,
+        ...globals.browser,
+      },
+    },
+  },
+  {
+    // poc/*/out/ holds bundles the PoC itself produced — build output, not source.
+    ignores: ['**/dist/', '**/node_modules/', 'poc/*/out/'],
   }
 )
