@@ -567,6 +567,50 @@ async function runBuild(kind, cssMinify, preload) {
   }
   if (!jsEntryFile) throw new Error('no entry chunk produced')
 
+  // Rehash anything generateBundle rewrote. Both preload paths mutate chunk
+  // code after the bundler has hashed it — the marker replacement and the
+  // helper prepend on rollup, the whole rewrite on rolldown — so without this
+  // a chunk's name no longer identifies its bytes. Concretely, building with
+  // and without preload produced the same filename holding different content,
+  // which is a cache-poisoning bug.
+  //
+  // vite avoids the problem differently, using rollup's hash placeholders so
+  // the final content is hashed in the first place. Renaming afterwards is the
+  // equivalent outcome for a post-processing pipeline like this one.
+  const renamed = new Map()
+  for (const f of files) {
+    if (!f.path.endsWith('.js')) continue
+    if (!f.text.includes('function __wcPreload')) continue
+    const hash = await sha8(f.text)
+    const next = f.path.replace(/-[^-.]+\.js$/, `-${hash}.js`)
+    if (next !== f.path) renamed.set(f.path, next)
+  }
+
+  if (renamed.size) {
+    // Renaming a chunk that another chunk imports by name would need the
+    // rename to cascade through those importers (and rehash them in turn).
+    // Nothing in the fixtures hits that, so refuse rather than emit output
+    // whose references silently dangle.
+    for (const [oldPath] of renamed) {
+      const base = oldPath.split('/').pop()
+      for (const other of files) {
+        if (other.path === oldPath || !other.path.endsWith('.js')) continue
+        if (other.text.includes(base)) {
+          throw new Error(
+            `rehash would break a reference: ${other.path} imports ${base}`
+          )
+        }
+      }
+    }
+
+    for (const f of files) {
+      const next = renamed.get(f.path)
+      if (next) f.path = next
+    }
+    if (renamed.has(jsEntryFile)) jsEntryFile = renamed.get(jsEntryFile)
+    log(`rehashed ${renamed.size} rewritten chunk(s)`)
+  }
+
   let cssFile = null
   if (cssSource.trim()) {
     const hash = await sha8(cssSource)

@@ -19,6 +19,7 @@ import puppeteer from 'puppeteer-core'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import crypto from 'node:crypto'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(HERE, '../..')
@@ -64,6 +65,15 @@ async function listFiles(root, base = '', extraIgnore = null) {
     else if (e.isFile()) out.push(rel)
   }
   return out
+}
+
+/** Same 8-hex-char digest the page uses when it rehashes a rewritten chunk. */
+function sha8(text) {
+  return crypto
+    .createHash('sha256')
+    .update(text, 'utf8')
+    .digest('hex')
+    .slice(0, 8)
 }
 
 function safeJoin(base, rel) {
@@ -318,6 +328,22 @@ async function verify(
         for (const dep of allDeps) {
           if (!jsFiles.includes(path.basename(dep))) {
             problems.push(`preload dep does not exist on disk: ${dep}`)
+          }
+        }
+
+        // Hash coherence: a chunk rewritten after bundling must have been
+        // rehashed, so its filename identifies its actual bytes. Without this
+        // two different builds can emit the same name with different content.
+        for (const f of jsFiles) {
+          const body = await fs
+            .readFile(path.join(outDir, 'assets', f), 'utf8')
+            .catch(() => '')
+          if (!body.includes('function __wcPreload')) continue
+          const stamped = f.match(/-([^-.]+)\.js$/)?.[1]
+          if (stamped !== sha8(body)) {
+            problems.push(
+              `rewritten chunk's name does not match its content hash: ${f}`
+            )
           }
         }
       }

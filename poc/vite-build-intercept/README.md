@@ -321,10 +321,50 @@ produced an unwrapped entry (766 B, no helper) and the lazy load still took
 rewrites the already-emitted `import("./chunk.js")` calls there instead, which
 brings rolldown to 228 ms, matching rollup.
 
-**Caveat, shared with the marker approach:** rewriting in `generateBundle`
-happens after the chunk has been hashed, so the entry's hash does not reflect
-the injected helper. vite avoids this with rollup's hash-placeholder mechanism;
-doing the same is the honest next refinement.
+### Rewriting after hashing was a cache-poisoning bug — now fixed
+
+Both preload paths mutate chunk code in `generateBundle`, i.e. **after** the
+bundler has hashed it: the marker replacement and helper prepend on rollup, the
+whole rewrite on rolldown. That means a chunk's name stopped identifying its
+bytes. The failure is not theoretical — building the same fixture with and
+without preload produced:
+
+```
+rolldown preload ON : main-BuyLOJ80.js  1263 B  md5 f829…
+rolldown preload OFF: main-BuyLOJ80.js   766 B  md5 5a5b…
+```
+
+**Same filename, different content.** Anything caching by URL — a CDN, a
+browser, a service worker — would serve one build's bytes for the other.
+
+The fix rehashes any chunk that was rewritten and renames it, updating the HTML
+entry reference to match. Renaming a chunk that another chunk imports by name
+would have to cascade into those importers (and rehash them in turn); nothing
+in the fixtures hits that, so the build **throws rather than emit dangling
+references**.
+
+After the fix the names diverge as they should, on both paths:
+
+|          | preload on         | preload off        |
+| -------- | ------------------ | ------------------ |
+| rolldown | `main-25dff951.js` | `main-BuyLOJ80.js` |
+| rollup   | `main-d5c07138.js` | `main-aC2H4x2L.js` |
+
+Rehashed names use an 8-hex-char sha256 prefix, so a rewritten chunk is
+visually distinguishable from one the bundler named. Repeat builds of identical
+input produce identical names.
+
+The harness now asserts the invariant directly: for any chunk containing the
+helper, the hash in its filename must equal a hash of its bytes. Disabling the
+rehash makes that check fail, so it has teeth:
+
+```
+✗ static: rewritten chunk's name does not match its content hash: main-BuyLOJ80.js
+```
+
+vite reaches the same outcome differently, using rollup's hash placeholders so
+the final content is what gets hashed in the first place. Renaming afterwards is
+the equivalent for a post-processing pipeline like this one.
 
 ## Code splitting: both pipelines split, one caveat
 
@@ -363,7 +403,5 @@ harness hit exactly that.
    number that decides whether this is faster in practice.
 2. ~~A project with real dependencies~~ / ~~dynamic-import chunking~~ — **done.**
 3. ~~`lightningcss-wasm` on the rolldown path~~ — **done, see above.**
-4. ~~A `__vitePreload`-equivalent~~ — **done, see above.** Remaining
-   refinement: hash the entry _after_ injecting the helper (vite uses
-   rollup's hash placeholders).
+4. ~~A `__vitePreload`-equivalent~~ / ~~hash coherence~~ — **done, see above.**
 5. Only then: plugin compatibility, sourcemaps, multi-page input.
