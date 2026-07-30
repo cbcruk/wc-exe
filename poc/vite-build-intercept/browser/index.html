@@ -4,16 +4,21 @@
     <meta charset="UTF-8" />
     <title>wc-exe PoC — browser production build</title>
     <!--
-      @rolldown/browser's browser entry still statically imports node:fs and
-      node:url. An import map resolves those bare specifiers to browser stubs,
-      which avoids having to pre-bundle the bundler itself. Must come before any
-      module script.
+      Bare specifiers our vendored browser builds import but a page cannot
+      resolve on its own. Must come before any module script.
+
+      - node:fs / node:url — @rolldown/browser's entry still imports these
+        statically; they point at browser stubs.
+      - napi-wasm — lightningcss-wasm's napi glue. A single-file ESM module with
+        no bare imports of its own, so an import-map entry is enough; no
+        prebundling needed (unlike rolldown's wasi binding).
     -->
     <script type="importmap">
       {
         "imports": {
           "node:fs": "/shim/node-fs.js",
-          "node:url": "/shim/node-url.js"
+          "node:url": "/shim/node-url.js",
+          "napi-wasm": "/vendor/napi-wasm/index.mjs"
         }
       }
     </script>

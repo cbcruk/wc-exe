@@ -16,15 +16,40 @@
 //   rolldown = vite 8's pipeline  (@rolldown/browser alone — it transforms TS
 //              and minifies itself via oxc, so esbuild is not needed)
 let esbuild = null
+let lightningcss = null
 
-async function loadBundler(kind) {
+async function loadBundler(kind, cssMinify) {
   if (kind === 'rolldown') {
     const m = await import('/vendor/rolldown/rolldown.js')
+    if (cssMinify) {
+      // Warm lightningcss here, not at first use: its wasm init is ~0.6s and
+      // would otherwise land inside the measured bundle burst.
+      lightningcss = await import('/vendor/lightningcss/index.mjs')
+      await lightningcss.default('/vendor/lightningcss/lightningcss_node.wasm')
+    }
     return m.rolldown
   }
   const m = await import('/vendor/rollup/rollup.browser.js')
   esbuild = await import('/vendor/esbuild/esm/browser.min.js')
   return m.rollup
+}
+
+/**
+ * Minify CSS with lightningcss-wasm — the tool vite 8 uses (its deps are
+ * rolldown, lightningcss and postcss). Only the rolldown path loads it; the
+ * rollup path minifies CSS with esbuild, matching vite 5.
+ *
+ * The module is initialized during toolchain setup (see loadBundler). Its wasm
+ * resolves relative to the module URL, so serving the package directory is
+ * enough; `napi-wasm` comes from the page's import map.
+ */
+function minifyCssWithLightning(cssText) {
+  const { code } = lightningcss.transform({
+    filename: 'style.css',
+    code: new TextEncoder().encode(cssText),
+    minify: true,
+  })
+  return new TextDecoder().decode(code)
 }
 
 // CSS is routed through a virtual module id so the bundler never sees a `.css`
@@ -359,11 +384,11 @@ function rewriteHtml(html, jsFile, cssFile) {
 // Build
 // ---------------------------------------------------------------------------
 
-async function runBuild(kind) {
+async function runBuild(kind, cssMinify) {
   const timings = {}
   const t0 = performance.now()
 
-  const bundleWith = await loadBundler(kind)
+  const bundleWith = await loadBundler(kind, cssMinify)
   if (esbuild) {
     await esbuild.initialize({ wasmURL: '/vendor/esbuild/esbuild.wasm' })
   }
@@ -406,13 +431,14 @@ async function runBuild(kind) {
   const cssJoined = css.join('\n')
   let cssSource = ''
   if (cssJoined.trim()) {
-    // vite 5 minifies CSS with esbuild; vite 8 uses lightningcss. Only esbuild
-    // is loaded here, so the rolldown path leaves CSS unminified — a difference
-    // called out in the README.
+    // Each pipeline minifies CSS with the tool its vite era uses: vite 5 →
+    // esbuild, vite 8 → lightningcss.
     cssSource = esbuild
       ? (await esbuild.transform(cssJoined, { loader: 'css', minify: true }))
           .code
-      : cssJoined
+      : lightningcss
+        ? minifyCssWithLightning(cssJoined)
+        : cssJoined
   }
   timings.bundleMs = Math.round(performance.now() - tBuild)
 
@@ -482,8 +508,9 @@ async function sha8(text) {
 
 window.__pocBuild = async (options = {}) => {
   const kind = options.bundler === 'rolldown' ? 'rolldown' : 'rollup'
+  const cssMinify = options.cssMinify !== false
   try {
-    const result = await runBuild(kind)
+    const result = await runBuild(kind, cssMinify)
     result.bundler = kind
     log('DONE', JSON.stringify(result.timings))
     return result

@@ -7,10 +7,10 @@ filesystem instead of `node:fs`.
 
 Two pipelines are implemented, matching two eras of vite:
 
-| flag                 | pipeline | tools                                                                                                                                                        |
-| -------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| _(default)_          | vite 5   | [`@rollup/browser`](https://www.npmjs.com/package/@rollup/browser) + [`esbuild-wasm`](https://www.npmjs.com/package/esbuild-wasm) (transform **and** minify) |
-| `--bundler=rolldown` | vite 8   | [`@rolldown/browser`](https://www.npmjs.com/package/@rolldown/browser) alone — it transforms TS and minifies itself via oxc                                  |
+| flag                 | pipeline | tools                                                                                                                                                                            |
+| -------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| _(default)_          | vite 5   | [`@rollup/browser`](https://www.npmjs.com/package/@rollup/browser) + [`esbuild-wasm`](https://www.npmjs.com/package/esbuild-wasm) (transform **and** minify)                     |
+| `--bundler=rolldown` | vite 8   | [`@rolldown/browser`](https://www.npmjs.com/package/@rolldown/browser) (TS + JS minify via oxc) + [`lightningcss-wasm`](https://www.npmjs.com/package/lightningcss-wasm) for CSS |
 
 vite 8.1.5's dependencies are `rolldown`, `lightningcss` and `postcss` — **no
 rollup, no esbuild** — so the rolldown path is what intercepting a current vite
@@ -28,6 +28,9 @@ node poc/vite-build-intercept/run.mjs                    # rollup + esbuild-wasm
 
 pnpm --dir poc/vite-build-intercept prebundle:rolldown   # once, for rolldown
 node poc/vite-build-intercept/run.mjs --bundler=rolldown
+
+# skip lightningcss (see its measured cost below)
+node poc/vite-build-intercept/run.mjs --bundler=rolldown --no-css-minify
 ```
 
 Defaults to `test/fixtures/sample-vite-app`. Needs a Chromium (`CHROME_PATH` if
@@ -82,24 +85,23 @@ the same range as a _native_ vite 5 build.
 
 ### Fidelity vs a real `vite build` (same fixture)
 
-|                                | `vite build` (native, v5) | rollup path                | rolldown path      |
-| ------------------------------ | ------------------------- | -------------------------- | ------------------ |
-| CSS asset                      | 673 B                     | **673 B — byte-identical** | 870 B (unminified) |
-| JS asset                       | 1101 B                    | 413 B                      | 384 B              |
-| minified JS                    | ✅                        | ✅ esbuild-wasm            | ✅ oxc             |
-| minified CSS                   | ✅                        | ✅                         | ❌ (see below)     |
-| TS transformed                 | ✅                        | ✅                         | ✅                 |
-| CSS extracted to its own asset | ✅                        | ✅                         | ✅                 |
-| hashed asset names             | ✅                        | ✅                         | ✅                 |
-| modulepreload polyfill         | ✅ (~690 B)               | ❌                         | ❌                 |
-| `<script>` hoisted to `<head>` | ✅                        | ❌                         | ❌                 |
-| sourcemaps                     | on request                | ❌                         | ❌                 |
+|                                | `vite build` (native, v5) | rollup path                | rolldown path        |
+| ------------------------------ | ------------------------- | -------------------------- | -------------------- |
+| CSS asset                      | 673 B                     | **673 B — byte-identical** | 666 B (lightningcss) |
+| JS asset                       | 1101 B                    | 413 B                      | 384 B                |
+| minified JS                    | ✅                        | ✅ esbuild-wasm            | ✅ oxc               |
+| minified CSS                   | ✅ esbuild                | ✅ esbuild                 | ✅ lightningcss      |
+| TS transformed                 | ✅                        | ✅                         | ✅                   |
+| CSS extracted to its own asset | ✅                        | ✅                         | ✅                   |
+| hashed asset names             | ✅                        | ✅                         | ✅                   |
+| modulepreload polyfill         | ✅ (~690 B)               | ❌                         | ❌                   |
+| `<script>` hoisted to `<head>` | ✅                        | ❌                         | ❌                   |
+| sourcemaps                     | on request                | ❌                         | ❌                   |
 
 On the rollup path the minified CSS is **byte-identical to vite's**, and the JS
-gap is almost entirely vite's modulepreload polyfill. The rolldown path leaves
-CSS unminified because only esbuild-wasm is loaded there; matching vite 8 would
-mean adding [`lightningcss-wasm`](https://www.npmjs.com/package/lightningcss-wasm)
-(it exists — the whole vite 8 toolchain has browser builds).
+gap is almost entirely vite's modulepreload polyfill. The rolldown path now
+minifies CSS with lightningcss, matching vite 8's toolchain — at a cost worth
+knowing about (next section).
 
 ## What wiring rolldown actually costs
 
@@ -236,6 +238,38 @@ Beyond the vanilla case, React forced four additions to `browser/build.js`:
 4. **JSX**: `jsx: 'automatic'` for esbuild-wasm on the rollup path; rolldown
    infers it.
 
+## lightningcss on the rolldown path: works, but the second wasm is not free
+
+vite 8 minifies CSS with lightningcss, so the rolldown path uses
+`lightningcss-wasm` to match. Wiring it was easy compared with rolldown: it is
+one ESM entry whose wasm resolves relative to the module URL, and its only bare
+import (`napi-wasm`, a single dependency-free ESM file) needs just an import-map
+entry — **no prebundling**.
+
+It works, and the CSS output is good: **870 B unminified → 666 B**, which is
+7 B _smaller_ than esbuild's 673 B. lightningcss also reorders declarations and
+shortens values further (`transparent` → `#0000`).
+
+**But loading a second wasm module measurably slows the build.** Interleaved
+A/B runs, 4 pairs, same fixture and machine:
+
+|                                    | toolchain init | bundle burst | CSS   |
+| ---------------------------------- | -------------- | ------------ | ----- |
+| rolldown + lightningcss            | 1001–1074 ms   | 344–393 ms   | 666 B |
+| rolldown alone (`--no-css-minify`) | 478–527 ms     | 154–171 ms   | 870 B |
+
+Init roughly doubles (+~500 ms, lightningcss's own instantiation — expected),
+but the **bundle burst also more than doubles** (+~190 ms), which it cannot be
+doing on 800 bytes of CSS. That points at the cost of a second wasm instance in
+the page rather than the transform itself. Consistent across all four pairs, so
+not noise.
+
+**Judgment:** for a small stylesheet this is a bad trade — roughly +690 ms to
+save 204 B. It only pays off on CSS-heavy projects. lightningcss stays **on by
+default** on the rolldown path because that path exists to mirror vite 8, and
+`--no-css-minify` opts out; the flag also keeps the bundler-only measurement
+recoverable.
+
 ## Code splitting: both pipelines split, one caveat
 
 `test/fixtures/sample-dynamic-app` adds `await import('./lazy')` behind a
@@ -272,7 +306,7 @@ harness hit exactly that.
 1. **Same-machine benchmark** against WebContainer's `npm run build` — the only
    number that decides whether this is faster in practice.
 2. ~~A project with real dependencies~~ / ~~dynamic-import chunking~~ — **done.**
-3. `lightningcss-wasm` on the rolldown path, to match vite 8's CSS handling.
+3. ~~`lightningcss-wasm` on the rolldown path~~ — **done, see above.**
 4. A `__vitePreload`-equivalent, so a lazy chunk's own dependencies get
    preloaded instead of discovered as a request waterfall (see below).
 5. Only then: plugin compatibility, sourcemaps, multi-page input.
