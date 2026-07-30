@@ -491,6 +491,55 @@ emit 형태도 vite와 같다: `__wcPreload(() => import("./featureA-….js"), [
 
 ---
 
+## 10. 중간 결론
+
+출발 질문은 "브라우저에서 가상 fs를 어떻게 구현할까"였다. 실제로 답이 나온 건 그 질문이 아니라 **그 아래 깔려 있던 질문**이다: wc-exe가 무엇을 소유해야 하고, 무엇을 남에게 맡겨야 하는가.
+
+### 확정된 것 (근거 있음)
+
+1. **저장 계층은 우리가 소유한다 — 완료.** OPFS 스냅샷 캐시로 install이 11.66s → **0.30s**(캐시 히트 시 전면 스킵). lockfile이 바뀌어도 타르볼 cacache가 살아남아 11.35s → **5.74s**(1.98×). 두 캐시 축(lockfile별 스냅샷 / 전역 누적 타르볼)의 분리가 부분 무효화를 가능하게 한 핵심이다(§5).
+2. **실행 계층은 WebContainer를 유지한다 — 성능으로 판정됨.** container2wasm은 빌드 버스트에서 **35× 느리다**(1.6s → 56s). CPU 에뮬레이션 세금이 wc-exe가 없애려던 I/O 병목보다 크다(§7).
+3. **WebContainer에서 "얇은 레이어만 떼오기"는 불가능하다.** 공개된 건 껍데기(`webcontainer-core`는 이슈 트래커, `@webcontainer/api`는 폐쇄 런타임의 스텁)이고, 탐내는 fs/런타임 알맹이가 정확히 닫힌 부분이다(§6).
+4. **`node:fs`는 필요조건이지 충분조건이 아니다.** npm install을 분해하면 1~4단계(resolve·다운로드·해제·hoist)는 가상 fs로 도달하지만 **5단계 lifecycle scripts(`child_process`)가 벽**이다. 이건 파일시스템 문제가 아니라 프로세스 모델 문제라, fs를 완벽히 가상화해도 열리지 않는다. almostnode가 이걸 동작하는 코드로 실증한다 — 1~4는 되고 `execSync`/`spawnSync`는 throw한다(§9).
+5. **결합도는 낮춰뒀다.** 러너가 `Runtime`/`SnapshotProvider` 인터페이스 뒤로 격리돼, 백엔드 교체가 구현 하나 추가로 끝난다(§5 중기).
+
+### 탐색 도중 나타난 제3의 길
+
+시작할 때의 프레이밍은 "저장소 vs 실행 엔진"이었고, WebContainer를 벗어나려면 **실행 엔진을 재구현해야 한다**는 결론으로 향했다. 그런데 PoC가 세 번째 선택지를 보여줬다:
+
+> **빌드 도구를 실행하지 말고, 우리가 빌드 도구가 된다.**
+
+번들러 인터셉트(`rollup`→`@rollup/browser`, `esbuild`→esbuild-wasm, vite 8이면 `rolldown`→`@rolldown/browser` + lightningcss-wasm)로 브라우저에서 **동작하는 프로덕션 `dist/`가 나온다.** "Node를 에뮬레이트하는" 문제가 "vite의 파이프라인을 재구현하는" 문제로 바뀌고, 후자가 훨씬 작다 — 그리고 빠르다. vite 5의 `dist/node`가 node 빌트인 24개와 `execSync`를 요구하는데, 인터셉트는 그 24개가 전부 불필요하다.
+
+여기까지 실제로 확인한 것: 프로덕션 빌드 동작(런타임 검증 포함), CSS·lazy 청크가 네이티브 vite와 **바이트 동일**, React(실제 의존성·CJS interop·`exports` 맵) 통과, 동적 청킹, lightningcss, `__wcPreload`로 워터폴 제거(~1.9×), 그리고 그 과정에서 **캐시 오염 버그 발견·수정**.
+
+### 그 길의 진짜 경계 (여기가 중요하다)
+
+**PoC는 vite가 아니다. `vite.config.ts`를 읽지 않는다.** React 픽스처엔 `plugins: [react()]`가 있는데 우리 빌드는 그걸 **통째로 무시**했다. 그런데도 성공한 이유는 평범한 React 앱이 필요로 하는 게 JSX 변환뿐이고 그건 우리가 직접 했기 때문이다. 즉:
+
+> **"React가 된다"는 "JSX 변환만 필요한 React 앱이 된다"는 뜻이다.**
+
+wc-exe의 약속은 "**임의의** 프로젝트를 빌드"인데, "임의"가 사는 곳이 바로 플러그인 생태계다 — Vue SFC, Svelte, MDX, tailwind 플러그인, legacy 타겟, `publicDir`, multi-page. 그건 하나도 손대지 않았다. 그래서 인터셉트는 **현재로선 "빠르고 오픈이지만 좁은" 경로**이고, 넓히는 비용이 이 접근의 미래를 좌우한다.
+
+### 지금의 권고
+
+- **프로덕션 경로는 바꾸지 않는다.** WebContainer + OPFS/타르볼 캐시가 현재 최적이고, 이미 실측으로 실익이 증명됐다.
+- **인터셉트는 PoC로 유지한다.** 성능·개방성(CDN 불필요, rollup 경로는 COOP/COEP도 불필요)은 매력적이지만 범용성이 아직 약속을 못 지킨다. WebContainer 독점 의존이 실제로 발목을 잡거나, 대상 프로젝트군이 "vite + JSX" 정도로 좁게 수렴하면 그때 승격 후보다.
+- **container2wasm은 성능이 아니라 다른 동인(네이티브 애드온·비-JS 툴체인)이 생길 때만 재검토한다.**
+
+### 남은 미결
+
+1. **한 머신에서 WebContainer `npm run build` vs 인터셉트 비교** — 유일하게 남은 큰 미측정. 이 저장소의 벤치 수치는 macOS, PoC 수치는 Linux 컨테이너에서 잰 것이라 직접 비교가 불가하고, WebContainer는 샌드박스에서 부팅되지 않는다. **로컬에서 둘을 나란히 돌리면 이 탐색의 마지막 숫자가 채워진다.**
+2. 플러그인 호환성 — 위에서 말한 경계. 무엇을 얼마나 지원할지가 곧 범위 결정이다.
+3. 미검증 생태계 형태: `browser` 필드 remap, 깊은 `exports` 와일드카드, worker/wasm import, CSS `@import`/`url()` 애셋 참조, sourcemap, multi-page.
+4. 캐시 고도화(§5): cacache blob 무한 증가는 상한으로 막았지만, lockfile diff 기반 부분 무효화(burrow `src/npm`의 stale-lock retry가 원형)는 아직 안 했다.
+
+### 이 탐색에서 배운 방법론
+
+수치를 믿기 전에 **교차 측정**하고, 통과를 믿기 전에 **검사가 실패하는지** 확인해야 했다. 실제로 그 과정에서 잡은 것들: 스냅샷 HIT이 빈 디렉터리를 HIT으로 보고하던 기존 버그, 게스트 클럭 스큐, lightningcss가 번들 버스트를 두 배로 만드는 비용, react-dom의 CSS 속성명 목록이 만든 오탐, oxc의 백틱 리터럴, 그리고 해시 정합성 캐시 오염. **문서에 적힌 수치 중 처음 측정에서 그대로 살아남은 게 거의 없다.**
+
+---
+
 ## 참고
 
 - [container2wasm](https://github.com/container2wasm/container2wasm) — 컨테이너 → wasm 변환기 (NTT, ktock)
