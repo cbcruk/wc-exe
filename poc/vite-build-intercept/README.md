@@ -33,7 +33,18 @@ node poc/vite-build-intercept/run.mjs --bundler=rolldown
 Defaults to `test/fixtures/sample-vite-app`. Needs a Chromium (`CHROME_PATH` if
 the lookup misses). Output lands in `poc/vite-build-intercept/out/` (gitignored).
 
-## Result: both pipelines work
+To try the React fixture, install its dependencies first — the page resolves
+bare specifiers out of the project's own `node_modules`:
+
+```bash
+npm --prefix test/fixtures/sample-react-app install
+node poc/vite-build-intercept/run.mjs test/fixtures/sample-react-app --bundler=rolldown
+```
+
+## Result: it works — with one split
+
+Both pipelines build the dependency-free fixture. On a **React** project only
+rolldown succeeds; rollup fails on CommonJS (see the React section below).
 
 ```
 === VERIFY ===
@@ -142,10 +153,9 @@ Also note the size: 10 MB of wasm plus ~1.5 MB of JS for rolldown, plus another
   hashed assets, HTML rewrite). Vite's config resolution, plugin ecosystem,
   framework plugins (`@vitejs/plugin-react`, svelte, …), `publicDir`, multi-page
   input, legacy targets and env/`define` handling are all absent.
-- **Dependencies are untested.** The fixture has zero runtime deps, so the
-  bare-specifier resolver in `browser/build.js` never runs. Real projects need
-  conditional `exports` maps and CJS→ESM interop, which is where this approach
-  gets genuinely hard.
+- **Only two fixtures.** React works (below), but plenty of ecosystem shapes are
+  still untried: packages with `browser` field remaps, deep `exports` wildcards,
+  worker/wasm imports, dynamic `import()` chunking.
 - Nothing about `postinstall`, native addons, or anything else needing a real
   process.
 
@@ -163,11 +173,72 @@ That is the strategic point: bypassing vite is far cheaper than porting vite —
 but you pay for it in ecosystem compatibility, and for wc-exe (whose promise is
 "build an _arbitrary_ project") that bill is the whole question.
 
+## The React test: rolldown passes, rollup fails on CJS
+
+`test/fixtures/sample-react-app` (React 18 + react-dom, TSX, CSS import) is the
+test that actually stresses dependency resolution — and it splits the two
+pipelines cleanly:
+
+| fixture    | rollup (vite 5)   | rolldown (vite 8)      |
+| ---------- | ----------------- | ---------------------- |
+| vanilla TS | ✅ 645 ms · 413 B | ✅ 172 ms · 384 B      |
+| **React**  | ❌ **fails**      | ✅ **505 ms · 141 KB** |
+
+**rolldown builds React and the result works.** The runtime check passes: the
+component mounts, the stylesheet applies, and clicking increments the counter —
+so JSX, hooks and state all behave. That means bare-specifier resolution,
+conditional `exports` maps and **CJS→ESM interop** all worked.
+
+**rollup fails, exactly where predicted:**
+
+```
+RollupError: src/Counter.tsx (2:9): "useState" is not exported by
+"node_modules/react/index.js", imported by "src/Counter.tsx"
+```
+
+React ships CommonJS. rollup cannot consume `module.exports` on its own — it
+needs `@rollup/plugin-commonjs`, whose own dependency chain (`glob`, `resolve`,
+…) would need the same prebundling exercise rolldown required. rolldown handles
+CJS natively via oxc, so the whole problem disappears on that path.
+
+**This is not worth fixing on the rollup path.** Current vite is rolldown
+(8.1.5's deps have no rollup and no esbuild), so the CJS gap is a property of
+the legacy pipeline. The rollup path stays in the repo as the
+no-COOP/COEP, smaller-download variant for dependency-free projects.
+
+### Fidelity on React vs native `vite build`
+
+|                       | native vite 5 + plugin-react | PoC (rolldown)        |
+| --------------------- | ---------------------------- | --------------------- |
+| JS                    | 142,671 B                    | **141,063 B** (−1.1%) |
+| CSS                   | 159 B                        | 215 B (unminified)    |
+| build time (same box) | 970 ms                       | 505 ms bundle burst   |
+
+The JS lands within ~1% of a real React production build. The PoC is slightly
+smaller because it omits vite's modulepreload polyfill; the CSS is larger only
+because the rolldown path does not minify CSS yet.
+
+### What resolving real dependencies actually required
+
+Beyond the vanilla case, React forced four additions to `browser/build.js`:
+
+1. **Lazy VFS.** node*modules is 2,150 files; fetching them all would dominate
+   the build. The page now loads a \_manifest* of paths eagerly (so resolution
+   stays synchronous) and fetches _contents_ only for files the graph reaches.
+2. **Conditional `exports` maps** — `react` exposes `{".": {"react-server":…,
+"default":…}}` and subpaths like `react/jsx-runtime`; `react-dom/client` needs
+   subpath resolution. Implemented with a condition order of
+   `browser → import → module → default → require`, plus single-`*` patterns.
+3. **`process.env.NODE_ENV` substitution.** React picks its dev or production
+   build from it, and nothing defines `process` in a page — the same job vite's
+   `define` does.
+4. **JSX**: `jsx: 'automatic'` for esbuild-wasm on the rollup path; rolldown
+   infers it.
+
 ## Next steps, in order of what they would settle
 
 1. **Same-machine benchmark** against WebContainer's `npm run build` — the only
    number that decides whether this is faster in practice.
-2. **A project with real dependencies** (e.g. React) — exercises bare-specifier
-   resolution, `exports` maps and CJS interop. Expect this to be where it breaks.
+2. ~~A project with real dependencies~~ — **done, see below.**
 3. `lightningcss-wasm` on the rolldown path, to match vite 8's CSS handling.
 4. Only then: plugin compatibility, sourcemaps, multi-page input.

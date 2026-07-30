@@ -41,15 +41,16 @@ function parseArgs(argv) {
   }
 }
 
-async function listFiles(root, base = '') {
+async function listFiles(root, base = '', extraIgnore = null) {
   const entries = await fs.readdir(path.join(root, base), {
     withFileTypes: true,
   })
   const out = []
   for (const e of entries) {
     if (IGNORE.has(e.name)) continue
+    if (extraIgnore?.has(e.name)) continue
     const rel = base ? `${base}/${e.name}` : e.name
-    if (e.isDirectory()) out.push(...(await listFiles(root, rel)))
+    if (e.isDirectory()) out.push(...(await listFiles(root, rel, extraIgnore)))
     else if (e.isFile()) out.push(rel)
   }
   return out
@@ -144,6 +145,19 @@ function createApp({ projectDir, outDir, vendor, needsCoi }) {
 
   app.get('/api/files', async (c) => c.json(await listFiles(projectDir)))
 
+  // Paths inside node_modules, so the page can resolve bare specifiers without
+  // downloading thousands of files it will never read.
+  app.get('/api/dep-files', async (c) => {
+    const root = path.join(projectDir, 'node_modules')
+    try {
+      await fs.access(root)
+    } catch {
+      return c.json([])
+    }
+    const rel = await listFiles(root, '', new Set(['.bin', '.cache']))
+    return c.json(rel.map((p) => `node_modules/${p}`))
+  })
+
   app.get('/api/files/raw', async (c) => {
     const rel = c.req.query('path')
     if (!rel) return c.text('missing path', 400)
@@ -194,32 +208,29 @@ async function verify(outDir) {
   if (cssRef) {
     const css = await read(cssRef).catch(() => null)
     if (!css) problems.push(`referenced CSS missing on disk: ${cssRef}`)
-    else if (!css.includes('font-family')) {
+    else if (!css.includes('#213547')) {
       problems.push('CSS asset does not contain the fixture stylesheet')
     }
   }
 
   if (js) {
-    // TypeScript annotations must be gone (esbuild-wasm actually ran).
-    if (/querySelector<HTML/.test(js)) {
-      problems.push(
-        'JS still contains TypeScript generics — transform did not run'
-      )
+    // TypeScript/JSX annotations must be gone (the transform actually ran).
+    for (const [re, what] of [
+      [/querySelector<HTML/, 'TypeScript generics'],
+      [/:\s*HTMLButtonElement/, 'TypeScript type annotations'],
+      [/:\s*JSX\.Element/, 'TSX return-type annotations'],
+      [/<\/div>\s*\)/, 'untransformed JSX'],
+    ]) {
+      if (re.test(js)) problems.push(`JS still contains ${what}`)
     }
-    if (/:\s*HTMLButtonElement/.test(js)) {
-      problems.push('JS still contains TypeScript type annotations')
-    }
-    // The app's own modules must be bundled in.
+    // The app's own code must be bundled in (both fixtures render this text).
     if (!js.includes('count is')) {
-      problems.push(
-        'bundled JS is missing counter.ts code (module graph broken)'
-      )
+      problems.push('bundled JS is missing the app code (module graph broken)')
     }
-    if (!js.includes('Sample Vite App')) {
-      problems.push('bundled JS is missing main.ts code')
-    }
-    // CSS must have been extracted out of the JS, like a vite build.
-    if (js.includes('font-family')) {
+    // CSS must have been extracted out of the JS, like a vite build. Match a
+    // value unique to the fixture stylesheet: react-dom itself ships a list of
+    // CSS property names, so testing for 'font-family' false-positives.
+    if (js.includes('#213547')) {
       problems.push('CSS leaked into the JS bundle instead of being extracted')
     }
   }
@@ -283,11 +294,12 @@ async function verifyBuiltAppRuns(outDir, chromePath) {
       waitUntil: 'networkidle2',
     })
 
+    // The mount node differs per fixture (#app for vanilla, #root for React).
     const rendered = await page
-      .$eval('#app', (el) => el.innerHTML)
+      .$eval('#app, #root', (el) => el.innerHTML)
       .catch(() => '')
-    if (!rendered.includes('Sample Vite App')) {
-      problems.push('app did not render into #app')
+    if (!/Sample .* App/.test(rendered)) {
+      problems.push('app did not render into its mount node')
     }
 
     // CSS asset applied? The stylesheet sets a font-family on :root.
