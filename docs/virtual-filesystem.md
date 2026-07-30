@@ -385,11 +385,28 @@ almostnode가 dev server까지만 보여주고 **행사하지 않은** 그 경�
 **증명하지 못한 것 (중요)**
 
 - **이건 `vite build`가 도는 게 아니다.** vanilla `index.html` 앱에 대해 vite가 하는 일(엔트리 발견, TS 변환, CSS 추출, 해시 애셋, HTML 재작성)을 재구현한 것이다. vite의 config 해석·플러그인 생태계·프레임워크 플러그인·multi-page·legacy 타겟은 전부 없다.
-- **의존성이 검증되지 않았다.** 픽스처에 런타임 의존성이 0개라 bare specifier 해석 경로가 아예 안 돌았다. 실제 프로젝트엔 조건부 `exports` 맵과 CJS→ESM interop이 필요하고, **거기가 이 접근의 진짜 난관**이다.
+- ~~의존성이 검증되지 않았다~~ → **React로 시험 완료(아래).** 다만 픽스처가 두 개뿐이라 `browser` 필드 remap·깊은 `exports` 와일드카드·worker/wasm import·동적 `import()` 청킹은 여전히 미검증이다.
 
 **왜 vite를 포팅하지 않는가 (실측)**: vite 5.4의 `dist/node`는 node 빌트인 **24개**(`child_process`·`worker_threads`·`net`·`tls`·`dns`·`inspector`·`module` 포함)를 import하고, 최소 한 청크가 `execSync`/`spawnSync`를 쓴다 — almostnode가 막히는 바로 그 벽이다. 인터셉트 방식은 vite를 **실행하는 대신 대체**하므로 그 24개가 전부 불필요하다. **vite를 우회하는 게 포팅보다 훨씬 싸다** — 대신 생태계 호환성으로 값을 치르고, "임의 프로젝트를 빌드"가 약속인 wc-exe에겐 그 청구서가 곧 핵심 질문이다.
 
-**다음에 결판낼 것**: ① 한 머신에서 WebContainer `npm run build`와 동일 조건 비교 ② 실제 의존성이 있는 프로젝트(React 등)로 bare specifier·`exports`·CJS interop 시험 — 여기서 깨질 것으로 예상. 자세한 내용은 `poc/vite-build-intercept/README.md`.
+#### React 시험 결과 — rolldown은 통과, rollup은 CJS에서 실패
+
+실제 의존성이 있는 프로젝트(`test/fixtures/sample-react-app`: React 18 + react-dom, TSX, CSS import)로 시험했더니 **두 파이프라인이 깨끗하게 갈렸다.**
+
+| 픽스처     | rollup (vite 5)  | rolldown (vite 8)     |
+| ---------- | ---------------- | --------------------- |
+| vanilla TS | ✅ 645ms · 413 B | ✅ 172ms · 384 B      |
+| **React**  | ❌ **실패**      | ✅ **505ms · 141 KB** |
+
+- **rolldown은 React를 빌드하고 결과가 동작한다.** 런타임 검증 통과 — 컴포넌트가 마운트되고 스타일시트가 적용되고 클릭 시 카운터가 증가한다(= JSX·hooks·state 정상). bare specifier 해석, 조건부 `exports` 맵, **CJS→ESM interop**이 전부 통했다.
+- **rollup은 예측한 그 지점에서 실패한다**: `RollupError: "useState" is not exported by "node_modules/react/index.js"`. React가 CommonJS로 배포되고 rollup은 `module.exports`를 자체적으로 소비하지 못한다 — `@rollup/plugin-commonjs`가 필요하고, 그 플러그인의 의존 체인(`glob`·`resolve` 등)은 rolldown이 요구했던 것과 같은 사전 번들링을 또 요구한다. rolldown은 oxc로 CJS를 native 처리해 이 문제가 아예 없다.
+- **rollup 경로는 고칠 가치가 없다.** 현행 vite는 rolldown이므로(8.1.5 deps에 rollup·esbuild 없음) 이 CJS 갭은 레거시 파이프라인의 속성이다. rollup 경로는 "COOP/COEP 불필요 + 다운로드 작음"이라는 이점 때문에 의존성 없는 프로젝트용 변형으로 남긴다.
+
+**충실도**: React 번들 JS가 141,063 B로 **네이티브 `vite build`(142,671 B)의 1% 이내**다(더 작은 건 modulepreload 폴리필이 없어서). 같은 머신 네이티브 vite가 970ms인데 브라우저 rolldown 번들 버스트는 505ms — 다만 PoC가 하는 일이 더 적으므로 동일 비교는 아니다.
+
+**실제 의존성을 풀려면 무엇이 필요했나** (전부 실제로 부딪혀 추가): ① **지연 VFS** — node_modules 2,150개 파일을 다 받으면 빌드보다 오래 걸려서, 경로 매니페스트만 미리 받고(해석은 동기 유지) 내용은 그래프가 닿는 파일만 fetch ② **조건부 `exports` 맵** — `browser → import → module → default → require` 순서 + 단일 `*` 패턴, `react/jsx-runtime`·`react-dom/client` 같은 서브패스 ③ **`process.env.NODE_ENV` 치환** — React가 이걸로 dev/prod 빌드를 고르는데 페이지엔 `process`가 없다(vite의 `define`이 하는 일) ④ **JSX** — rollup 경로는 esbuild `jsx:'automatic'`, rolldown은 자동 추론.
+
+**다음에 결판낼 것**: ① 한 머신에서 WebContainer `npm run build`와 동일 조건 비교 ② rolldown 경로에 `lightningcss-wasm`(vite 8의 CSS 처리 일치) ③ 그 다음에 플러그인 호환성·sourcemap·multi-page. 자세한 내용은 `poc/vite-build-intercept/README.md`.
 
 ### 하이브리드 착지점 (제안 — 미구현)
 

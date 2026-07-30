@@ -39,30 +39,52 @@ const CSS_VIRTUAL_SUFFIX = '.js'
 const RESOLVE_EXTENSIONS = ['', '.ts', '.tsx', '.mts', '.js', '.mjs', '.jsx']
 const RESOLVE_INDEX = ['/index.ts', '/index.tsx', '/index.js', '/index.mjs']
 
-/** In-memory project files: VFS path (no leading slash) -> text. */
+/** Loaded file contents: VFS path (no leading slash) -> text. */
 const vfs = new Map()
+
+/**
+ * Every path that exists, including node_modules. Kept separate from `vfs` so
+ * resolution stays synchronous while contents load lazily: a React app's
+ * node_modules is thousands of files but only a few dozen end up in the graph,
+ * so fetching all of them up front would dominate the build.
+ */
+const knownPaths = new Set()
 
 function log(...args) {
   console.log('[poc]', ...args)
 }
 
 // ---------------------------------------------------------------------------
-// VFS
+// VFS — eager manifest, lazy contents
 // ---------------------------------------------------------------------------
 
-async function loadProjectIntoVfs() {
-  const manifest = await fetch('/api/files')
-  if (!manifest.ok) throw new Error(`manifest failed: ${manifest.status}`)
-  const paths = await manifest.json()
+async function loadManifests() {
+  const [srcRes, depRes] = await Promise.all([
+    fetch('/api/files'),
+    fetch('/api/dep-files'),
+  ])
+  if (!srcRes.ok) throw new Error(`manifest failed: ${srcRes.status}`)
+  if (!depRes.ok) throw new Error(`dep manifest failed: ${depRes.status}`)
 
-  for (const p of paths) {
-    const res = await fetch(`/api/files/raw?path=${encodeURIComponent(p)}`)
-    if (!res.ok) throw new Error(`file failed: ${p} ${res.status}`)
-    vfs.set(p, await res.text())
-  }
+  const srcPaths = await srcRes.json()
+  const depPaths = await depRes.json()
+  for (const p of [...srcPaths, ...depPaths]) knownPaths.add(p)
 
-  log(`VFS loaded: ${vfs.size} files`)
-  return paths.length
+  // Project sources are few and all get read, so fetch them eagerly.
+  await Promise.all(srcPaths.map((p) => loadFile(p)))
+
+  log(`manifest: ${srcPaths.length} source + ${depPaths.length} dep files`)
+  return { sourceCount: srcPaths.length, depCount: depPaths.length }
+}
+
+async function loadFile(p) {
+  const cached = vfs.get(p)
+  if (cached !== undefined) return cached
+  const res = await fetch(`/api/files/raw?path=${encodeURIComponent(p)}`)
+  if (!res.ok) throw new Error(`file failed: ${p} ${res.status}`)
+  const text = await res.text()
+  vfs.set(p, text)
+  return text
 }
 
 /** Normalize to a VFS key: strip leading "./" and "/". */
@@ -87,50 +109,123 @@ function joinPath(base, rel) {
   return out.join('/')
 }
 
-/** Try a candidate path plus extension/index variants against the VFS. */
+/** Try a candidate path plus extension/index variants against known paths. */
 function resolveInVfs(candidate) {
   for (const ext of RESOLVE_EXTENSIONS) {
     const key = vfsKey(candidate + ext)
-    if (vfs.has(key)) return key
+    if (knownPaths.has(key)) return key
   }
   for (const idx of RESOLVE_INDEX) {
     const key = vfsKey(candidate + idx)
-    if (vfs.has(key)) return key
+    if (knownPaths.has(key)) return key
   }
   return null
 }
 
 /**
- * Resolve a bare specifier (`lodash`, `foo/bar`) against node_modules in the
- * VFS, honouring only the simple `module`/`main` fields.
- *
- * NOT exercised by the current fixture (it has zero runtime deps) and
- * deliberately shallow: no conditional `exports` maps, no CJS interop. Those
- * are the real work if this PoC is ever taken further — see README.
+ * Conditions we honour when walking an `exports` map, most specific first.
+ * A browser build wants `browser` over `node`, and ESM over CJS.
  */
-function resolveBare(source) {
+const EXPORT_CONDITIONS = ['browser', 'import', 'module', 'default', 'require']
+
+/**
+ * Pick a target out of an `exports` entry, which may be a bare string or a
+ * nested condition object. Returns null when nothing applies (e.g. a
+ * `node`-only branch).
+ */
+function pickCondition(entry) {
+  if (typeof entry === 'string') return entry
+  if (!entry || typeof entry !== 'object') return null
+  if (Array.isArray(entry)) {
+    for (const alt of entry) {
+      const hit = pickCondition(alt)
+      if (hit) return hit
+    }
+    return null
+  }
+  for (const cond of EXPORT_CONDITIONS) {
+    if (cond in entry) {
+      const hit = pickCondition(entry[cond])
+      if (hit) return hit
+    }
+  }
+  return null
+}
+
+/**
+ * Resolve `subpath` ('' for the package root) against an `exports` map,
+ * supporting exact keys and a single trailing `*` pattern.
+ */
+function resolveExports(exportsField, subpath) {
+  const key = subpath ? `./${subpath}` : '.'
+
+  // A string or condition object directly under "exports" only defines ".".
+  if (
+    typeof exportsField === 'string' ||
+    Array.isArray(exportsField) ||
+    (exportsField &&
+      typeof exportsField === 'object' &&
+      !Object.keys(exportsField).some((k) => k === '.' || k.startsWith('./')))
+  ) {
+    return key === '.' ? pickCondition(exportsField) : null
+  }
+
+  if (key in exportsField) return pickCondition(exportsField[key])
+
+  for (const [pattern, entry] of Object.entries(exportsField)) {
+    if (!pattern.includes('*')) continue
+    const [head, tail] = pattern.split('*')
+    if (key.startsWith(head) && key.endsWith(tail)) {
+      const star = key.slice(head.length, key.length - (tail.length || 0))
+      const target = pickCondition(entry)
+      if (target) return target.replace('*', star)
+    }
+  }
+  return null
+}
+
+/**
+ * Resolve a bare specifier (`react`, `react-dom/client`) against node_modules,
+ * honouring conditional `exports` maps first and falling back to the legacy
+ * `module`/`main` fields.
+ *
+ * Async because the package manifest itself is fetched lazily.
+ */
+async function resolveBare(source) {
   const parts = source.split('/')
   const pkgName = source.startsWith('@')
     ? parts.slice(0, 2).join('/')
     : parts[0]
   const subpath = source.slice(pkgName.length).replace(/^\//, '')
   const pkgDir = `node_modules/${pkgName}`
-
-  if (subpath) return resolveInVfs(`${pkgDir}/${subpath}`)
-
   const manifestKey = `${pkgDir}/package.json`
-  if (vfs.has(manifestKey)) {
+
+  if (knownPaths.has(manifestKey)) {
+    let pkg = null
     try {
-      const pkg = JSON.parse(vfs.get(manifestKey))
-      const field = pkg.module || pkg.main
+      pkg = JSON.parse(await loadFile(manifestKey))
+    } catch {
+      pkg = null
+    }
+
+    if (pkg?.exports) {
+      const target = resolveExports(pkg.exports, subpath)
+      if (target) {
+        const hit = resolveInVfs(joinPath(pkgDir, target))
+        if (hit) return hit
+      }
+    }
+
+    if (!subpath) {
+      const field = pkg?.module || pkg?.main
       if (field) {
         const hit = resolveInVfs(joinPath(pkgDir, field))
         if (hit) return hit
       }
-    } catch {
-      // fall through to index lookup
     }
   }
+
+  if (subpath) return resolveInVfs(`${pkgDir}/${subpath}`)
   return resolveInVfs(pkgDir)
 }
 
@@ -147,7 +242,7 @@ function vfsPlugin(collectedCss, kind) {
   return {
     name: 'wc-exe-vfs',
 
-    resolveId(source, importer) {
+    async resolveId(source, importer) {
       // Entry (host passes a VFS-relative path).
       if (!importer) {
         const hit = resolveInVfs(source)
@@ -166,7 +261,7 @@ function vfsPlugin(collectedCss, kind) {
         throw new Error(`cannot resolve "${source}" from "${importer}"`)
       }
 
-      const bare = resolveBare(source)
+      const bare = await resolveBare(source)
       if (bare) return bare
 
       // Leave truly external specifiers alone rather than failing the build;
@@ -175,20 +270,29 @@ function vfsPlugin(collectedCss, kind) {
       return { id: source, external: true }
     },
 
-    load(id) {
+    async load(id) {
       if (id.startsWith(CSS_VIRTUAL_PREFIX)) {
         const key = id
           .slice(CSS_VIRTUAL_PREFIX.length)
           .slice(0, -CSS_VIRTUAL_SUFFIX.length)
-        collectedCss.push(`/* ${key} */\n${vfs.get(key) ?? ''}`)
+        collectedCss.push(`/* ${key} */\n${await loadFile(key)}`)
         return 'export default ""'
       }
-      if (!vfs.has(id)) return null
-      return vfs.get(id)
+      if (!knownPaths.has(id)) return null
+      return loadFile(id)
     },
 
     async transform(code, id) {
-      if (!needsEsbuild) return null
+      // Dependencies branch on process.env.NODE_ENV (React picks its dev vs
+      // production build that way). Nothing defines `process` in a browser, so
+      // substitute it the way vite's `define` does.
+      let source = code
+      if (source.includes('process.env.NODE_ENV')) {
+        source = source.replace(/process\.env\.NODE_ENV/g, '"production"')
+      }
+
+      if (!needsEsbuild)
+        return source === code ? null : { code: source, map: null }
 
       const loader = id.match(/\.tsx$/)
         ? 'tsx'
@@ -197,14 +301,15 @@ function vfsPlugin(collectedCss, kind) {
           : id.match(/\.jsx$/)
             ? 'jsx'
             : null
-      if (!loader) return null
+      if (!loader) return source === code ? null : { code: source, map: null }
 
-      // The interception that matters: the project's TypeScript is transformed
-      // by esbuild-wasm, never by a native esbuild binary.
-      const out = await esbuild.transform(code, {
+      // The interception that matters: the project's TypeScript/JSX is
+      // transformed by esbuild-wasm, never by a native esbuild binary.
+      const out = await esbuild.transform(source, {
         loader,
         target: 'es2020',
         sourcefile: id,
+        jsx: 'automatic',
       })
       return { code: out.code, map: null }
     },
@@ -266,8 +371,8 @@ async function runBuild(kind) {
   log(`${kind} toolchain ready (${timings.toolInitMs}ms)`)
 
   const tVfs = performance.now()
-  const fileCount = await loadProjectIntoVfs()
-  timings.vfsLoadMs = Math.round(performance.now() - tVfs)
+  const { sourceCount, depCount } = await loadManifests()
+  timings.manifestMs = Math.round(performance.now() - tVfs)
 
   const html = vfs.get('index.html')
   if (!html) throw new Error('index.html not found in VFS')
@@ -355,7 +460,10 @@ async function runBuild(kind) {
 
   return {
     ok: true,
-    fileCount,
+    sourceCount,
+    depCount,
+    depFilesRead: [...vfs.keys()].filter((k) => k.startsWith('node_modules/'))
+      .length,
     timings,
     outputs: files.map((f) => ({ path: f.path, bytes: f.text.length })),
   }
