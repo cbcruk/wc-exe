@@ -38,6 +38,9 @@ function parseArgs(argv) {
       rest.find((a) => !a.startsWith('--')) ?? 'test/fixtures/sample-vite-app',
     keep: rest.includes('--keep'),
     bundler: rest.includes('--bundler=rolldown') ? 'rolldown' : 'rollup',
+    // Skips lightningcss on the rolldown path. Exists because loading a second
+    // wasm module measurably slows the bundle burst — see README.
+    cssMinify: !rest.includes('--no-css-minify'),
   }
 }
 
@@ -393,7 +396,7 @@ async function verifyBuiltAppRuns(outDir, chromePath) {
 }
 
 async function main() {
-  const { project, keep, bundler } = parseArgs(process.argv)
+  const { project, keep, bundler, cssMinify } = parseArgs(process.argv)
   const projectDir = path.resolve(REPO_ROOT, project)
   const outDir = path.join(HERE, 'out')
 
@@ -401,8 +404,18 @@ async function main() {
     rollup: path.join(HERE, 'node_modules/@rollup/browser/dist/es'),
     esbuild: path.join(HERE, 'node_modules/esbuild-wasm'),
     rolldown: path.join(HERE, 'vendor/rolldown'),
+    // vite 8's CSS tool, used by the rolldown path only.
+    lightningcss: path.join(HERE, 'node_modules/lightningcss-wasm'),
+    // lightningcss-wasm's napi glue, resolved via the page's import map.
+    'napi-wasm': path.join(
+      HERE,
+      'node_modules/lightningcss-wasm/node_modules/napi-wasm'
+    ),
   }
-  const needed = bundler === 'rolldown' ? ['rolldown'] : ['rollup', 'esbuild']
+  const needed =
+    bundler === 'rolldown'
+      ? ['rolldown', ...(cssMinify ? ['lightningcss', 'napi-wasm'] : [])]
+      : ['rollup', 'esbuild']
   for (const [k, dir] of Object.entries(vendor).filter(([k]) =>
     needed.includes(k)
   )) {
@@ -477,8 +490,9 @@ async function main() {
       timeout: 60000,
     })
     result = await page.evaluate(
-      (b) => window.__pocBuild({ bundler: b }),
-      bundler
+      (b, css) => window.__pocBuild({ bundler: b, cssMinify: css }),
+      bundler,
+      cssMinify
     )
     result.hostWallclockMs = Math.round(performance.now() - hostStart)
   } finally {

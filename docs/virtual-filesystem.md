@@ -423,7 +423,24 @@ rollup 경로는 lazy 청크와 CSS **둘 다 진짜 `vite build`와 바이트 �
 
 **알아둘 차이 하나**: oxc(rolldown의 minifier)는 문자열 리터럴을 **백틱 템플릿**으로 emit한다 — esbuild가 `import("./lazy-BymLrvT9.js")`를 쓰는 자리에 ``import(`./lazy-hLdNd2Sa.js`)``. 따옴표만 받는 청크 참조 검사는 **정상 빌드를 실패로 오탐**하는데, 이 하네스가 정확히 그걸 겪었다.
 
-**다음에 결판낼 것**: ① 한 머신에서 WebContainer `npm run build`와 동일 조건 비교 ② rolldown 경로에 `lightningcss-wasm`(vite 8의 CSS 처리 일치) ③ `__vitePreload` 상당물(lazy 청크의 의존성 preload) ④ 그 다음에 플러그인 호환성·sourcemap·multi-page. 자세한 내용은 `poc/vite-build-intercept/README.md`.
+#### lightningcss 붙이기 — 되지만 두 번째 wasm은 공짜가 아니다
+
+vite 8이 CSS를 lightningcss로 minify하므로 rolldown 경로에 `lightningcss-wasm`을 붙여 맞췄다. **배선은 rolldown보다 훨씬 쉬웠다** — ESM 진입점 하나에 wasm이 모듈 URL 기준으로 해석되고, 유일한 bare import(`napi-wasm`, 의존성 없는 단일 ESM 파일)는 import map 항목 하나로 끝. **사전 번들링 불필요.**
+
+동작하고 출력도 좋다: **870 B(unminified) → 666 B**로, esbuild의 673 B보다 **7 B 더 작다**(선언 순서 재배치, `transparent`→`#0000` 같은 추가 축약).
+
+**그런데 두 번째 wasm을 페이지에 올리면 빌드가 느려진다.** 같은 픽스처·같은 머신에서 ON/OFF를 **교차로 4쌍** 측정:
+
+|                                   | 툴체인 init | 번들 버스트 | CSS   |
+| --------------------------------- | ----------- | ----------- | ----- |
+| rolldown + lightningcss           | 1001–1074ms | 344–393ms   | 666 B |
+| rolldown 단독 (`--no-css-minify`) | 478–527ms   | 154–171ms   | 870 B |
+
+init이 두 배(+~500ms, lightningcss 자체 인스턴스화 — 예상됨)인 건 그렇다 치고, **번들 버스트도 두 배 이상(+~190ms)** 늘어난다. 800바이트 CSS를 변환하는 데 190ms가 걸릴 수는 없으니, 변환 자체가 아니라 **페이지에 wasm 인스턴스가 둘 있는 비용**으로 보인다. 4쌍 전부 일관되므로 노이즈가 아니다.
+
+**판단**: 작은 스타일시트에선 나쁜 거래다 — **204 B 줄이려고 ~690ms**를 쓴다. CSS가 무거운 프로젝트에서만 값을 한다. rolldown 경로는 vite 8을 반영하는 게 목적이므로 lightningcss를 **기본 ON**으로 두고 `--no-css-minify`로 끌 수 있게 했다(번들러 단독 측정을 복구하는 용도로도 필요하다).
+
+**다음에 결판낼 것**: ① 한 머신에서 WebContainer `npm run build`와 동일 조건 비교 ② `__vitePreload` 상당물(lazy 청크의 의존성 preload) ③ 그 다음에 플러그인 호환성·sourcemap·multi-page. 자세한 내용은 `poc/vite-build-intercept/README.md`.
 
 ### 하이브리드 착지점 (제안 — 미구현)
 
