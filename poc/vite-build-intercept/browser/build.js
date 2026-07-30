@@ -52,6 +52,51 @@ function minifyCssWithLightning(cssText) {
   return new TextDecoder().decode(code)
 }
 
+// Placeholder written by renderDynamicImport and replaced in generateBundle,
+// once final chunk filenames are known. This is the same two-phase trick vite
+// uses (its marker is __VITE_PRELOAD__).
+const PRELOAD_MARKER = '__WC_PRELOAD_DEPS__'
+
+/**
+ * Runtime helper injected into the entry chunk — our equivalent of vite's
+ * `__vitePreload`. Without it the browser cannot know a lazily-imported chunk's
+ * own dependencies until it has fetched and parsed that chunk, so every level
+ * of the graph costs another round trip.
+ *
+ * Deliberately simpler than vite's: no promise bookkeeping for in-flight CSS,
+ * no error recovery, no base-URL handling beyond the root-absolute paths this
+ * PoC emits.
+ */
+const PRELOAD_HELPER = `function __wcPreload(load, deps) {
+  for (var i = 0; i < deps.length; i++) {
+    var dep = deps[i];
+    if (document.querySelector('link[href="' + dep + '"]')) continue;
+    var link = document.createElement('link');
+    link.rel = dep.endsWith('.css') ? 'stylesheet' : 'modulepreload';
+    link.crossOrigin = '';
+    link.href = dep;
+    document.head.appendChild(link);
+  }
+  return load();
+}
+`
+
+/**
+ * Transitive static-import closure of a chunk, as root-absolute URLs, excluding
+ * anything the entry already loads (those are in the document by then).
+ */
+function chunkPreloadDeps(bundle, target, alreadyLoaded) {
+  const seen = new Set()
+  const queue = [...(bundle[target]?.imports ?? [])]
+  while (queue.length) {
+    const next = queue.shift()
+    if (seen.has(next) || alreadyLoaded.has(next)) continue
+    seen.add(next)
+    queue.push(...(bundle[next]?.imports ?? []))
+  }
+  return [...seen].map((f) => `/${f}`)
+}
+
 // CSS is routed through a virtual module id so the bundler never sees a `.css`
 // extension. rolldown hard-refuses CSS input ("Bundling CSS is no longer
 // supported"), and vite's own build extracts styles rather than bundling them,
@@ -258,7 +303,7 @@ async function resolveBare(source) {
 // The vite-like rollup plugin: VFS + esbuild-wasm transforms + CSS extraction
 // ---------------------------------------------------------------------------
 
-function vfsPlugin(collectedCss, kind) {
+function vfsPlugin(collectedCss, kind, preload) {
   // rolldown transforms TypeScript and minifies itself (oxc); with it we only
   // supply the VFS and the CSS extraction. With rollup we must also drive
   // esbuild-wasm for both jobs.
@@ -339,6 +384,68 @@ function vfsPlugin(collectedCss, kind) {
       return { code: out.code, map: null }
     },
 
+    // Wrap every dynamic import so the target chunk's own dependencies can be
+    // preloaded alongside it. The dep list is not known yet — filenames are
+    // assigned after rendering — so a marker goes in and generateBundle
+    // resolves it.
+    renderDynamicImport() {
+      if (!preload) return null
+      return {
+        left: '__wcPreload(() => import(',
+        right: `), ${PRELOAD_MARKER})`,
+      }
+    },
+
+    // Final filenames exist here, so resolve the markers and inject the helper.
+    generateBundle(_options, bundle) {
+      if (!preload) return
+      const entry = Object.values(bundle).find(
+        (c) => c.type === 'chunk' && c.isEntry
+      )
+      const entryLoads = new Set(entry?.imports ?? [])
+
+      for (const chunk of Object.values(bundle)) {
+        if (chunk.type !== 'chunk') continue
+
+        if (chunk.code.includes(PRELOAD_MARKER)) {
+          // rollup path: renderDynamicImport already wrapped the imports, so
+          // only the dep lists are outstanding. Targets appear in source order,
+          // matching marker order, so consume them in step.
+          const targets = [...chunk.dynamicImports]
+          chunk.code = chunk.code.replaceAll(PRELOAD_MARKER, () => {
+            const target = targets.shift()
+            const deps = target
+              ? chunkPreloadDeps(bundle, target, entryLoads)
+              : []
+            return JSON.stringify(deps)
+          })
+          chunk.code = PRELOAD_HELPER + chunk.code
+          continue
+        }
+
+        // rolldown path: it does not call renderDynamicImport, so nothing was
+        // wrapped. Rewrite the emitted `import("./chunk.js")` calls here
+        // instead — the filenames are final at this point. oxc emits string
+        // literals as backtick templates, hence the quote class.
+        if (!chunk.dynamicImports?.length) continue
+        let rewrote = false
+        chunk.code = chunk.code.replace(
+          /import\(\s*(["'`])(\.\/[^"'`]+\.js)\1\s*\)/g,
+          (whole, _quote, spec) => {
+            const target = chunk.dynamicImports.find(
+              (t) => t.split('/').pop() === spec.split('/').pop()
+            )
+            if (!target) return whole
+            const deps = chunkPreloadDeps(bundle, target, entryLoads)
+            if (deps.length === 0) return whole
+            rewrote = true
+            return `__wcPreload(() => ${whole}, ${JSON.stringify(deps)})`
+          }
+        )
+        if (rewrote) chunk.code = PRELOAD_HELPER + chunk.code
+      }
+    },
+
     // Minify inside the rollup pipeline, which is where vite does it too (its
     // esbuild minifier runs as a renderChunk hook). Doing it here rather than
     // after generate() matters: rollup then hashes the *minified* output, so
@@ -384,7 +491,7 @@ function rewriteHtml(html, jsFile, cssFile) {
 // Build
 // ---------------------------------------------------------------------------
 
-async function runBuild(kind, cssMinify) {
+async function runBuild(kind, cssMinify, preload) {
   const timings = {}
   const t0 = performance.now()
 
@@ -409,7 +516,7 @@ async function runBuild(kind, cssMinify) {
   const css = []
   const bundle = await bundleWith({
     input: entry,
-    plugins: [vfsPlugin(css, kind)],
+    plugins: [vfsPlugin(css, kind, preload)],
     onwarn: (w) => log('bundler warn:', w.message ?? w),
   })
 
@@ -509,8 +616,9 @@ async function sha8(text) {
 window.__pocBuild = async (options = {}) => {
   const kind = options.bundler === 'rolldown' ? 'rolldown' : 'rollup'
   const cssMinify = options.cssMinify !== false
+  const preload = options.preload !== false
   try {
-    const result = await runBuild(kind, cssMinify)
+    const result = await runBuild(kind, cssMinify, preload)
     result.bundler = kind
     log('DONE', JSON.stringify(result.timings))
     return result

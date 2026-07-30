@@ -181,11 +181,12 @@ but you pay for it in ecosystem compatibility, and for wc-exe (whose promise is
 test that actually stresses dependency resolution — and it splits the two
 pipelines cleanly:
 
-| fixture            | rollup (vite 5)      | rolldown (vite 8)      |
-| ------------------ | -------------------- | ---------------------- |
-| vanilla TS         | ✅ 314 ms · 413 B    | ✅ 161 ms · 384 B      |
-| dynamic `import()` | ✅ 440 ms · 2 chunks | ✅ 160 ms · 2 chunks   |
-| **React**          | ❌ **fails**         | ✅ **470 ms · 141 KB** |
+| fixture              | rollup (vite 5)      | rolldown (vite 8)      |
+| -------------------- | -------------------- | ---------------------- |
+| vanilla TS           | ✅ 314 ms · 413 B    | ✅ 161 ms · 384 B      |
+| dynamic `import()`   | ✅ 440 ms · 2 chunks | ✅ 160 ms · 2 chunks   |
+| shared-chunk preload | ✅ 414 ms · 4 chunks | ✅ 231 ms · 4 chunks   |
+| **React**            | ❌ **fails**         | ✅ **470 ms · 141 KB** |
 
 **rolldown builds React and the result works.** The runtime check passes: the
 component mounts, the stylesheet applies, and clicking increments the counter —
@@ -270,6 +271,61 @@ default** on the rolldown path because that path exists to mirror vite 8, and
 `--no-css-minify` opts out; the flag also keeps the bundler-only measurement
 recoverable.
 
+## The `__vitePreload` equivalent: implemented, and it removes the waterfall
+
+Emitting a bare `import()` means the browser only discovers a lazy chunk's own
+dependencies _after_ fetching and parsing that chunk — one extra round trip per
+level. vite avoids this with `__vitePreload`, which injects
+`<link rel="modulepreload">` for the target's dependencies before importing it.
+The PoC now does the same, as `__wcPreload`.
+
+`test/fixtures/sample-preload-app` makes the waterfall real: two dynamic
+imports whose targets both statically import `./shared`, so the bundler hoists
+`shared` into its own chunk that the feature chunks depend on.
+
+**Measured** with an artificial 200 ms delay on chunk requests
+(`--chunk-delay=200`), interleaved A/B, 3 pairs per bundler — time from click to
+the lazily-rendered text appearing:
+
+|          | preload on         | preload off (`--no-preload`) |
+| -------- | ------------------ | ---------------------------- |
+| rollup   | 230 / 237 / 241 ms | 439 / 442 / 444 ms           |
+| rolldown | 234 / 236 / 238 ms | 435 / 441 / 444 ms           |
+
+One round trip instead of two — **~1.9x faster, saving a full ~200 ms hop** — and
+the numbers land exactly where the theory says (1x vs 2x the injected delay).
+
+Emitted shape, matching vite's:
+
+```js
+__wcPreload(
+  () => import('./featureA-CGZr6uFs.js'),
+  ['/assets/shared-D6P-CrGZ.js']
+)
+```
+
+Native vite on the same fixture produces the same chunk graph (its `shared`
+chunk is byte-identical to ours, hash included) and its entry likewise carries
+`modulepreload` plus the shared chunk's name — so this matches vite's
+behaviour, not just its file layout.
+
+### rolldown does not call `renderDynamicImport`
+
+The rollup path uses the same two-phase trick vite does: `renderDynamicImport`
+wraps each import with a `__WC_PRELOAD_DEPS__` marker, then `generateBundle` —
+where final filenames exist — replaces markers with the dependency list.
+
+**rolldown never calls `renderDynamicImport`.** With preload on it silently
+produced an unwrapped entry (766 B, no helper) and the lazy load still took
+442 ms, i.e. the full waterfall. `generateBundle` _is_ called, so the fallback
+rewrites the already-emitted `import("./chunk.js")` calls there instead, which
+brings rolldown to 228 ms, matching rollup.
+
+**Caveat, shared with the marker approach:** rewriting in `generateBundle`
+happens after the chunk has been hashed, so the entry's hash does not reflect
+the injected helper. vite avoids this with rollup's hash-placeholder mechanism;
+doing the same is the honest next refinement.
+
 ## Code splitting: both pipelines split, one caveat
 
 `test/fixtures/sample-dynamic-app` adds `await import('./lazy')` behind a
@@ -307,6 +363,7 @@ harness hit exactly that.
    number that decides whether this is faster in practice.
 2. ~~A project with real dependencies~~ / ~~dynamic-import chunking~~ — **done.**
 3. ~~`lightningcss-wasm` on the rolldown path~~ — **done, see above.**
-4. A `__vitePreload`-equivalent, so a lazy chunk's own dependencies get
-   preloaded instead of discovered as a request waterfall (see below).
+4. ~~A `__vitePreload`-equivalent~~ — **done, see above.** Remaining
+   refinement: hash the entry _after_ injecting the helper (vite uses
+   rollup's hash placeholders).
 5. Only then: plugin compatibility, sourcemaps, multi-page input.
