@@ -1,4 +1,5 @@
 import puppeteer, { type Browser, type Page } from 'puppeteer-core'
+import type { CacheResult } from '../types.js'
 
 /**
  * Drives the headless Chrome instance that hosts the runner page.
@@ -144,26 +145,17 @@ export class WCBrowser {
    * starts empty and every run is a miss.
    *
    * @returns `cached` whether the snapshot was reused, `key` the lockfile hash
-   *   it is stored under, and on a miss `bytes` the snapshot size.
+   *   it is stored under, and on a miss `bytes` the snapshot size plus the
+   *   tarball-cache stats (`npmCacheRestored`, `npmCacheBytes`).
    * @throws If the install fails.
    */
-  async installWithCache(): Promise<{
-    cached: boolean
-    key: string
-    bytes?: number
-  }> {
+  async installWithCache(): Promise<CacheResult> {
     if (!this.page) throw new Error('Browser not launched')
 
     return await this.page.evaluate(async () => {
       return await (
         window as unknown as {
-          wcRunner: {
-            installWithCache: () => Promise<{
-              cached: boolean
-              key: string
-              bytes?: number
-            }>
-          }
+          wcRunner: { installWithCache: () => Promise<CacheResult> }
         }
       ).wcRunner.installWithCache()
     })
@@ -280,6 +272,29 @@ export class WCBrowser {
         }
       ).wcRunner.getServerUrl()
     })
+  }
+
+  /**
+   * Deletes paths inside the runtime that no longer exist on the host.
+   *
+   * Mounting only adds and overwrites, so without this a deleted file stays
+   * resolvable in a long-lived runtime and the build keeps succeeding against
+   * source that is gone.
+   *
+   * @param paths Project-root-relative paths. Missing paths are ignored.
+   * @returns How many paths were requested.
+   * @throws If the browser has not been launched.
+   */
+  async removePaths(paths: string[]): Promise<number> {
+    if (!this.page) throw new Error('Browser not launched')
+
+    return await this.page.evaluate(async (pathsArg: string[]) => {
+      return await (
+        window as unknown as {
+          wcRunner: { removePaths: (p: string[]) => Promise<number> }
+        }
+      ).wcRunner.removePaths(pathsArg)
+    }, paths)
   }
 
   /**

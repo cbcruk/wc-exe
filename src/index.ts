@@ -16,6 +16,13 @@ export { install } from './commands/install.js'
 // Low-level primitives, exposed for programmatic use and benchmarking.
 export { startServer, createApp, type ServerInfo } from './core/server.js'
 export { WCBrowser } from './core/browser.js'
-export { listProjectFiles, readProjectFileBytes } from './core/file-sync.js'
+export {
+  listProjectFiles,
+  readProjectFileBytes,
+  listProjectManifest,
+  diffManifests,
+  type Manifest,
+  type SyncPlan,
+} from './core/file-sync.js'
 
 export type * from './types.js'

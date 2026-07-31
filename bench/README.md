@@ -37,6 +37,42 @@ Needs a Chrome/Chromium binary — set `CHROME_PATH` if the default lookup
 (`src/core/browser.ts`) misses it. Prints per-run and averaged
 `bootMs / mountMs / installMs / buildMs`. Compare `buildMs`.
 
+### Warm mode (`--cache`) — the persistent-runner Phase 0 question
+
+The default mode is cold on purpose: it is the container2wasm baseline. But
+once the OPFS cache lands, a _cold_ breakdown says nothing about day-to-day
+cost. `docs/persistent-runner.md` §8 Phase 0 asks a different question — **on a
+warm run, is boot actually dominant enough to justify a daemon?** — and that
+needs warm numbers.
+
+```bash
+node bench/webcontainer.mjs ../my-real-project --cache --runs 4
+```
+
+`--cache` pins the runner to the fixed port and a persistent Chrome profile
+(the same two things the real `--cache` flag needs, for the same reason: OPFS is
+origin-scoped), then installs through `installWithCache`. **Run 1 seeds the
+cache and is excluded from `warmAverage`**; runs 2..N are the measurement. The
+cache lives in a temp dir, not your real `~/.cache/wc-exe`, and is wiped at
+start unless you pass `--keep-cache`.
+
+It then prints each phase's share of the warm total and splits it three ways:
+
+| bucket           | phases         | why                                                       |
+| ---------------- | -------------- | --------------------------------------------------------- |
+| amortizable      | boot + install | a live container removes both outright                    |
+| replaced by sync | mount          | becomes manifest-diff sync, at a cost nobody has measured |
+| irreducible      | build          | same work either way                                      |
+
+and ends with a **GO / STOP** call: GO if boot is ≥30% of the warm run, STOP
+otherwise. STOP is a real outcome, not a failure — on a project whose build
+dwarfs boot, the daemon buys little and Phase 0 is where to stop. The reported
+win is an **upper bound**: manifest sync is not yet subtracted from it.
+
+The arithmetic behind that call lives in `bench/report.mjs` and is unit-tested
+(`bench/webcontainer.test.mjs`), because a sign error there would misdirect the
+whole design.
+
 ## 2. container2wasm
 
 ```bash

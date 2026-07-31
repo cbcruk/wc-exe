@@ -71,6 +71,25 @@ export interface WCMessage {
 }
 
 /**
+ * Outcome of a cache-aware install, as reported by the in-browser runner.
+ *
+ * Mirrors the runner's own `CacheResult`; kept here because the two sides are
+ * built as separate bundles and cannot share a type import.
+ */
+export interface CacheResult {
+  /** Whether `node_modules` was restored from a snapshot instead of installed. */
+  cached: boolean
+  /** Lockfile hash the snapshot is keyed on. */
+  key: string
+  /** Size of the snapshot just written. Absent on a cache HIT. */
+  bytes?: number
+  /** Whether npm's tarball cache was restored before installing. MISS only. */
+  npmCacheRestored?: boolean
+  /** Size of the tarball cache snapshot. MISS only. */
+  npmCacheBytes?: number
+}
+
+/**
  * Host-side callbacks the local server exposes to the in-browser runner.
  * Each maps to one `/api` route in {@link createApp}.
  */

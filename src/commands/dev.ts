@@ -160,6 +160,27 @@ export async function dev(options: DevOptions): Promise<void> {
           }
         })
 
+        // mount/writeFile only add and overwrite, so a deletion has to be
+        // pushed explicitly — otherwise the dev server keeps resolving a file
+        // the developer already removed.
+        const removeFromRuntime = async (
+          filePath: string,
+          label: string
+        ): Promise<void> => {
+          try {
+            const wcPath = path.relative('.', filePath).replace(/\\/g, '/')
+            await browser!.removePaths([wcPath])
+            console.log(chalk.gray(`  [${label}] ${filePath}`))
+          } catch {
+            console.error(chalk.red(`  [Error] Failed to remove: ${filePath}`))
+          }
+        }
+
+        watcher.on('unlink', (filePath) => removeFromRuntime(filePath, 'Del'))
+        watcher.on('unlinkDir', (dirPath) =>
+          removeFromRuntime(dirPath, 'DelDir')
+        )
+
         watcher.on('add', async (filePath) => {
           try {
             const content = await fs.readFile(filePath, 'utf-8')
