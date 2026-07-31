@@ -529,6 +529,7 @@ wc-exe의 약속은 "**임의의** 프로젝트를 빌드"인데, "임의"가 �
 
 ### 남은 미결
 
+0. **부팅 상주화(persistent runner)** — 캐시가 install을 0.30s로 줄인 뒤 **부팅 ~5.4s가 지배적 비용**(warm 실행의 ~70%)이 됐다. 엔진 교체보다 훨씬 싸게 남은 가장 큰 덩어리를 건드린다. 설계: `docs/persistent-runner.md`.
 1. **한 머신에서 WebContainer `npm run build` vs 인터셉트 비교** — 유일하게 남은 큰 미측정. 이 저장소의 벤치 수치는 macOS, PoC 수치는 Linux 컨테이너에서 잰 것이라 직접 비교가 불가하고, WebContainer는 샌드박스에서 부팅되지 않는다. **로컬에서 둘을 나란히 돌리면 이 탐색의 마지막 숫자가 채워진다.**
 2. 플러그인 호환성 — 위에서 말한 경계. 무엇을 얼마나 지원할지가 곧 범위 결정이다.
 3. 미검증 생태계 형태: `browser` 필드 remap, 깊은 `exports` 와일드카드, worker/wasm import, CSS `@import`/`url()` 애셋 참조, sourcemap, multi-page.
