@@ -111,3 +111,69 @@ function safeResolve(base: string, relPath: string): string {
 
   return fullPath
 }
+
+/**
+ * A project snapshot: slash-separated relative path -> change stamp.
+ *
+ * The stamp only has to change when the file's contents might have; it is
+ * `size:mtimeMs`, which is cheap to collect and good enough to drive a sync.
+ */
+export type Manifest = Map<string, string>
+
+/** What a runtime needs to do to match the host's files. */
+export interface SyncPlan {
+  /** Paths to write or overwrite. */
+  upsert: string[]
+  /**
+   * Paths to delete. Populated only for files the runtime was previously told
+   * about — see {@link diffManifests} for why this matters.
+   */
+  remove: string[]
+}
+
+/**
+ * Collects a {@link Manifest} for a project directory.
+ *
+ * @param sourcePath Directory to walk.
+ */
+export async function listProjectManifest(
+  sourcePath: string
+): Promise<Manifest> {
+  const absoluteBase = path.resolve(sourcePath)
+  const paths = await listProjectFiles(absoluteBase)
+  const manifest: Manifest = new Map()
+
+  for (const rel of paths) {
+    const stat = await fs.stat(path.join(absoluteBase, ...rel.split('/')))
+    manifest.set(rel, `${stat.size}:${stat.mtimeMs}`)
+  }
+
+  return manifest
+}
+
+/**
+ * Works out what to sync into a runtime that already holds `previous`.
+ *
+ * Deletions are the reason this exists. `mount` only adds and overwrites, so a
+ * file deleted on the host survives in a long-lived runtime and the build can
+ * still resolve it — a build that succeeds against files that no longer exist.
+ * Anything in `previous` but not in `next` therefore has to be removed
+ * explicitly.
+ *
+ * @param previous What the runtime was last told to hold. Empty for a fresh
+ *   runtime, which yields a plan that writes everything and removes nothing.
+ * @param next The host's current state.
+ */
+export function diffManifests(previous: Manifest, next: Manifest): SyncPlan {
+  const upsert: string[] = []
+  const remove: string[] = []
+
+  for (const [rel, stamp] of next) {
+    if (previous.get(rel) !== stamp) upsert.push(rel)
+  }
+  for (const rel of previous.keys()) {
+    if (!next.has(rel)) remove.push(rel)
+  }
+
+  return { upsert, remove }
+}

@@ -60,6 +60,13 @@ export class WebContainerRuntime implements Runtime, SnapshotProvider {
     }
   }
 
+  rm(
+    path: string,
+    options?: { recursive?: boolean; force?: boolean }
+  ): Promise<void> {
+    return this.wc.fs.rm(path, options)
+  }
+
   onServerReady(listener: (port: number, url: string) => void): void {
     this.wc.on('server-ready', listener)
   }

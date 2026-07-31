@@ -589,6 +589,29 @@ function spawnCommand(cmd: string, args: string[]): void {
  * @param path Absolute path inside the runtime, e.g. `/src/main.ts`.
  * @param content UTF-8 text. Binary files are not supported here.
  */
+/**
+ * Deletes paths from the runtime that no longer exist on the host.
+ *
+ * `mount` only adds and overwrites, so without this a file deleted on the host
+ * stays resolvable inside a long-lived runtime and the build keeps succeeding
+ * against source that is gone.
+ *
+ * @param paths Root-relative paths to delete. Missing paths are ignored.
+ * @returns How many paths were requested.
+ */
+async function removePaths(paths: string[]): Promise<number> {
+  invariant(runtime, 'Runtime not booted')
+
+  for (const p of paths) {
+    await runtime.rm(p, { recursive: true, force: true })
+  }
+
+  if (paths.length > 0) {
+    console.log(`[wc-build] Removed ${paths.length} stale path(s).`)
+  }
+  return paths.length
+}
+
 async function writeFile(path: string, content: string): Promise<void> {
   invariant(runtime, 'Runtime not booted')
 
@@ -692,6 +715,7 @@ const wcRunner = {
   installWithCache,
   spawnCommand,
   writeFile,
+  removePaths,
   uploadDist,
   getServerUrl,
 }

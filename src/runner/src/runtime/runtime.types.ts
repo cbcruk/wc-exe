@@ -70,6 +70,20 @@ export interface Runtime {
    */
   mkdir(path: string, options?: { recursive?: boolean }): Promise<void>
   /**
+   * Deletes a path.
+   *
+   * Needed because {@link Runtime.mount} only adds and overwrites: a file
+   * deleted on the host would otherwise survive in the runtime and stay
+   * resolvable by the build.
+   *
+   * @param options.recursive Delete directories and their contents.
+   * @param options.force Succeed if the path does not exist.
+   */
+  rm(
+    path: string,
+    options?: { recursive?: boolean; force?: boolean }
+  ): Promise<void>
+  /**
    * Registers a listener fired when a process inside the runtime starts
    * listening on a port. `url` is the address reachable from the host page.
    */
