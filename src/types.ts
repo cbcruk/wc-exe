@@ -114,6 +114,19 @@ export interface RunCommandOptions {
 }
 
 /**
+ * Result of one command run in an interactive shell.
+ *
+ * Mirrors the runner's own `ShellExecResult`; kept here because the two sides
+ * are built as separate bundles and cannot share a type import.
+ */
+export interface ShellExecResult {
+  /** Everything the command printed, ANSI escapes intact. */
+  output: string
+  /** The command's exit status, or `null` if the shell did not report one. */
+  exitCode: number | null
+}
+
+/**
  * Outcome of a cache-aware install, as reported by the in-browser runner.
  *
  * Mirrors the runner's own `CacheResult`; kept here because the two sides are

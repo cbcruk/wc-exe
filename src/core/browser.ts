@@ -3,6 +3,7 @@ import type {
   CacheResult,
   CommandResult,
   RunCommandOptions,
+  ShellExecResult,
   TerminalSize,
 } from '../types.js'
 
@@ -21,6 +22,10 @@ export class WCBrowser {
   private userDataDir: string | undefined
   /** Source of generated command handles; see {@link runCommand}. */
   private handleSequence = 0
+  /** Live output listeners, by shell id; see {@link openShell}. */
+  private shellListeners = new Map<string, (chunk: string) => void>()
+  /** Whether `__wcShellData__` has been bound on the page yet. */
+  private shellDataBound = false
 
   /**
    * @param options.verbose Mirror browser console and failed requests to stdout.
@@ -239,6 +244,146 @@ export class WCBrowser {
     } finally {
       clearTimeout(timer)
     }
+  }
+
+  /**
+   * Opens an interactive shell inside the runtime.
+   *
+   * Output is pushed to `onData` as it arrives rather than polled, so a
+   * terminal attached to this stays responsive.
+   *
+   * Prefer {@link runCommand} for one-off commands: a fresh process per command
+   * has no shared state to leak, and none of a long-lived shell's fragility.
+   * This is for interactive use, where the session is the point.
+   *
+   * @param id Caller-chosen id, used by the other `shell*` methods.
+   * @throws If a shell with this id is already open.
+   */
+  async openShell(
+    id: string,
+    options?: { cols?: number; rows?: number; onData?: (chunk: string) => void }
+  ): Promise<void> {
+    if (!this.page) throw new Error('Browser not launched')
+
+    if (options?.onData && !this.shellDataBound) {
+      // exposeFunction can only bind a name once per page, so the single bound
+      // callback fans out to whichever shells are open.
+      await this.page.exposeFunction(
+        '__wcShellData__',
+        (shellId: string, chunk: string) => {
+          this.shellListeners.get(shellId)?.(chunk)
+        }
+      )
+      this.shellDataBound = true
+    }
+
+    if (options?.onData) this.shellListeners.set(id, options.onData)
+
+    await this.page.evaluate(
+      async (idArg: string, optionsArg: { cols?: number; rows?: number }) => {
+        await (
+          window as unknown as {
+            wcRunner: {
+              openShell: (
+                i: string,
+                o?: { cols?: number; rows?: number }
+              ) => Promise<void>
+            }
+          }
+        ).wcRunner.openShell(idArg, optionsArg)
+      },
+      id,
+      { cols: options?.cols, rows: options?.rows }
+    )
+  }
+
+  /**
+   * Runs one command in an open shell and waits for it to finish.
+   *
+   * @returns The command's output and exit status.
+   */
+  async shellExec(id: string, command: string): Promise<ShellExecResult> {
+    if (!this.page) throw new Error('Browser not launched')
+
+    return await this.page.evaluate(
+      async (idArg: string, commandArg: string) => {
+        return await (
+          window as unknown as {
+            wcRunner: {
+              shellExec: (i: string, c: string) => Promise<ShellExecResult>
+            }
+          }
+        ).wcRunner.shellExec(idArg, commandArg)
+      },
+      id,
+      command
+    )
+  }
+
+  /**
+   * Sends Ctrl-C to an open shell.
+   *
+   * @throws If the shell does not acknowledge it — which means job control has
+   *   died and the session should be discarded, not retried.
+   */
+  async shellInterrupt(id: string): Promise<void> {
+    if (!this.page) throw new Error('Browser not launched')
+
+    await this.page.evaluate(async (idArg: string) => {
+      await (
+        window as unknown as {
+          wcRunner: { shellInterrupt: (i: string) => Promise<void> }
+        }
+      ).wcRunner.shellInterrupt(idArg)
+    }, id)
+  }
+
+  /** Tells an open shell its terminal was resized. */
+  async shellResize(id: string, dimensions: TerminalSize): Promise<void> {
+    if (!this.page) throw new Error('Browser not launched')
+
+    await this.page.evaluate(
+      async (idArg: string, dimensionsArg: TerminalSize) => {
+        ;(
+          window as unknown as {
+            wcRunner: { shellResize: (i: string, d: TerminalSize) => void }
+          }
+        ).wcRunner.shellResize(idArg, dimensionsArg)
+      },
+      id,
+      dimensions
+    )
+  }
+
+  /**
+   * Why an open shell can no longer be trusted, or `null` while it is healthy.
+   *
+   * Worth checking between commands in a long-lived session: a broken shell
+   * keeps running commands and printing output, so nothing else reveals it.
+   */
+  async shellBrokenReason(id: string): Promise<string | null> {
+    if (!this.page) throw new Error('Browser not launched')
+
+    return await this.page.evaluate(async (idArg: string) => {
+      return (
+        window as unknown as {
+          wcRunner: { shellBrokenReason: (i: string) => string | null }
+        }
+      ).wcRunner.shellBrokenReason(idArg)
+    }, id)
+  }
+
+  /** Closes an open shell. Unknown ids are ignored. */
+  async closeShell(id: string): Promise<void> {
+    if (!this.page) throw new Error('Browser not launched')
+
+    this.shellListeners.delete(id)
+
+    await this.page.evaluate(async (idArg: string) => {
+      ;(
+        window as unknown as { wcRunner: { closeShell: (i: string) => void } }
+      ).wcRunner.closeShell(idArg)
+    }, id)
   }
 
   /**

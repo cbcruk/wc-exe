@@ -130,7 +130,105 @@ try {
     after.output.includes('STILL_RESPONSIVE')
   )
 
-  // 6. the actual build still works
+  // 6. interactive shell session
+  const streamed = []
+  await browser.openShell('main', {
+    cols: 100,
+    rows: 30,
+    onData: (chunk) => streamed.push(chunk),
+  })
+
+  const hi = await browser.shellExec('main', 'echo SHELL_MARKER_OK')
+  check(
+    'shell runs a command',
+    hi.output.includes('SHELL_MARKER_OK'),
+    JSON.stringify(hi.output.trim())
+  )
+  check(
+    'shell reports exit status',
+    hi.exitCode === 0,
+    `exitCode=${hi.exitCode}`
+  )
+  check(
+    'shell output streams to the host',
+    streamed.join('').includes('SHELL_MARKER_OK'),
+    `${streamed.length} chunks`
+  )
+
+  const bad2 = await browser.shellExec('main', 'ls /definitely-not-here')
+  check(
+    'shell reports a non-zero status',
+    bad2.exitCode !== 0,
+    `exitCode=${bad2.exitCode}`
+  )
+
+  // state persists across commands — this is what makes it a session
+  await browser.shellExec('main', 'mkdir -p session-probe')
+  await browser.shellExec('main', 'cd session-probe')
+  const pwd = await browser.shellExec('main', 'pwd')
+  check(
+    'shell keeps cwd between commands',
+    pwd.output.includes('session-probe'),
+    JSON.stringify(pwd.output.trim())
+  )
+
+  check('shell is healthy', (await browser.shellBrokenReason('main')) === null)
+
+  // 6b. the case that motivated all of this: after many commands, does the
+  // session still have working job control?
+  for (let i = 0; i < 25; i++) {
+    await browser.shellExec('main', `echo warm${i}`)
+  }
+  check(
+    'still healthy after 25 commands',
+    (await browser.shellBrokenReason('main')) === null,
+    await browser.shellBrokenReason('main')
+  )
+
+  // Ctrl-C is only meaningful against something running, so start a command
+  // that will not end on its own and cut it short.
+  const longCommand = browser.shellExec(
+    'main',
+    'node -e "setInterval(() => {}, 1000)"'
+  )
+  await new Promise((r) => setTimeout(r, 2500))
+  await browser.shellInterrupt('main')
+
+  const interruptedResult = await Promise.race([
+    longCommand,
+    new Promise((_, rej) =>
+      setTimeout(() => rej(new Error('exec never returned')), 15000)
+    ),
+  ]).catch((err) => ({ error: err.message }))
+
+  check(
+    'Ctrl-C cuts a running command short on an aged session',
+    interruptedResult.interrupted === true,
+    JSON.stringify(interruptedResult).slice(0, 120)
+  )
+  check(
+    'still healthy after Ctrl-C',
+    (await browser.shellBrokenReason('main')) === null,
+    await browser.shellBrokenReason('main')
+  )
+
+  // An idle Ctrl-C is a no-op, not a fault.
+  await browser.shellInterrupt('main')
+  check(
+    'idle Ctrl-C does not break the session',
+    (await browser.shellBrokenReason('main')) === null
+  )
+
+  const afterInterrupt = await browser.shellExec('main', 'echo AFTER_INTERRUPT')
+  check(
+    'shell usable after Ctrl-C',
+    afterInterrupt.output.includes('AFTER_INTERRUPT'),
+    JSON.stringify(afterInterrupt.output.trim().slice(-60))
+  )
+
+  await browser.closeShell('main')
+
+  // 7. the actual build still works
   const install = await browser.runCommand('npm', ['install'])
   check(
     'npm install succeeds',

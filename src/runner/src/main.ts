@@ -10,6 +10,7 @@ import {
   type TerminalSize,
 } from './runtime/runtime.types'
 import { OutputBuffer } from './runtime/output-buffer'
+import { ShellSession, type ShellExecResult } from './runtime/shell-session'
 
 const ANSI_REGEX =
   /* eslint-disable-next-line no-control-regex */
@@ -52,6 +53,8 @@ declare global {
   interface Window {
     __WC_READY__: boolean
     wcRunner: typeof wcRunner
+    /** Installed by the host via `page.exposeFunction`; see {@link openShell}. */
+    __wcShellData__?: (id: string, chunk: string) => void
   }
 }
 
@@ -250,6 +253,75 @@ function resizeCommand(handle: string, dimensions: TerminalSize): boolean {
 
   process.resize(dimensions)
   return true
+}
+
+/**
+ * Open interactive shells, by caller-chosen id.
+ *
+ * Kept per session rather than one global shell because the daemon will hold
+ * several projects open at once, and because a broken shell (see
+ * {@link ShellSession}) has to be discardable without disturbing the others.
+ */
+const shells = new Map<string, ShellSession>()
+
+/**
+ * Opens an interactive shell.
+ *
+ * Output is pushed to `window.__wcShellData__` as it arrives — the host
+ * installs that via `page.exposeFunction`, so a terminal stays responsive
+ * instead of waiting on a poll interval.
+ *
+ * @throws If `id` is already in use.
+ */
+async function openShell(
+  id: string,
+  options?: { cols?: number; rows?: number }
+): Promise<void> {
+  invariant(runtime, 'Runtime not booted')
+  invariant(!shells.has(id), `Shell ${id} is already open`)
+
+  const session = await ShellSession.open(runtime, {
+    terminal: { cols: options?.cols ?? 80, rows: options?.rows ?? 24 },
+    onData: (chunk) => window.__wcShellData__?.(id, chunk),
+  })
+
+  shells.set(id, session)
+}
+
+/** Looks up an open shell. */
+function requireShell(id: string): ShellSession {
+  const session = shells.get(id)
+  invariant(session, `No open shell with id ${id}`)
+  return session
+}
+
+/** Runs one command in an open shell, waiting for it to finish. */
+function shellExec(id: string, command: string): Promise<ShellExecResult> {
+  return requireShell(id).exec(command)
+}
+
+/** Sends Ctrl-C to an open shell. */
+function shellInterrupt(id: string): Promise<void> {
+  return requireShell(id).interrupt()
+}
+
+/** Tells an open shell its terminal was resized. */
+function shellResize(id: string, dimensions: TerminalSize): void {
+  requireShell(id).resize(dimensions)
+}
+
+/**
+ * Why a shell can no longer be trusted, or `null` while it is healthy.
+ * A non-null value is a reset trigger, not a warning — see the ShellSession docs.
+ */
+function shellBrokenReason(id: string): string | null {
+  return requireShell(id).brokenReason
+}
+
+/** Closes a shell and forgets it. Unknown ids are ignored. */
+function closeShell(id: string): void {
+  shells.get(id)?.close()
+  shells.delete(id)
 }
 
 /** Outcome of {@link installWithCache}. */
@@ -793,6 +865,12 @@ const wcRunner = {
   runCommand,
   killCommand,
   resizeCommand,
+  openShell,
+  shellExec,
+  shellInterrupt,
+  shellResize,
+  shellBrokenReason,
+  closeShell,
   installWithCache,
   spawnCommand,
   writeFile,
