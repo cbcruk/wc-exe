@@ -1,4 +1,5 @@
 import path from 'node:path'
+import type { Browser } from 'puppeteer-core'
 import { WCBrowser } from '../core/browser.js'
 import {
   listProjectFiles,
@@ -29,8 +30,17 @@ export interface SessionOptions {
   source: string
   /** Origin the daemon serves from, e.g. `http://127.0.0.1:5199`. */
   origin: string
-  /** Chrome profile directory, so OPFS survives daemon restarts. */
-  userDataDir: string
+  /**
+   * Supplies the browser every session opens its page on.
+   *
+   * Shared rather than one-per-session because Chrome permits a single process
+   * per profile directory and aborts otherwise — with a browser apiece, opening
+   * a second project failed before it started.
+   *
+   * A function so the browser is launched on first use rather than at daemon
+   * startup, and so all sessions await the same launch.
+   */
+  getBrowser: () => Promise<Browser>
 }
 
 /**
@@ -52,7 +62,7 @@ export class Session {
   readonly id: string
   readonly source: string
   private readonly origin: string
-  private readonly userDataDir: string
+  private readonly getBrowser: () => Promise<Browser>
   private lastUsed = Date.now()
   /** Output directory of the build in flight, for the dist upload route. */
   private currentOutput: string | null = null
@@ -61,7 +71,7 @@ export class Session {
     this.id = id
     this.source = options.source
     this.origin = options.origin
-    this.userDataDir = options.userDataDir
+    this.getBrowser = options.getBrowser
   }
 
   /** When this session was last used, for idle eviction. */
@@ -97,7 +107,10 @@ export class Session {
   private async ensureBooted(verbose: boolean): Promise<boolean> {
     if (this.booted && this.browser) return true
 
-    this.browser = new WCBrowser({ verbose, userDataDir: this.userDataDir })
+    this.browser = new WCBrowser({
+      verbose,
+      browser: await this.getBrowser(),
+    })
     await this.browser.launch(`${this.origin}/s/${this.id}/`)
     this.booted = true
     // A fresh container holds nothing, so the next sync must push everything.

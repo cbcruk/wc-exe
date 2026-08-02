@@ -3,11 +3,13 @@ import { serve, type ServerType } from '@hono/node-server'
 import { serveStatic } from '@hono/node-server/serve-static'
 import fs from 'node:fs'
 import path from 'node:path'
+import type { Browser } from 'puppeteer-core'
 import {
   CACHE_PORT,
   CHROME_PROFILE_DIR,
   ensureCacheDirs,
 } from '../core/cache.js'
+import { launchChrome } from '../core/chrome.js'
 import { resolveRunnerDist } from '../core/runner-assets.js'
 import { controlPlaneGuard } from './auth.js'
 import { createToken, writeRecord, clearRecord } from './discovery.js'
@@ -75,9 +77,24 @@ export async function startDaemon(
   const token = createToken()
   const idleMs = options.idleMs ?? DEFAULT_IDLE_MS
   const sessions = new Map<string, Session>()
+  // Monotonic, so an id is never reused after a session is evicted — the page
+  // URL carries it, and a recycled id could route one project's files to
+  // another's page.
+  let nextSessionId = 0
 
   let server: ServerType | undefined
   let closing = false
+
+  // One browser for every session. Chrome allows a single process per profile
+  // directory and aborts rather than risk corrupting it, so a browser per
+  // session made the second project fail before it began. Launched on first use
+  // and memoised, so concurrent sessions await the same launch rather than
+  // racing to start two.
+  let browserPromise: Promise<Browser> | null = null
+  const getBrowser = (): Promise<Browser> => {
+    browserPromise ??= launchChrome({ userDataDir: CHROME_PROFILE_DIR })
+    return browserPromise
+  }
   let lastActivity = Date.now()
   const touch = (): void => {
     lastActivity = Date.now()
@@ -191,10 +208,10 @@ export async function startDaemon(
     }
 
     if (!session) {
-      session = new Session(`${sessions.size}-${Date.now().toString(36)}`, {
+      session = new Session(`${nextSessionId++}-${Date.now().toString(36)}`, {
         source,
         origin: `http://127.0.0.1:${port}`,
-        userDataDir: CHROME_PROFILE_DIR,
+        getBrowser,
       })
       sessions.set(key, session)
     }
@@ -250,6 +267,14 @@ export async function startDaemon(
     clearInterval(idleTimer)
     for (const session of sessions.values()) await session.close()
     sessions.clear()
+    // Sessions only close their own pages, so the shared browser is the
+    // daemon's to shut down.
+    if (browserPromise) {
+      await browserPromise
+        .then((browser) => browser.close())
+        .catch(() => undefined)
+      browserPromise = null
+    }
     clearRecord()
     await new Promise<void>((resolve) => {
       if (!server) return resolve()

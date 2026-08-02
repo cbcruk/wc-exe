@@ -1,4 +1,5 @@
-import puppeteer, { type Browser, type Page } from 'puppeteer-core'
+import { type Browser, type Page } from 'puppeteer-core'
+import { launchChrome } from './chrome.js'
 import type {
   CacheResult,
   CommandResult,
@@ -26,15 +27,30 @@ export class WCBrowser {
   private shellListeners = new Map<string, (chunk: string) => void>()
   /** Whether `__wcShellData__` has been bound on the page yet. */
   private shellDataBound = false
+  /** A browser supplied by the caller, shared with other instances. */
+  private sharedBrowser: Browser | undefined
+  /** Whether {@link close} should close the browser or only this page. */
+  private ownsBrowser = true
 
   /**
    * @param options.verbose Mirror browser console and failed requests to stdout.
    * @param options.userDataDir Persistent Chrome profile. Required for the OPFS
-   *   cache to survive across runs; omit for a throwaway profile.
+   *   cache to survive across runs; omit for a throwaway profile. Ignored when
+   *   `browser` is supplied, since that browser already has a profile.
+   * @param options.browser An already-running browser to open a page on,
+   *   instead of launching one. Required when several instances must coexist:
+   *   Chrome allows only one process per profile directory, so launching one
+   *   browser apiece against a shared profile fails outright. {@link close}
+   *   then closes only this page and leaves the browser to its owner.
    */
-  constructor(options?: { verbose?: boolean; userDataDir?: string }) {
+  constructor(options?: {
+    verbose?: boolean
+    userDataDir?: string
+    browser?: Browser
+  }) {
     this.verbose = options?.verbose ?? false
     this.userDataDir = options?.userDataDir
+    this.sharedBrowser = options?.browser
   }
 
   /**
@@ -46,20 +62,14 @@ export class WCBrowser {
    *   within 60s.
    */
   async launch(serverUrl: string): Promise<void> {
-    const executablePath = await this.findChrome()
-
-    this.browser = await puppeteer.launch({
-      headless: true,
-      executablePath,
-      protocolTimeout: 600000,
+    if (this.sharedBrowser) {
+      this.browser = this.sharedBrowser
+      this.ownsBrowser = false
+    } else {
       // A persistent profile keeps OPFS (the node_modules cache) across runs.
-      userDataDir: this.userDataDir,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-      ],
-    })
+      this.browser = await launchChrome({ userDataDir: this.userDataDir })
+      this.ownsBrowser = true
+    }
 
     this.page = await this.browser.newPage()
 
@@ -85,47 +95,6 @@ export class WCBrowser {
       () =>
         (window as unknown as { __WC_READY__?: boolean }).__WC_READY__ === true,
       { timeout: 60000 }
-    )
-  }
-
-  /**
-   * Resolves a Chrome executable: `CHROME_PATH` if set, otherwise the first hit
-   * among the well-known install locations for macOS, Linux and Windows.
-   */
-  private async findChrome(): Promise<string> {
-    const { access } = await import('node:fs/promises')
-
-    const envPath = process.env.CHROME_PATH
-    if (envPath) {
-      try {
-        await access(envPath)
-        return envPath
-      } catch {
-        throw new Error(`CHROME_PATH is set but not accessible: ${envPath}`)
-      }
-    }
-
-    const paths = [
-      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-      '/Applications/Chromium.app/Contents/MacOS/Chromium',
-      '/usr/bin/google-chrome',
-      '/usr/bin/chromium',
-      '/usr/bin/chromium-browser',
-      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    ]
-
-    for (const chromePath of paths) {
-      try {
-        await access(chromePath)
-        return chromePath
-      } catch {
-        continue
-      }
-    }
-
-    throw new Error(
-      'Chrome not found. Please install Chrome or set CHROME_PATH environment variable.'
     )
   }
 
@@ -567,9 +536,19 @@ export class WCBrowser {
     )
   }
 
-  /** Closes the browser and drops the handles. Safe to call when not launched. */
+  /**
+   * Releases this instance's resources. Safe to call when not launched.
+   *
+   * Closes the browser only when this instance launched it. With a shared
+   * browser it closes just the page, because the other sessions on that browser
+   * are still using it.
+   */
   async close(): Promise<void> {
-    await this.browser?.close()
+    if (this.ownsBrowser) {
+      await this.browser?.close()
+    } else {
+      await this.page?.close().catch(() => undefined)
+    }
     this.browser = null
     this.page = null
   }
