@@ -1,10 +1,12 @@
 import type { Runtime, RuntimeProcess, TerminalSize } from './runtime.types'
 
 /**
- * Signature jsh prints when its own job bookkeeping falls over. Matching on an
- * error string is brittle, but it is the only signal the shell gives, and
- * missing it is worse: after this appears the shell keeps running commands and
- * keeps printing output while Ctrl-C silently does nothing.
+ * Signature jsh prints when its own job bookkeeping falls over.
+ *
+ * This is the **early warning**, not the proof. It fires the instant the shell
+ * breaks, before anyone tries to cancel anything — but it depends on jsh's
+ * exact wording, so a message change would silently disable it. The
+ * authoritative checks below are functional and do not read this string.
  *
  * See docs/persistent-runner.md §2.3.
  */
@@ -12,6 +14,22 @@ const JSH_INTERNAL_ERROR = /jsh: Cannot read properties of undefined/
 
 /** How long a single command may run before {@link ShellSession.exec} gives up. */
 const DEFAULT_EXEC_TIMEOUT_MS = 10 * 60 * 1000
+
+/**
+ * How long an interrupt has to visibly take effect before job control is
+ * considered dead. Measured at well under a second on a healthy shell.
+ */
+const INTERRUPT_GRACE_MS = 5000
+
+/** Bound on {@link ShellSession.verifyJobControl}. */
+const VERIFY_TIMEOUT_MS = 20000
+
+/**
+ * A command that runs until interrupted, used by
+ * {@link ShellSession.verifyJobControl}. `node` is guaranteed present — the
+ * runtime is a Node sandbox — and there is no `sleep` binary.
+ */
+const VERIFY_FOREGROUND = 'node -e "setInterval(() => {}, 1000)"'
 
 /** Result of one {@link ShellSession.exec}. */
 export interface ShellExecResult {
@@ -31,6 +49,11 @@ export interface ShellSessionOptions {
   terminal?: TerminalSize
   /** Called with every output chunk as it arrives, for live streaming. */
   onData?: (chunk: string) => void
+  /**
+   * How long an interrupt has to visibly take effect before job control is
+   * declared dead. Defaults to {@link INTERRUPT_GRACE_MS}.
+   */
+  interruptGraceMs?: number
 }
 
 /**
@@ -59,7 +82,8 @@ export class ShellSession {
 
   private constructor(
     private readonly process: RuntimeProcess,
-    private readonly onData?: (chunk: string) => void
+    private readonly onData?: (chunk: string) => void,
+    private readonly interruptGraceMs: number = INTERRUPT_GRACE_MS
   ) {}
 
   /** Starts a shell and waits for its first prompt. */
@@ -71,7 +95,11 @@ export class ShellSession {
       terminal: options.terminal ?? { cols: 80, rows: 24 },
     })
 
-    const session = new ShellSession(process, options.onData)
+    const session = new ShellSession(
+      process,
+      options.onData,
+      options.interruptGraceMs
+    )
     session.consume()
     // Wait for the shell to print something — otherwise the first command is
     // written into a terminal that is not listening yet, which is the exact
@@ -197,6 +225,14 @@ export class ShellSession {
         timeoutMs
       )
 
+      if (wasInterrupted && !marker.test(this.transcript.slice(start))) {
+        // Sending Ctrl-C is not evidence that Ctrl-C worked. On a shell whose
+        // job control has died the byte is accepted and nothing happens, so
+        // resolving here would report a command as cancelled while it is in
+        // fact still running and still holding the terminal.
+        await this.requireInterruptTookEffect(marker, start)
+      }
+
       const produced = this.transcript.slice(start)
       const match = marker.exec(produced)
 
@@ -206,6 +242,77 @@ export class ShellSession {
         interrupted: wasInterrupted && !match,
       }
     })
+  }
+
+  /**
+   * Waits for visible proof that an interrupt landed: either the shell echoed
+   * the interrupt, or the command completed anyway (it finished on its own just
+   * as the interrupt arrived).
+   *
+   * @throws And marks the session broken if neither appears.
+   */
+  private async requireInterruptTookEffect(
+    marker: RegExp,
+    start: number
+  ): Promise<void> {
+    const deadline = Date.now() + this.interruptGraceMs
+
+    for (;;) {
+      const produced = this.transcript.slice(start)
+      if (/\^C/.test(produced) || marker.test(produced)) return
+
+      if (Date.now() > deadline) {
+        this.broken ??=
+          'an interrupt was sent but never took effect; job control is dead'
+        throw new Error(this.broken)
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+  }
+
+  /**
+   * Actively proves job control still works, by running a command that never
+   * ends, interrupting it, and requiring the shell to accept another command
+   * afterwards.
+   *
+   * This is the authoritative check and the only one that reads no strings from
+   * jsh at all. On a broken shell the interrupted process keeps holding the
+   * terminal, so the follow-up command never completes — measured, not assumed
+   * (a broken shell still runs commands and still reports `$?` correctly, so
+   * neither of those can stand in for this).
+   *
+   * Costs a few seconds. Worth running when a session is handed out or comes
+   * back from idle, and cheap next to the ~5s reboot it prevents.
+   *
+   * @returns `true` if job control works. `false` marks the session broken.
+   */
+  async verifyJobControl(timeoutMs = VERIFY_TIMEOUT_MS): Promise<boolean> {
+    if (this.closed) throw new Error('Shell session is closed')
+    if (this.broken) return false
+
+    try {
+      const running = this.exec(VERIFY_FOREGROUND, timeoutMs)
+      // Let the command actually reach the foreground before interrupting it.
+      await new Promise((resolve) => setTimeout(resolve, 1500))
+      await this.interrupt()
+      await running
+
+      // The real test: a shell that lost job control is still blocked by the
+      // process it failed to kill, so this never completes.
+      const after = await this.exec('echo wc-jobcontrol-ok', timeoutMs)
+      if (!after.output.includes('wc-jobcontrol-ok')) {
+        this.broken ??=
+          'the shell did not run a command after an interrupt; job control is dead'
+        return false
+      }
+
+      return true
+    } catch {
+      this.broken ??=
+        'job control verification did not complete; treating the session as unusable'
+      return false
+    }
   }
 
   /**

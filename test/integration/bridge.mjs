@@ -226,7 +226,57 @@ try {
     JSON.stringify(afterInterrupt.output.trim().slice(-60))
   )
 
+  // The authoritative health check: interrupt a real command and require the
+  // shell to accept another one afterwards. Reads no jsh error strings.
+  const verified = await browser.shellVerifyJobControl('main')
+  check('verifyJobControl passes on a healthy aged session', verified === true)
+
   await browser.closeShell('main')
+
+  // 6c. and now the negative control — a deliberately broken shell must be
+  // caught. Without this, "verify passes" only proves it can say yes.
+  await browser.openShell('broken')
+  const brokenBefore = await browser.shellBrokenReason('broken')
+  check('a fresh shell starts healthy', brokenBefore === null)
+
+  // Two command lines in one write. ShellSession's queue cannot produce this,
+  // but an embedded newline smuggles it through — which gives a negative
+  // control without adding a test-only "break yourself" method to the API.
+  try {
+    await browser.shellExec('broken', 'echo one\necho two')
+  } catch (err) {
+    console.log('   (exec threw:', err.message.slice(0, 80), ')')
+  }
+
+  // Whether jsh prints its internal error varies between runs, so which signal
+  // catches the damage varies too. Asserting on one mechanism would make this
+  // flaky. The invariant that actually matters is weaker and firmer: a damaged
+  // session must never be reported as healthy.
+  const heuristicSaw = await browser.shellBrokenReason('broken')
+  console.log(
+    `   string heuristic ${heuristicSaw ? 'caught it' : 'MISSED it'} — ${JSON.stringify(heuristicSaw)}`
+  )
+
+  const verifiedBroken = await browser.shellVerifyJobControl('broken')
+  check(
+    'verifyJobControl rejects the damaged session',
+    verifiedBroken === false
+  )
+  check(
+    'the damaged session ends up marked broken',
+    (await browser.shellBrokenReason('broken')) !== null
+  )
+
+  // And once known bad, it refuses work rather than quietly doing it wrong.
+  let refused = false
+  try {
+    await browser.shellExec('broken', 'echo SHOULD_NOT_RUN')
+  } catch (err) {
+    refused = /broken/.test(err.message)
+  }
+  check('a broken session refuses further commands', refused)
+
+  await browser.closeShell('broken')
 
   // 7. the actual build still works
   const install = await browser.runCommand('npm', ['install'])

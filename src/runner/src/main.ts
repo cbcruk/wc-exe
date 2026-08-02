@@ -318,6 +318,14 @@ function shellBrokenReason(id: string): string | null {
   return requireShell(id).brokenReason
 }
 
+/**
+ * Actively proves a shell's job control still works. Costs a few seconds; the
+ * authoritative check, and the only one that reads no jsh error strings.
+ */
+function shellVerifyJobControl(id: string): Promise<boolean> {
+  return requireShell(id).verifyJobControl()
+}
+
 /** Closes a shell and forgets it. Unknown ids are ignored. */
 function closeShell(id: string): void {
   shells.get(id)?.close()
@@ -870,6 +878,7 @@ const wcRunner = {
   shellInterrupt,
   shellResize,
   shellBrokenReason,
+  shellVerifyJobControl,
   closeShell,
   installWithCache,
   spawnCommand,

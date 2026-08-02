@@ -66,7 +66,9 @@ function finish(shell: ReturnType<typeof fakeShell>, n: number, code = 0) {
 const flush = () => new Promise((r) => setTimeout(r, 30))
 
 async function openSession(shell: ReturnType<typeof fakeShell>) {
-  const opening = ShellSession.open(shell.runtime)
+  // A short grace keeps the broken-shell tests fast; the behaviour under test
+  // is the same, only the deadline differs.
+  const opening = ShellSession.open(shell.runtime, { interruptGraceMs: 300 })
   await flush()
   shell.emit('~/project ❯ ')
   return await opening
@@ -160,8 +162,11 @@ describe('ShellSession serialization', () => {
     expect(shell.writes).toHaveLength(1)
 
     await session.interrupt()
-
     expect(shell.writes[1]).toBe(String.fromCharCode(3))
+
+    // A shell that honours the interrupt echoes it.
+    shell.emit('^C\n')
+
     // The interrupted command finishes without its completion marker.
     await expect(running).resolves.toMatchObject({
       interrupted: true,
@@ -176,6 +181,7 @@ describe('ShellSession serialization', () => {
     const running = session.exec('sleep 1')
     await flush()
     await session.interrupt()
+    shell.emit('^C\n')
     await running
 
     const next = session.exec('echo after')
@@ -287,6 +293,101 @@ describe('ShellSession health', () => {
 
     expect(shell.killed).toBe(true)
     await expect(session.exec('echo hi')).rejects.toThrow(/closed/)
+  })
+})
+
+describe('ShellSession job-control detection', () => {
+  // Measured, not assumed: on a shell whose job control has died the Ctrl-C
+  // byte is accepted and nothing happens. Resolving on "we sent it" would
+  // report a command as cancelled while it is still running and still holding
+  // the terminal.
+  it('does not call a command interrupted just because Ctrl-C was sent', async () => {
+    const shell = fakeShell()
+    const session = await openSession(shell)
+
+    const running = session.exec('sleep 1')
+    await flush()
+    await session.interrupt()
+    // The shell never acknowledges — this is the broken case.
+
+    await expect(running).rejects.toThrow(/never took effect/)
+    expect(session.brokenReason).toMatch(/job control is dead/)
+  })
+
+  it('accepts the command completing on its own as proof enough', async () => {
+    const shell = fakeShell()
+    const session = await openSession(shell)
+
+    const running = session.exec('quick')
+    await flush()
+    await session.interrupt()
+    // It finished by itself just as the interrupt arrived. Nothing is wrong.
+    finish(shell, 1)
+
+    await expect(running).resolves.toMatchObject({ exitCode: 0 })
+    expect(session.brokenReason).toBeNull()
+  })
+
+  it('verifyJobControl passes on a shell that honours interrupts', async () => {
+    const shell = fakeShell()
+    const session = await openSession(shell)
+
+    const verifying = session.verifyJobControl()
+
+    // The probe command, then the interrupt it expects to land.
+    await flush()
+    shell.emit('^C\n')
+    // Then the follow-up command that proves the shell came back.
+    await new Promise((r) => setTimeout(r, 1700))
+    shell.emit('wc-jobcontrol-ok\n')
+    finish(shell, 2)
+
+    await expect(verifying).resolves.toBe(true)
+    expect(session.brokenReason).toBeNull()
+  })
+
+  // The distinct, string-free failure the experiment measured: on a broken
+  // shell the process it failed to kill keeps holding the terminal, so the
+  // NEXT command never completes even though the interrupt looked accepted.
+  it('verifyJobControl fails when the interrupt lands but no command runs after it', async () => {
+    const shell = fakeShell()
+    const session = await openSession(shell)
+
+    // The bound must exceed the settle delay before the interrupt, or the
+    // probe command times out first and this would pass for the wrong reason.
+    const verifying = session.verifyJobControl(3000)
+
+    // Acknowledge the interrupt, so the run gets past that step...
+    await flush()
+    shell.emit('^C\n')
+    // ...but never complete the follow-up `echo wc-jobcontrol-ok`.
+
+    await expect(verifying).resolves.toBe(false)
+    expect(session.brokenReason).toBeTruthy()
+  }, 15000)
+
+  it('verifyJobControl fails when the shell never comes back', async () => {
+    const shell = fakeShell()
+    const session = await openSession(shell)
+
+    // Nothing is ever emitted: the interrupted process still holds the
+    // terminal, which is exactly what a broken shell looks like.
+    await expect(session.verifyJobControl()).resolves.toBe(false)
+    expect(session.brokenReason).toBeTruthy()
+  })
+
+  it('verifyJobControl reports false without re-probing an already broken shell', async () => {
+    const shell = fakeShell()
+    const session = await openSession(shell)
+
+    shell.emit(
+      "jsh: Cannot read properties of undefined (reading 'exitCode')\n"
+    )
+    await flush()
+    const writesBefore = shell.writes.length
+
+    await expect(session.verifyJobControl()).resolves.toBe(false)
+    expect(shell.writes).toHaveLength(writesBefore)
   })
 })
 

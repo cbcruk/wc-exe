@@ -373,6 +373,30 @@ export class WCBrowser {
     }, id)
   }
 
+  /**
+   * Actively proves an open shell's job control still works: runs a command
+   * that never ends, interrupts it, and requires the shell to accept another
+   * command afterwards.
+   *
+   * This is the authoritative health check. Unlike {@link shellBrokenReason} it
+   * reads no error strings from the shell, so a wording change cannot silently
+   * disable it — but it costs a few seconds, so it suits session checkout
+   * rather than every command.
+   *
+   * @returns `true` if job control works. `false` marks the shell broken.
+   */
+  async shellVerifyJobControl(id: string): Promise<boolean> {
+    if (!this.page) throw new Error('Browser not launched')
+
+    return await this.page.evaluate(async (idArg: string) => {
+      return await (
+        window as unknown as {
+          wcRunner: { shellVerifyJobControl: (i: string) => Promise<boolean> }
+        }
+      ).wcRunner.shellVerifyJobControl(idArg)
+    }, id)
+  }
+
   /** Closes an open shell. Unknown ids are ignored. */
   async closeShell(id: string): Promise<void> {
     if (!this.page) throw new Error('Browser not launched')
