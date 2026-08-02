@@ -6,6 +6,7 @@ import type {
   FileTree,
   RuntimeProcess,
   RuntimeDirEnt,
+  SpawnOptions,
 } from './runtime.types'
 
 /**
@@ -34,8 +35,14 @@ export class WebContainerRuntime implements Runtime, SnapshotProvider {
     return this.wc.mount(tree as FileSystemTree, options)
   }
 
-  spawn(command: string, args: string[]): Promise<RuntimeProcess> {
-    return this.wc.spawn(command, args)
+  spawn(
+    command: string,
+    args: string[],
+    options?: SpawnOptions
+  ): Promise<RuntimeProcess> {
+    // WebContainerProcess already is the full pseudoterminal shape the
+    // RuntimeProcess interface describes, so this stays a passthrough.
+    return this.wc.spawn(command, args, options)
   }
 
   readFile(path: string): Promise<Uint8Array> {

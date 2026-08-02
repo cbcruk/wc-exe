@@ -1,5 +1,18 @@
 import type { Ora } from 'ora'
 
+/**
+ * A spinner occupies one terminal line, so only the first line of a message can
+ * render there.
+ *
+ * This matters now that command failures carry the failed command's output:
+ * without it the spinner would smear a whole build log across the progress
+ * line, and the caller that finally reports the error would print all of it a
+ * second time.
+ */
+function firstLine(message: string): string {
+  return message.split('\n')[0]
+}
+
 /** Options for {@link withSpin}. */
 interface WithSpinOptions<T> {
   /** Spinner to drive. Shared across steps so they render on one line. */
@@ -35,7 +48,7 @@ export async function withSpin<T>(options: WithSpinOptions<T>): Promise<T> {
         typeof successMessage === 'function'
           ? successMessage(result)
           : successMessage
-      spinner.succeed(msg)
+      spinner.succeed(firstLine(msg))
     } else {
       spinner.succeed()
     }
@@ -47,7 +60,7 @@ export async function withSpin<T>(options: WithSpinOptions<T>): Promise<T> {
     if (failMessage) {
       const msg =
         typeof failMessage === 'function' ? failMessage(err) : failMessage
-      spinner.fail(msg)
+      spinner.fail(firstLine(msg))
     } else {
       spinner.fail()
     }

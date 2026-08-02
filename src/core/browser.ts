@@ -1,5 +1,10 @@
 import puppeteer, { type Browser, type Page } from 'puppeteer-core'
-import type { CacheResult } from '../types.js'
+import type {
+  CacheResult,
+  CommandResult,
+  RunCommandOptions,
+  TerminalSize,
+} from '../types.js'
 
 /**
  * Drives the headless Chrome instance that hosts the runner page.
@@ -14,6 +19,8 @@ export class WCBrowser {
   private page: Page | null = null
   private verbose: boolean = false
   private userDataDir: string | undefined
+  /** Source of generated command handles; see {@link runCommand}. */
+  private handleSequence = 0
 
   /**
    * @param options.verbose Mirror browser console and failed requests to stdout.
@@ -166,47 +173,116 @@ export class WCBrowser {
    *
    * @param cmd Executable name, e.g. `npm`.
    * @param args Arguments, e.g. `['run', 'build']`.
-   * @param timeout Milliseconds before giving up. Omit to wait indefinitely.
-   * @returns The process exit code — a non-zero code resolves, it does not throw.
-   * @throws If `timeout` elapses first. Note the command keeps running in the
-   *   page; the timeout only stops us waiting on it.
+   * @param options Timeout, working directory, environment and terminal size.
+   * @returns Exit code and captured output — a non-zero exit resolves, it does
+   *   not throw.
+   * @throws If `options.timeout` elapses. The command is killed first, so it
+   *   does not keep running in the page.
    */
   async runCommand(
     cmd: string,
     args: string[],
-    timeout?: number
-  ): Promise<number> {
+    options?: RunCommandOptions
+  ): Promise<CommandResult> {
     if (!this.page) throw new Error('Browser not launched')
 
+    const { timeout, handle: explicitHandle, ...spawnOptions } = options ?? {}
+    // A timeout needs something to cancel, so give the command a name even when
+    // the caller did not ask for one.
+    const handle =
+      explicitHandle ?? (timeout ? `wc-${++this.handleSequence}` : undefined)
+
     const commandPromise = this.page.evaluate(
-      async (cmdArg: string, argsArg: string[]) => {
+      async (
+        cmdArg: string,
+        argsArg: string[],
+        optionsArg: Record<string, unknown>
+      ) => {
         return await (
           window as unknown as {
             wcRunner: {
-              runCommand: (c: string, a: string[]) => Promise<number>
+              runCommand: (
+                c: string,
+                a: string[],
+                o?: Record<string, unknown>
+              ) => Promise<CommandResult>
             }
           }
-        ).wcRunner.runCommand(cmdArg, argsArg)
+        ).wcRunner.runCommand(cmdArg, argsArg, optionsArg)
       },
       cmd,
-      args
+      args,
+      { ...spawnOptions, ...(handle ? { handle } : {}) }
     )
 
     if (!timeout) {
       return commandPromise
     }
 
+    let timer: NodeJS.Timeout | undefined
     const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => {
-        reject(
-          new Error(
-            `Command timed out after ${timeout}ms: ${cmd} ${args.join(' ')}`
+      timer = setTimeout(() => {
+        // Kill before rejecting, otherwise the command runs on invisibly and
+        // keeps consuming the runtime for the rest of the session.
+        void this.killCommand(handle!).finally(() => {
+          reject(
+            new Error(
+              `Command timed out after ${timeout}ms: ${cmd} ${args.join(' ')}`
+            )
           )
-        )
+        })
       }, timeout)
     })
 
-    return Promise.race([commandPromise, timeoutPromise])
+    try {
+      return await Promise.race([commandPromise, timeoutPromise])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /**
+   * Terminates a command started with a `handle`.
+   *
+   * @returns `true` if a running command matched. `false` means it had already
+   *   exited — a normal race, not an error.
+   */
+  async killCommand(handle: string): Promise<boolean> {
+    if (!this.page) throw new Error('Browser not launched')
+
+    return await this.page.evaluate(async (handleArg: string) => {
+      return (
+        window as unknown as {
+          wcRunner: { killCommand: (h: string) => boolean }
+        }
+      ).wcRunner.killCommand(handleArg)
+    }, handle)
+  }
+
+  /**
+   * Tells a running command its terminal was resized.
+   *
+   * @returns `true` if a running command matched, `false` otherwise.
+   */
+  async resizeCommand(
+    handle: string,
+    dimensions: TerminalSize
+  ): Promise<boolean> {
+    if (!this.page) throw new Error('Browser not launched')
+
+    return await this.page.evaluate(
+      async (handleArg: string, dimensionsArg: TerminalSize) => {
+        return (
+          window as unknown as {
+            wcRunner: {
+              resizeCommand: (h: string, d: TerminalSize) => boolean
+            }
+          }
+        ).wcRunner.resizeCommand(handleArg, dimensionsArg)
+      },
+      handle,
+      dimensions
+    )
   }
 
   /**

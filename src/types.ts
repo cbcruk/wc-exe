@@ -70,6 +70,49 @@ export interface WCMessage {
   code?: number
 }
 
+/** Terminal dimensions, in character cells. */
+export interface TerminalSize {
+  cols: number
+  rows: number
+}
+
+/**
+ * Result of running a command inside the runtime.
+ *
+ * Mirrors the runner's own `CommandResult`; kept here because the two sides are
+ * built as separate bundles and cannot share a type import.
+ */
+export interface CommandResult {
+  /** Exit code. A non-zero code is returned, not thrown. */
+  exitCode: number
+  /** Captured output, ANSI escapes intact. Possibly only the tail. */
+  output: string
+  /** Whether `output` is only the tail of what the command actually produced. */
+  truncated: boolean
+  /** Characters dropped from the front. `0` when nothing was lost. */
+  droppedChars: number
+}
+
+/** Options for running a command inside the runtime. */
+export interface RunCommandOptions {
+  /**
+   * Milliseconds before the command is killed and an error thrown. Omit to wait
+   * indefinitely.
+   */
+  timeout?: number
+  /** Working directory, relative to the runtime's working directory. */
+  cwd?: string
+  /** Extra environment variables for the command. */
+  env?: Record<string, string | number | boolean>
+  /** Size of the attached terminal. Commands read this as their tty width. */
+  terminal?: TerminalSize
+  /**
+   * Caller-chosen id, so this command can be cancelled with `killCommand`.
+   * One is generated automatically when a `timeout` is set.
+   */
+  handle?: string
+}
+
 /**
  * Outcome of a cache-aware install, as reported by the in-browser runner.
  *

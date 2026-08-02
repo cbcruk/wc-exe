@@ -106,8 +106,8 @@ async function runOnce(source, { cache }) {
     let cacheHit = null
     const install = await timed('install', async () => {
       if (!cache) {
-        const code = await browser.runCommand('npm', ['install'])
-        if (code !== 0) throw new Error(`npm install exited ${code}`)
+        const { exitCode } = await browser.runCommand('npm', ['install'])
+        if (exitCode !== 0) throw new Error(`npm install exited ${exitCode}`)
         return
       }
       const result = await browser.installWithCache()
@@ -115,8 +115,8 @@ async function runOnce(source, { cache }) {
     })
 
     const build = await timed('build', async () => {
-      const code = await browser.runCommand('npm', ['run', 'build'])
-      if (code !== 0) throw new Error(`npm run build exited ${code}`)
+      const { exitCode } = await browser.runCommand('npm', ['run', 'build'])
+      if (exitCode !== 0) throw new Error(`npm run build exited ${exitCode}`)
     })
 
     return {

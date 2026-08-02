@@ -98,9 +98,9 @@ async function runScenario({ label, wipe, withExtraDep }) {
     const installMs = Math.round(performance.now() - installStart)
 
     const buildStart = performance.now()
-    const code = await browser.runCommand('npm', ['run', 'build'])
+    const { exitCode } = await browser.runCommand('npm', ['run', 'build'])
     const buildMs = Math.round(performance.now() - buildStart)
-    if (code !== 0) throw new Error(`build failed (${code})`)
+    if (exitCode !== 0) throw new Error(`build failed (${exitCode})`)
 
     console.log(
       `  ${label}: install ${(installMs / 1000).toFixed(2)}s | build ${(

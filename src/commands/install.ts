@@ -13,6 +13,7 @@ import {
   ensureCacheDirs,
 } from '../core/cache.js'
 import { withSpin } from '../utils/spinner.js'
+import { commandFailure } from '../utils/command-error.js'
 import type { InstallOptions, ServerHandlers } from '../types.js'
 
 /**
@@ -120,9 +121,8 @@ export async function install(options: InstallOptions): Promise<void> {
         spinner,
         message: 'Installing dependencies (npm install)...',
         fn: async () => {
-          const code = await browser!.runCommand('npm', ['install'])
-          if (code !== 0)
-            throw new Error(`npm install failed with exit code ${code}`)
+          const result = await browser!.runCommand('npm', ['install'])
+          if (result.exitCode !== 0) throw commandFailure('npm install', result)
         },
         successMessage: 'Dependencies installed successfully',
         failMessage: (err) => `npm install failed: ${err.message}`,

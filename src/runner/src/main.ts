@@ -4,8 +4,12 @@ import {
   isSnapshotCapable,
   type FileTree,
   type Runtime,
+  type RuntimeProcess,
   type SnapshotProvider,
+  type SpawnOptions,
+  type TerminalSize,
 } from './runtime/runtime.types'
+import { OutputBuffer } from './runtime/output-buffer'
 
 const ANSI_REGEX =
   /* eslint-disable-next-line no-control-regex */
@@ -141,36 +145,111 @@ function insertIntoTree(
 }
 
 /**
- * Runs a command to completion, streaming its output to the page console (where
- * the host picks it up in verbose mode).
- *
- * @returns The exit code — a non-zero code is returned, not thrown.
+ * How much command output is retained for the host. Beyond this the oldest
+ * characters are dropped and the result says so — see {@link OutputBuffer}.
  */
-async function runCommand(cmd: string, args: string[]): Promise<number> {
+const OUTPUT_LIMIT = 256 * 1024
+
+/**
+ * Commands currently running, by the handle the caller supplied.
+ *
+ * Needed because {@link runCommand} does not resolve until the command exits,
+ * so a caller can never learn a handle it did not choose itself. The caller
+ * names the command up front and can then cancel it mid-flight.
+ */
+const running = new Map<string, RuntimeProcess>()
+
+/** Outcome of {@link runCommand}. */
+type CommandResult = {
+  /** Exit code. Non-zero is returned, not thrown. */
+  exitCode: number
+  /** Captured output, ANSI escapes intact. Possibly only the tail. */
+  output: string
+  /** Whether `output` is only the tail of what the command actually produced. */
+  truncated: boolean
+  /** Characters dropped from the front. `0` when nothing was lost. */
+  droppedChars: number
+}
+
+/**
+ * Runs a command to completion, streaming its output to the page console (where
+ * the host picks it up in verbose mode) and capturing it for the caller.
+ *
+ * @param handle Optional caller-chosen id. Pass one to be able to
+ *   {@link killCommand} this command while it runs.
+ * @returns The exit code and the captured output.
+ */
+async function runCommand(
+  cmd: string,
+  args: string[],
+  options?: SpawnOptions & { handle?: string }
+): Promise<CommandResult> {
   invariant(runtime, 'Runtime not booted')
 
   console.log(`[wc-build] Running: ${cmd} ${args.join(' ')}`)
 
-  const process = await runtime.spawn(cmd, args)
+  const { handle, ...spawnOptions } = options ?? {}
+  const process = await runtime.spawn(cmd, args, spawnOptions)
+  const buffer = new OutputBuffer(OUTPUT_LIMIT)
+
+  if (handle) running.set(handle, process)
 
   process.output.pipeTo(
     new WritableStream({
       write(chunk) {
+        buffer.push(chunk)
         const filtered = filterOutput(chunk)
         if (filtered) console.log(filtered)
       },
     })
   )
 
-  const exitCode = await process.exit
+  try {
+    const exitCode = await process.exit
 
-  if (exitCode === 0) {
-    console.log(`[wc-build] Command exited with code: ${exitCode}`)
-  } else {
-    console.error(`[wc-build] Command exited with code: ${exitCode}`)
+    if (exitCode === 0) {
+      console.log(`[wc-build] Command exited with code: ${exitCode}`)
+    } else {
+      console.error(`[wc-build] Command exited with code: ${exitCode}`)
+    }
+
+    return {
+      exitCode,
+      output: buffer.text,
+      truncated: buffer.truncated,
+      droppedChars: buffer.droppedChars,
+    }
+  } finally {
+    if (handle) running.delete(handle)
   }
+}
 
-  return exitCode
+/**
+ * Terminates a command started with a `handle`.
+ *
+ * @returns `true` if a running command matched, `false` if it had already
+ *   exited or the handle was never used. A miss is not an error — the race
+ *   between cancelling and finishing is normal.
+ */
+function killCommand(handle: string): boolean {
+  const process = running.get(handle)
+  if (!process) return false
+
+  process.kill()
+  return true
+}
+
+/**
+ * Tells a running command its terminal was resized.
+ *
+ * @returns `true` if a running command matched, `false` otherwise.
+ */
+function resizeCommand(handle: string, dimensions: TerminalSize): boolean {
+  const process = running.get(handle)
+  if (!process) return false
+
+  process.resize(dimensions)
+  return true
 }
 
 /** Outcome of {@link installWithCache}. */
@@ -511,9 +590,9 @@ async function installWithCache(): Promise<CacheResult> {
     console.log(
       '[wc-build] Runtime has no snapshot support; installing plainly'
     )
-    const code = await runCommand('npm', ['install'])
-    if (code !== 0) {
-      throw new Error(`npm install failed with exit code ${code}`)
+    const { exitCode } = await runCommand('npm', ['install'])
+    if (exitCode !== 0) {
+      throw new Error(`npm install failed with exit code ${exitCode}`)
     }
     return { cached: false, key }
   }
@@ -534,14 +613,14 @@ async function installWithCache(): Promise<CacheResult> {
       : '[wc-build] no npm tarball cache yet; installing online (will seed it)'
   )
 
-  const code = await runCommand('npm', [
+  const { exitCode } = await runCommand('npm', [
     'install',
     '--prefer-offline',
     '--cache',
     NPM_CACHE_DIR,
   ])
-  if (code !== 0) {
-    throw new Error(`npm install failed with exit code ${code}`)
+  if (exitCode !== 0) {
+    throw new Error(`npm install failed with exit code ${exitCode}`)
   }
 
   const bytes = await saveNodeModules(runtime, key)
@@ -712,6 +791,8 @@ const wcRunner = {
   boot,
   mountFromServer,
   runCommand,
+  killCommand,
+  resizeCommand,
   installWithCache,
   spawnCommand,
   writeFile,

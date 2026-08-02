@@ -21,12 +21,45 @@ export interface FileTree {
   [name: string]: FileNode | DirectoryNode
 }
 
-/** A process started by {@link Runtime.spawn}. */
+/** Terminal dimensions, in character cells. */
+export interface TerminalSize {
+  cols: number
+  rows: number
+}
+
+/** Options accepted by {@link Runtime.spawn}. */
+export interface SpawnOptions {
+  /** Working directory, relative to the runtime's own working directory. */
+  cwd?: string
+  /** Extra environment variables for the process. */
+  env?: Record<string, string | number | boolean>
+  /** Set `false` to suppress the output stream entirely. */
+  output?: boolean
+  /** Size of the attached terminal. Processes read this as their tty width. */
+  terminal?: TerminalSize
+}
+
+/**
+ * A process started by {@link Runtime.spawn}.
+ *
+ * Deliberately mirrors a pseudoterminal rather than a plain pipe: the backend
+ * attaches one, and collapsing it to just an exit code — which this interface
+ * used to do — throws away cancellation, interactive input and terminal sizing.
+ */
 export interface RuntimeProcess {
   /** Merged stdout/stderr, still carrying ANSI escapes. */
   output: ReadableStream<string>
+  /**
+   * Input side of the attached terminal. Writing a line runs it; writing a
+   * control byte such as `\x03` interrupts, exactly as typing would.
+   */
+  input: WritableStream<string>
   /** Resolves with the exit code. A non-zero code resolves, it does not reject. */
   exit: Promise<number>
+  /** Terminates the process. {@link exit} then resolves with the signal code. */
+  kill(): void
+  /** Tells the process its terminal was resized. */
+  resize(dimensions: TerminalSize): void
 }
 
 /** A directory entry returned by {@link Runtime.readdir}. */
@@ -55,7 +88,11 @@ export interface Runtime {
    */
   mount(tree: FileTree, options?: { mountPoint?: string }): Promise<void>
   /** Starts a process. Resolves once spawned, not once exited. */
-  spawn(command: string, args: string[]): Promise<RuntimeProcess>
+  spawn(
+    command: string,
+    args: string[],
+    options?: SpawnOptions
+  ): Promise<RuntimeProcess>
   /** Reads a file as raw bytes. Rejects if it does not exist. */
   readFile(path: string): Promise<Uint8Array>
   /** Writes a file, overwriting any existing contents. */

@@ -9,6 +9,7 @@ import { startServer, type ServerInfo } from '../core/server.js'
 import { WCBrowser } from '../core/browser.js'
 import { listProjectFiles, readProjectFileBytes } from '../core/file-sync.js'
 import { withSpin } from '../utils/spinner.js'
+import { commandFailure } from '../utils/command-error.js'
 import type { DevOptions, ServerHandlers } from '../types.js'
 
 /**
@@ -94,8 +95,8 @@ export async function dev(options: DevOptions): Promise<void> {
       spinner,
       message: 'Installing dependencies...',
       fn: async () => {
-        const code = await browser!.runCommand('npm', ['install'])
-        if (code !== 0) throw new Error('npm install failed')
+        const result = await browser!.runCommand('npm', ['install'])
+        if (result.exitCode !== 0) throw commandFailure('npm install', result)
       },
       successMessage: 'Dependencies installed',
       failMessage: (err) => `npm install failed: ${err.message}`,

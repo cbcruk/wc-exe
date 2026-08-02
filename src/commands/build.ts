@@ -18,6 +18,7 @@ import {
   ensureCacheDirs,
 } from '../core/cache.js'
 import { withSpin } from '../utils/spinner.js'
+import { commandFailure } from '../utils/command-error.js'
 import type { BuildOptions, ServerHandlers } from '../types.js'
 
 /**
@@ -135,9 +136,11 @@ export async function build(options: BuildOptions): Promise<void> {
           spinner,
           message: 'Installing dependencies (npm install)...',
           fn: async () => {
-            const code = await browser!.runCommand('npm', ['install'], timeout)
-            if (code !== 0)
-              throw new Error(`npm install failed with exit code ${code}`)
+            const result = await browser!.runCommand('npm', ['install'], {
+              timeout,
+            })
+            if (result.exitCode !== 0)
+              throw commandFailure('npm install', result)
           },
           successMessage: 'Dependencies installed',
           failMessage: (err) => `npm install failed: ${err.message}`,
@@ -149,9 +152,10 @@ export async function build(options: BuildOptions): Promise<void> {
       spinner,
       message: 'Building project (npm run build)...',
       fn: async () => {
-        const code = await browser!.runCommand('npm', ['run', 'build'], timeout)
-        if (code !== 0)
-          throw new Error(`npm run build failed with exit code ${code}`)
+        const result = await browser!.runCommand('npm', ['run', 'build'], {
+          timeout,
+        })
+        if (result.exitCode !== 0) throw commandFailure('npm run build', result)
       },
       successMessage: 'Build completed',
       failMessage: (err) => `Build failed: ${err.message}`,
