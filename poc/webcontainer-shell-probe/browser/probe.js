@@ -18,6 +18,8 @@ import {
   CTRL_C,
   CWD_MARKER,
   CWD_TYPED,
+  FOREGROUND_MARKER,
+  FOREGROUND_TYPED,
   NEVER_SENT,
   SIGINT_MARKER,
   SIGINT_TYPED,
@@ -25,6 +27,7 @@ import {
   STDIN_TYPED,
   TIMEOUT_MS,
   attach,
+  runInShell,
   send,
   timeout,
 } from './pty.js'
@@ -143,25 +146,32 @@ async function main() {
   )
   record('env.path', 'What is the default PATH?', 'info', String(wc.path))
 
-  await check('env.inventory', 'What is actually on PATH?', async () => {
-    const dirs = String(wc.path).split(':').filter(Boolean)
-    const found = {}
-    let total = 0
-    for (const dir of dirs) {
-      try {
-        const entries = await wc.fs.readdir(dir, { withFileTypes: true })
-        const names = entries.filter((e) => e.isFile()).map((e) => e.name)
-        found[dir] = names.sort()
-        total += names.length
-      } catch (err) {
-        found[dir] = `<unreadable: ${err?.message ?? err}>`
+  await check(
+    'env.fs_scope',
+    'Can the fs API see the system filesystem?',
+    async () => {
+      // Asked explicitly because it is a genuine constraint, not a probe
+      // limitation: the inventory below has to go through the shell for exactly
+      // this reason.
+      const attempts = {}
+      for (const p of ['/bin', '/usr/bin', '/']) {
+        try {
+          const entries = await wc.fs.readdir(p, { withFileTypes: true })
+          attempts[p] = entries.map((e) => e.name)
+        } catch (err) {
+          attempts[p] = `<${err?.message ?? err}>`
+        }
+      }
+      const sawSystemDirs = Array.isArray(attempts['/bin'])
+      return {
+        status: sawSystemDirs ? 'pass' : 'fail',
+        detail: sawSystemDirs
+          ? `fs reaches system directories: ${JSON.stringify(attempts)}`
+          : `fs is scoped to the project directory — absolute paths resolve under workdir, ` +
+            `so system binaries are invisible to it. ${JSON.stringify(attempts)}`,
       }
     }
-    return {
-      status: total > 0 ? 'pass' : 'fail',
-      detail: JSON.stringify(found),
-    }
-  })
+  )
 
   // ---------------------------------------------------------------- shell discovery
 
@@ -198,48 +208,6 @@ async function main() {
     }
   })
 
-  // ---------------------------------------------------------------- binaries
-
-  await check(
-    'binaries.probe',
-    'Which well-known commands exist?',
-    async () => {
-      const present = []
-      const absent = []
-      for (const name of [...BINARY_CANDIDATES, IMPOSSIBLE_BINARY]) {
-        try {
-          const { exitCode, transcript } = await runToExit(
-            wc,
-            name,
-            ['--version'],
-            {},
-            8000
-          )
-          // 127 and "not found" both mean the binary is missing; anything else
-          // means it ran, even if it rejected --version.
-          const missing =
-            exitCode === 127 || /not found|no such file/i.test(transcript)
-          ;(missing ? absent : present).push(name)
-        } catch {
-          absent.push(name)
-        }
-      }
-      // Negative control: a name that cannot exist must land in `absent`.
-      if (present.includes(IMPOSSIBLE_BINARY)) {
-        return {
-          status: 'broken',
-          detail:
-            `the impossible binary "${IMPOSSIBLE_BINARY}" was reported present, ` +
-            `so this detection cannot tell present from absent. present=${JSON.stringify(present)}`,
-        }
-      }
-      return {
-        status: present.length > 0 ? 'pass' : 'fail',
-        detail: `present=${JSON.stringify(present)} absent=${JSON.stringify(absent.filter((n) => n !== IMPOSSIBLE_BINARY))}`,
-      }
-    }
-  )
-
   // ---------------------------------------------------------------- the PTY itself
 
   // Everything below needs a live interactive shell.
@@ -266,6 +234,87 @@ async function main() {
       }
     })
   )
+
+  // ---------------------------------------------------------------- inventory
+  //
+  // Runs through the shell rather than the fs API, because env.fs_scope shows
+  // the fs API cannot see system directories at all.
+
+  await check(
+    'env.inventory',
+    'What is actually installed on PATH?',
+    needShell(async () => {
+      if (!session || !sessionIo)
+        return { status: 'skip', detail: 'no session' }
+      const dirs = String(wc.path).split(':').filter(Boolean)
+      const found = {}
+      for (const dir of dirs) {
+        const raw = await runInShell(session, sessionIo, `ls ${dir}`)
+        found[dir] = raw
+          .split(/\s+/)
+          // ls marks executables with `*` and symlinks with `@`.
+          .map((name) => name.replace(/[*@/]$/, '').trim())
+          // Keep only plausible command names: the transcript also carries the
+          // prompt (`~/<workdir>`, `❯`) and ls's `dir:` headers.
+          .filter((name) => /^[\w.+-]+$/.test(name))
+          .sort()
+      }
+      // Positive control: we are running jsh right now, so /bin must list it.
+      // If it does not, the parse is wrong and the whole inventory is noise.
+      const all = Object.values(found).flat()
+      if (!all.includes('jsh')) {
+        return {
+          status: 'broken',
+          detail:
+            'jsh is demonstrably running yet does not appear in the parsed listing, ' +
+            `so this parse cannot be trusted. parsed=${JSON.stringify(found)}`,
+        }
+      }
+      return {
+        status: 'pass',
+        detail: `${all.length} entries. ${JSON.stringify(found)}`,
+      }
+    })
+  )
+
+  await check(
+    'binaries.probe',
+    'Which well-known commands exist?',
+    needShell(async () => {
+      if (!session || !sessionIo)
+        return { status: 'skip', detail: 'no session' }
+      const present = []
+      const absent = []
+      for (const name of [...BINARY_CANDIDATES, IMPOSSIBLE_BINARY]) {
+        // `which` is authoritative. The first version of this check ran
+        // `X --version` and called a non-zero exit "absent", which wrongly
+        // buried `env` — it exists but does not take --version.
+        const out = await runInShell(session, sessionIo, `which ${name}`)
+        ;(/not found/i.test(out) ? absent : present).push(name)
+      }
+      if (present.includes(IMPOSSIBLE_BINARY)) {
+        return {
+          status: 'broken',
+          detail:
+            `the impossible binary "${IMPOSSIBLE_BINARY}" was reported present, ` +
+            `so this cannot tell present from absent. present=${JSON.stringify(present)}`,
+        }
+      }
+      // Positive control: node demonstrably runs, so it must resolve.
+      if (!present.includes('node')) {
+        return {
+          status: 'broken',
+          detail: `node runs in this very probe but was reported absent. absent=${JSON.stringify(absent)}`,
+        }
+      }
+      return {
+        status: 'pass',
+        detail: `present=${JSON.stringify(present)} absent=${JSON.stringify(absent.filter((n) => n !== IMPOSSIBLE_BINARY))}`,
+      }
+    })
+  )
+
+  // ---------------------------------------------------------------- back to the PTY
 
   await check(
     'pty.echo',
@@ -305,7 +354,10 @@ async function main() {
       if (!session || !sessionIo)
         return { status: 'skip', detail: 'no session' }
       await wc.fs.mkdir('probe-cd', { recursive: true })
-      await send(session, 'cd probe-cd\n')
+      // Wait for `cd` to complete before typing the next line. Writing both
+      // back-to-back made jsh throw an internal error mid-run, after which its
+      // job tracking silently died — see pty.sigint_aged.
+      await runInShell(session, sessionIo, 'cd probe-cd')
       await send(session, CWD_TYPED)
       const transcript = await sessionIo.waitFor(new RegExp(CWD_MARKER))
       const inDir = /probe-cd/.test(transcript)
@@ -318,23 +370,90 @@ async function main() {
     })
   )
 
+  /**
+   * Starts a foreground process, interrupts it with Ctrl-C, and checks the
+   * shell survived.
+   *
+   * A failure here is ambiguous — Ctrl-C not working looks exactly like the
+   * probe mistiming it — so every exit path reports the transcript tail rather
+   * than a bare "timed out". Never claim a finding we cannot see.
+   */
+  async function trySigint(proc, io) {
+    const tail = () =>
+      `last 600 chars: ${JSON.stringify(io.transcript.slice(-600))}`
+
+    await send(proc, FOREGROUND_TYPED)
+    try {
+      // Wait for the victim to announce itself instead of sleeping a guess.
+      await io.waitFor(new RegExp(FOREGROUND_MARKER), 15000)
+    } catch {
+      return {
+        status: 'skip',
+        detail: `the foreground process never started, so Ctrl-C was never exercised. ${tail()}`,
+      }
+    }
+
+    await send(proc, CTRL_C)
+    try {
+      // The shell must acknowledge the interrupt before we type again; writing
+      // too early means it never sees the follow-up line and a working Ctrl-C
+      // reports as a timeout.
+      await io.waitFor(/\^C/, 10000)
+    } catch {
+      return {
+        status: 'fail',
+        detail: `no ^C acknowledgement within 10s of writing 0x03. ${tail()}`,
+      }
+    }
+
+    try {
+      await send(proc, SIGINT_TYPED)
+      await io.waitFor(new RegExp(SIGINT_MARKER), 10000)
+    } catch {
+      return {
+        status: 'fail',
+        detail: `the interrupt was acknowledged but the shell stopped accepting input. ${tail()}`,
+      }
+    }
+
+    return {
+      status: 'pass',
+      detail:
+        'Ctrl-C interrupted the foreground process and the shell kept accepting input',
+    }
+  }
+
   await check(
     'pty.sigint',
     'Does Ctrl-C kill the foreground command but leave the shell alive?',
     needShell(async () => {
+      // Deliberately a FRESH shell. The shared session has by now run ~25
+      // commands, and mixing "does Ctrl-C work" with "does a long-lived session
+      // stay healthy" into one result makes a failure unattributable. The next
+      // check asks the second question separately.
+      const fresh = await wc.spawn(shell, [], {
+        terminal: { cols: 80, rows: 24 },
+      })
+      const freshIo = attach(fresh)
+      try {
+        await freshIo.waitFor(/\S/, 10000)
+        return await trySigint(fresh, freshIo)
+      } finally {
+        fresh.kill()
+      }
+    })
+  )
+
+  await check(
+    'pty.sigint_aged',
+    'Does Ctrl-C still work on a session that has been used heavily?',
+    needShell(async () => {
       if (!session || !sessionIo)
         return { status: 'skip', detail: 'no session' }
-      await send(session, 'node -e "setInterval(() => {}, 1000)"\n')
-      // Give the child a moment to actually become the foreground process.
-      await new Promise((r) => setTimeout(r, 1500))
-      await send(session, CTRL_C)
-      await send(session, SIGINT_TYPED)
-      await sessionIo.waitFor(new RegExp(SIGINT_MARKER))
-      return {
-        status: 'pass',
-        detail:
-          'Ctrl-C interrupted the foreground process and the shell kept accepting input',
-      }
+      // Matters for the persistent-runner design specifically: a daemon holds
+      // one session open for a long time, so degradation over a session's life
+      // is the failure mode that would actually bite.
+      return await trySigint(session, sessionIo)
     })
   )
 

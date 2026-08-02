@@ -29,6 +29,13 @@ export const SIGINT_TYPED = 'echo "WCPROBE""_SURVIVED_SIGINT"\n'
 export const CWD_MARKER = 'WCPROBE_CWD_OK'
 export const CWD_TYPED = 'pwd && echo "WCPROBE""_CWD_OK"\n'
 
+// The Ctrl-C check must not fire until the victim process is genuinely in the
+// foreground. Sleeping a guessed number of milliseconds is what made the first
+// version of that check flaky, so the process announces itself instead.
+export const FOREGROUND_MARKER = 'WCPROBE_FOREGROUND_READY'
+export const FOREGROUND_TYPED =
+  'node -e \'console.log("WCPROBE" + "_FOREGROUND_READY"); setInterval(() => {}, 1000)\'\n'
+
 /**
  * Never written to anything. If it ever shows up in a transcript, the probe is
  * not reading what it thinks it is and every other result becomes suspect.
@@ -104,4 +111,39 @@ export async function send(proc, text) {
   const writer = proc.input.getWriter()
   await writer.write(text)
   writer.releaseLock()
+}
+
+/** Strips ANSI escape sequences so shell output can be parsed. */
+export function stripAnsi(text) {
+  return text.replace(
+    new RegExp(String.fromCharCode(27) + '\\[[0-9;?]*[a-zA-Z]', 'g'),
+    ''
+  )
+}
+
+let sequence = 0
+
+/**
+ * Runs one command inside a live shell session and returns just its output.
+ *
+ * Needed because the runtime's `fs` API cannot see the system filesystem — the
+ * only way to inventory what is installed is to ask the shell. Completion is
+ * detected with a per-call marker rather than a sleep, so slow commands are
+ * waited out and fast ones are not padded.
+ *
+ * The marker is split across a quote boundary for the same reason the probe's
+ * other markers are: the terminal echoes the keystrokes, so an unsplit marker
+ * would signal completion the instant the line was typed.
+ */
+export async function runInShell(proc, io, command, ms = TIMEOUT_MS) {
+  const n = ++sequence
+  const marker = `WCPROBE_DONE_${n}`
+  const start = io.transcript.length
+  await send(proc, `${command}; echo "WCPROBE""_DONE_${n}"\n`)
+  await io.waitFor(new RegExp(marker), ms)
+  // Drop the echoed command line and the marker itself; keep what ran.
+  return stripAnsi(io.transcript.slice(start))
+    .split('\n')
+    .filter((line) => !line.includes(command) && !line.includes(marker))
+    .join('\n')
 }
