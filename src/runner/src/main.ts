@@ -58,6 +58,20 @@ declare global {
   }
 }
 
+/**
+ * Base the `/api` routes hang off, taken from where this page was served.
+ *
+ * The one-shot server mounts the page at `/`; the daemon mounts one session per
+ * path. Resolving against the page's own directory makes the same bundle work
+ * for both, so the runner never needs to know which it is talking to.
+ */
+const API_BASE = new URL('.', location.href)
+
+/** Absolute URL for an API route, e.g. `apiUrl('api/files')`. */
+function apiUrl(path: string): string {
+  return new URL(path, API_BASE).href
+}
+
 let runtime: Runtime | null = null
 
 /**
@@ -85,7 +99,7 @@ async function boot(): Promise<void> {
 async function mountFromServer(): Promise<number> {
   invariant(runtime, 'Runtime not booted')
 
-  const manifestRes = await fetch('/api/files')
+  const manifestRes = await fetch(apiUrl('api/files'))
   if (!manifestRes.ok) {
     throw new Error(`Failed to fetch file manifest: ${manifestRes.status}`)
   }
@@ -98,7 +112,7 @@ async function mountFromServer(): Promise<number> {
 
   for (const filePath of paths) {
     const fileRes = await fetch(
-      `/api/files/raw?path=${encodeURIComponent(filePath)}`
+      apiUrl(`api/files/raw?path=${encodeURIComponent(filePath)}`)
     )
     if (!fileRes.ok) {
       throw new Error(`Failed to fetch file ${filePath}: ${fileRes.status}`)
@@ -580,6 +594,38 @@ async function restoreNodeModules(
 }
 
 /**
+ * Restores the executable bit on everything in `node_modules/.bin`.
+ *
+ * The snapshot round-trip does not preserve permissions, so a restored
+ * `node_modules` has a `.bin` full of non-executable files and the first thing
+ * an npm script tries to run dies with `spawn <tool> EACCES`.
+ *
+ * That failure is unusually nasty because **npm still exits 0**. The build
+ * reports success, produces nothing, and the first sign of trouble is a
+ * confusing ENOENT when the output directory turns out not to exist. It went
+ * unnoticed until the daemon started taking the cache-hit path on every build.
+ *
+ * `chmod` follows symlinks, and `.bin` entries are symlinks into the packages,
+ * so this reaches the real files.
+ */
+async function restoreBinPermissions(): Promise<void> {
+  invariant(runtime, 'Runtime not booted')
+
+  const { exitCode } = await runCommand('chmod', [
+    '-R',
+    '+x',
+    'node_modules/.bin',
+  ])
+
+  if (exitCode !== 0) {
+    console.warn(
+      `[wc-build] Could not restore permissions on node_modules/.bin (exit ${exitCode}); ` +
+        'the build may fail to spawn its tools'
+    )
+  }
+}
+
+/**
  * Snapshots the installed `node_modules` to OPFS under `key`, replacing any
  * existing snapshot for that key.
  *
@@ -678,6 +724,7 @@ async function installWithCache(): Promise<CacheResult> {
   }
 
   if (await restoreNodeModules(runtime, key)) {
+    await restoreBinPermissions()
     console.log(`[wc-build] node_modules cache HIT (${key.slice(0, 12)})`)
     return { cached: true, key }
   }
@@ -795,6 +842,19 @@ async function uploadDist(distPath: string): Promise<number> {
   const rt = runtime
   let count = 0
 
+  // A build tool that cannot spawn its own binary still exits 0 under npm, so
+  // "the build succeeded" and "the build produced something" are genuinely
+  // different claims. Checking here turns that case into a sentence naming the
+  // problem, instead of a bare ENOENT from the directory walk below.
+  try {
+    await rt.readdir(distPath)
+  } catch {
+    throw new Error(
+      `The build reported success but produced no output at ${distPath}. ` +
+        'Check the build log above — a tool that fails to start can still exit 0.'
+    )
+  }
+
   async function traverse(currentPath: string): Promise<void> {
     const entries = await rt.readdir(currentPath)
 
@@ -813,7 +873,7 @@ async function uploadDist(distPath: string): Promise<number> {
         ) as ArrayBuffer
 
         const res = await fetch(
-          `/api/dist?path=${encodeURIComponent(relative)}`,
+          apiUrl(`api/dist?path=${encodeURIComponent(relative)}`),
           {
             method: 'POST',
             headers: { 'content-type': 'application/octet-stream' },

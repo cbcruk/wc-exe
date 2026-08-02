@@ -1,12 +1,8 @@
 import { Hono } from 'hono'
 import { serve, type ServerType } from '@hono/node-server'
 import { serveStatic } from '@hono/node-server/serve-static'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { resolveRunnerDist } from './runner-assets.js'
 import type { ServerHandlers } from '../types.js'
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const runnerPath = path.resolve(__dirname, '../src/runner/dist')
 
 function toArrayBuffer(view: Uint8Array): ArrayBuffer {
   return view.buffer.slice(
@@ -63,7 +59,7 @@ export function createApp(handlers: ServerHandlers): Hono {
     return c.body(null, 204)
   })
 
-  app.use('/*', serveStatic({ root: runnerPath }))
+  app.use('/*', serveStatic({ root: resolveRunnerDist() }))
 
   return app
 }
