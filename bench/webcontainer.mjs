@@ -33,6 +33,7 @@ import {
   readProjectFileBytes,
 } from '../dist/index.js'
 import { average, reportBreakdown, reportVerdict } from './report.mjs'
+import { assertBuildProduced } from './verify.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(__dirname, '..')
@@ -119,6 +120,9 @@ async function runOnce(source, { cache }) {
       if (exitCode !== 0) throw new Error(`npm run build exited ${exitCode}`)
     })
 
+    // Timing a build that produced nothing is worse than not timing it.
+    const producedFiles = await assertBuildProduced(browser)
+
     return {
       bootMs: boot.ms,
       mountMs: mount.ms,
@@ -127,6 +131,7 @@ async function runOnce(source, { cache }) {
       // The number that matters for the container2wasm comparison: the
       // CPU/IO burst of install+build, excluding one-time boot.
       installPlusBuildMs: install.ms + build.ms,
+      producedFiles,
       ...(cache ? { cacheHit } : {}),
     }
   } finally {

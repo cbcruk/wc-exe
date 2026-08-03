@@ -12,7 +12,12 @@ import {
 import { launchChrome } from '../core/chrome.js'
 import { resolveRunnerDist } from '../core/runner-assets.js'
 import { controlPlaneGuard } from './auth.js'
-import { createToken, writeRecord, clearRecord } from './discovery.js'
+import {
+  createToken,
+  writeRecord,
+  clearRecord,
+  readRecord,
+} from './discovery.js'
 import { Session, sessionKey } from './session.js'
 import { VERSION } from '../version.js'
 
@@ -256,7 +261,15 @@ export async function startDaemon(
   })
 
   const idleTimer = setInterval(() => {
-    if (Date.now() - lastActivity > idleMs) void shutdown()
+    if (Date.now() - lastActivity > idleMs) return void shutdown()
+
+    // Exit if the discovery record no longer points at us. Without this a
+    // daemon whose record was removed out from under it — the cache directory
+    // wiped, say — keeps running and keeps holding the port, while every CLI
+    // reports that no daemon exists. It becomes unmanageable and breaks any
+    // other process expecting that port to be free.
+    const current = readRecord()
+    if (!current || current.pid !== process.pid) void shutdown()
   }, 30_000)
   // Do not hold the process open on the idle check alone.
   idleTimer.unref?.()

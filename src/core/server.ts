@@ -92,12 +92,24 @@ export function startServer(
         {
           fetch: app.fetch,
           port,
+          // 127.0.0.1 only. These routes hand out the project's source files,
+          // so binding every interface published the user's code to the local
+          // network for the duration of the build. It also made a port clash
+          // undetectable: binding INADDR_ANY can succeed while another process
+          // already holds 127.0.0.1 on the same port, after which requests land
+          // on whichever got there first.
+          hostname: '127.0.0.1',
         },
         (info) => {
           resolve({
             server,
             port: info.port,
-            url: `http://localhost:${info.port}`,
+            // 127.0.0.1, not `localhost`. OPFS is keyed by origin as a
+            // string, so the two are different stores even though they reach
+            // the same server — the daemon and this path would each keep their
+            // own node_modules cache and neither could use the other's. It also
+            // avoids `localhost` resolving to ::1 while we listen on IPv4.
+            url: `http://127.0.0.1:${info.port}`,
           })
         }
       )
