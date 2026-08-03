@@ -119,6 +119,16 @@ export async function build(options: BuildOptions): Promise<void> {
       failMessage: 'Failed to mount files',
     })
 
+    // The project's own package manager, not npm by assumption: the three
+    // build different dependency trees from the same package.json, and using
+    // the wrong one breaks projects that build fine locally.
+    const { manager, reason, command, argsPrefix, note } =
+      await browser.packageManager()
+    if (verbose)
+      console.log(
+        chalk.gray(`  package manager: ${manager} (${reason}; ${note})`)
+      )
+
     if (!noInstall) {
       if (cacheStable) {
         await withSpin({
@@ -129,33 +139,38 @@ export async function build(options: BuildOptions): Promise<void> {
             r.cached
               ? `Restored node_modules from cache (${r.key.slice(0, 12)})`
               : `Installed and cached node_modules (${((r.bytes ?? 0) / 1048576).toFixed(1)} MB)`,
-          failMessage: (err) => `npm install failed: ${err.message}`,
+          failMessage: (err) => `${manager} install failed: ${err.message}`,
         })
       } else {
         await withSpin({
           spinner,
-          message: 'Installing dependencies (npm install)...',
+          message: `Installing dependencies (${manager} install)...`,
           fn: async () => {
-            const result = await browser!.runCommand('npm', ['install'], {
-              timeout,
-            })
+            const result = await browser!.runCommand(
+              command,
+              [...argsPrefix, 'install'],
+              { timeout }
+            )
             if (result.exitCode !== 0)
-              throw commandFailure('npm install', result)
+              throw commandFailure(`${manager} install`, result)
           },
           successMessage: 'Dependencies installed',
-          failMessage: (err) => `npm install failed: ${err.message}`,
+          failMessage: (err) => `${manager} install failed: ${err.message}`,
         })
       }
     }
 
     await withSpin({
       spinner,
-      message: 'Building project (npm run build)...',
+      message: `Building project (${manager} run build)...`,
       fn: async () => {
-        const result = await browser!.runCommand('npm', ['run', 'build'], {
-          timeout,
-        })
-        if (result.exitCode !== 0) throw commandFailure('npm run build', result)
+        const result = await browser!.runCommand(
+          command,
+          [...argsPrefix, 'run', 'build'],
+          { timeout }
+        )
+        if (result.exitCode !== 0)
+          throw commandFailure(`${manager} run build`, result)
       },
       successMessage: 'Build completed',
       failMessage: (err) => `Build failed: ${err.message}`,

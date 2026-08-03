@@ -3,6 +3,7 @@ import { launchChrome } from './chrome.js'
 import type {
   CacheResult,
   CommandResult,
+  PackageManagerChoice,
   RunCommandOptions,
   ShellExecResult,
   TerminalSize,
@@ -139,6 +140,26 @@ export class WCBrowser {
           wcRunner: { installWithCache: () => Promise<CacheResult> }
         }
       ).wcRunner.installWithCache()
+    })
+  }
+
+  /**
+   * Asks the runtime which package manager this project uses.
+   *
+   * Decided from the mounted files rather than the host copy, so the answer
+   * comes from exactly the tree that will be installed and built.
+   */
+  async packageManager(): Promise<PackageManagerChoice> {
+    if (!this.page) throw new Error('Browser not launched')
+
+    return await this.page.evaluate(async () => {
+      return await (
+        window as unknown as {
+          wcRunner: {
+            resolvePackageManager: () => Promise<PackageManagerChoice>
+          }
+        }
+      ).wcRunner.resolvePackageManager()
     })
   }
 

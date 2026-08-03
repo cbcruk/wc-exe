@@ -95,8 +95,10 @@ export async function dev(options: DevOptions): Promise<void> {
       spinner,
       message: 'Installing dependencies...',
       fn: async () => {
-        const result = await browser!.runCommand('npm', ['install'])
-        if (result.exitCode !== 0) throw commandFailure('npm install', result)
+        const { manager } = await browser!.packageManager()
+        const result = await browser!.runCommand(manager, ['install'])
+        if (result.exitCode !== 0)
+          throw commandFailure(`${manager} install`, result)
       },
       successMessage: 'Dependencies installed',
       failMessage: (err) => `npm install failed: ${err.message}`,

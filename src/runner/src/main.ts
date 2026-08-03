@@ -10,6 +10,18 @@ import {
   type TerminalSize,
 } from './runtime/runtime.types'
 import { OutputBuffer } from './runtime/output-buffer'
+import {
+  detectPackageManager,
+  installArgs,
+  offlineInstallArgs,
+  usesNpmTarballCache,
+  LOCKFILES,
+  packageManagerCommand,
+  parsePackageManagerVersion,
+  type PackageManager,
+  type PackageManagerChoice,
+  type PackageManagerCommand,
+} from './runtime/package-manager'
 import { ShellSession, type ShellExecResult } from './runtime/shell-session'
 
 const ANSI_REGEX =
@@ -346,6 +358,62 @@ function closeShell(id: string): void {
   shells.delete(id)
 }
 
+/**
+ * Works out which package manager this project uses, from the mounted files.
+ *
+ * Done inside the runtime rather than on the host so there is one answer, taken
+ * from exactly the tree that will be installed.
+ */
+async function resolvePackageManager(): Promise<
+  PackageManagerChoice & PackageManagerCommand
+> {
+  invariant(runtime, 'Runtime not booted')
+
+  let packageManagerField: string | undefined
+  let declaredVersion: string | null = null
+  try {
+    const raw = await runtime.readFile('package.json')
+    const parsed = JSON.parse(new TextDecoder().decode(raw))
+    packageManagerField =
+      typeof parsed?.packageManager === 'string'
+        ? parsed.packageManager
+        : undefined
+    declaredVersion = parsePackageManagerVersion(packageManagerField)
+  } catch {
+    /* no package.json, or unreadable — fall through to lockfile detection */
+  }
+
+  const lockfiles: string[] = []
+  for (const { file } of LOCKFILES) {
+    try {
+      await runtime.readFile(file)
+      lockfiles.push(file)
+    } catch {
+      /* absent */
+    }
+  }
+
+  const choice = detectPackageManager({ packageManagerField, lockfiles })
+
+  let runtimeVersion: string | null = null
+  if (declaredVersion) {
+    const installed = await runCommand(choice.manager, ['--version'])
+    runtimeVersion = /(\d+\.\d+\.\d+)/.exec(installed.output)?.[1] ?? null
+  }
+
+  const invocation = packageManagerCommand(
+    choice.manager,
+    declaredVersion,
+    runtimeVersion
+  )
+
+  console.log(
+    `[wc-build] Using ${choice.manager} to install (${choice.reason}; ${invocation.note})`
+  )
+
+  return { ...choice, ...invocation }
+}
+
 /** Outcome of {@link installWithCache}. */
 type CacheResult = {
   /** Whether `node_modules` was restored from a snapshot instead of installed. */
@@ -358,6 +426,8 @@ type CacheResult = {
   // on a node_modules MISS when the tarball cache participated.
   npmCacheRestored?: boolean
   npmCacheBytes?: number
+  /** Which package manager actually performed the install. */
+  manager?: PackageManager
 }
 
 // Candidate cache-key sources, most authoritative first: the first one present
@@ -709,6 +779,7 @@ async function installWithCache(): Promise<CacheResult> {
   invariant(runtime, 'Runtime not booted')
 
   const key = await computeCacheKey()
+  const { manager, command, argsPrefix } = await resolvePackageManager()
 
   // The cache needs a snapshot-capable backend; otherwise fall back to a plain
   // install so a future backend without export/import still works.
@@ -716,38 +787,45 @@ async function installWithCache(): Promise<CacheResult> {
     console.log(
       '[wc-build] Runtime has no snapshot support; installing plainly'
     )
-    const { exitCode } = await runCommand('npm', ['install'])
+    const { exitCode } = await runCommand(command, [
+      ...argsPrefix,
+      ...installArgs(),
+    ])
     if (exitCode !== 0) {
-      throw new Error(`npm install failed with exit code ${exitCode}`)
+      throw new Error(`${manager} install failed with exit code ${exitCode}`)
     }
-    return { cached: false, key }
+    return { cached: false, key, manager }
   }
 
   if (await restoreNodeModules(runtime, key)) {
     await restoreBinPermissions()
     console.log(`[wc-build] node_modules cache HIT (${key.slice(0, 12)})`)
-    return { cached: true, key }
+    return { cached: true, key, manager }
   }
 
   console.log(`[wc-build] node_modules cache MISS (${key.slice(0, 12)})`)
 
   // Even on a full node_modules miss, prime npm's own content-addressed tarball
   // cache from OPFS so only packages new to *this* lockfile hit the network.
-  const npmCacheRestored = await restoreNpmCache(runtime)
-  console.log(
-    npmCacheRestored
-      ? '[wc-build] npm tarball cache restored; installing --prefer-offline'
-      : '[wc-build] no npm tarball cache yet; installing online (will seed it)'
-  )
+  // pnpm and yarn keep their own stores in their own formats, so they skip this
+  // layer and rely on the node_modules snapshot alone.
+  const npmCacheRestored = usesNpmTarballCache(manager)
+    ? await restoreNpmCache(runtime)
+    : false
+  if (usesNpmTarballCache(manager)) {
+    console.log(
+      npmCacheRestored
+        ? '[wc-build] npm tarball cache restored; installing --prefer-offline'
+        : '[wc-build] no npm tarball cache yet; installing online (will seed it)'
+    )
+  }
 
-  const { exitCode } = await runCommand('npm', [
-    'install',
-    '--prefer-offline',
-    '--cache',
-    NPM_CACHE_DIR,
+  const { exitCode } = await runCommand(command, [
+    ...argsPrefix,
+    ...offlineInstallArgs(manager, NPM_CACHE_DIR),
   ])
   if (exitCode !== 0) {
-    throw new Error(`npm install failed with exit code ${exitCode}`)
+    throw new Error(`${manager} install failed with exit code ${exitCode}`)
   }
 
   const bytes = await saveNodeModules(runtime, key)
@@ -755,10 +833,14 @@ async function installWithCache(): Promise<CacheResult> {
     `[wc-build] Cached node_modules snapshot: ${(bytes / 1048576).toFixed(1)} MB`
   )
 
-  const npmCacheBytes = await saveNpmCache(runtime)
-  console.log(
-    `[wc-build] Updated npm tarball cache: ${(npmCacheBytes / 1048576).toFixed(1)} MB`
-  )
+  const npmCacheBytes = usesNpmTarballCache(manager)
+    ? await saveNpmCache(runtime)
+    : 0
+  if (usesNpmTarballCache(manager)) {
+    console.log(
+      `[wc-build] Updated npm tarball cache: ${(npmCacheBytes / 1048576).toFixed(1)} MB`
+    )
+  }
 
   await evictCache(`nm-${key}.bin`)
 
@@ -931,6 +1013,7 @@ const wcRunner = {
   boot,
   mountFromServer,
   runCommand,
+  resolvePackageManager,
   killCommand,
   resizeCommand,
   openShell,

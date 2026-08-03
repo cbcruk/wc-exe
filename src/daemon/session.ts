@@ -174,6 +174,12 @@ export class Session {
       const { upserted, removed } = await this.sync()
       log(`Synced project (${upserted} written, ${removed} removed)`)
 
+      // Re-resolved every build: a project can gain or change a lockfile
+      // between runs, and a long-lived session must not keep installing with
+      // the manager it happened to see first.
+      const { manager, reason } = await this.browser!.packageManager()
+      log(`Package manager: ${manager} (${reason})`)
+
       if (!options.noInstall) {
         const result = await this.browser!.installWithCache()
         log(
@@ -195,11 +201,12 @@ export class Session {
       log('Cleared previous build output')
 
       const build: CommandResult = await this.browser!.runCommand(
-        'npm',
+        manager,
         ['run', 'build'],
         { timeout: options.timeout }
       )
-      if (build.exitCode !== 0) throw commandFailure('npm run build', build)
+      if (build.exitCode !== 0)
+        throw commandFailure(`${manager} run build`, build)
       log('Build completed')
 
       this.currentOutput = options.output

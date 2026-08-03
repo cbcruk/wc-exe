@@ -70,6 +70,22 @@ export interface WCMessage {
   code?: number
 }
 
+/** Package managers the runtime can install with. */
+export type PackageManager = 'npm' | 'pnpm' | 'yarn'
+
+/** Which package manager a project uses, and how that was decided. */
+export interface PackageManagerChoice {
+  manager: PackageManager
+  /** Human-readable justification, so a wrong pick is visible in the log. */
+  reason: string
+  /** Executable to spawn — the manager, or `npx` when a version is pinned. */
+  command: string
+  /** Arguments that must precede the subcommand. */
+  argsPrefix: string[]
+  /** Why this invocation was chosen. */
+  note: string
+}
+
 /** Terminal dimensions, in character cells. */
 export interface TerminalSize {
   cols: number
@@ -143,6 +159,8 @@ export interface CacheResult {
   npmCacheRestored?: boolean
   /** Size of the tarball cache snapshot. MISS only. */
   npmCacheBytes?: number
+  /** Which package manager performed the install. */
+  manager?: PackageManager
 }
 
 /**
