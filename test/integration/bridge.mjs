@@ -41,6 +41,25 @@ try {
   await browser.launch(info.url)
   await browser.mountFromServer()
 
+  // 0. byte fidelity of mounted files.
+  //
+  // WebContainer 1.6.1 corrupted non-ASCII content on mount: bytes came back
+  // decoded as Windows-1252 and truncated (0x98 -> 0xDC, 0x85 -> 0x26). Fixed
+  // upstream, but it silently broke every project with non-ASCII text in it,
+  // and nothing here would have noticed — the fixtures are pure ASCII.
+  const koreanHex = Buffer.from('옵션을 노드 그래프로 조립', 'utf8').toString(
+    'hex'
+  )
+  const mountedHex = await browser.runCommand('node', [
+    '-e',
+    "const fs=require('fs');console.log('H='+(fs.existsSync('utf8-marker.txt')?fs.readFileSync('utf8-marker.txt').toString('hex'):'missing'))",
+  ])
+  check(
+    'non-ASCII file content survives mounting',
+    mountedHex.output.includes(koreanHex),
+    /H=(\S*)/.exec(mountedHex.output)?.[1]?.slice(0, 80)
+  )
+
   // 1. output capture
   const echo = await browser.runCommand('echo', ['CAPTURE_MARKER_OK'])
   check(
