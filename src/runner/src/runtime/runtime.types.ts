@@ -121,6 +121,14 @@ export interface Runtime {
     options?: { recursive?: boolean; force?: boolean }
   ): Promise<void>
   /**
+   * Absolute path of the runtime's working directory.
+   *
+   * Needed to hand tools an absolute path for their own state: package
+   * managers write config under a home directory that does not exist here, and
+   * a relative override is not always honoured.
+   */
+  readonly workdir: string
+  /**
    * Registers a listener fired when a process inside the runtime starts
    * listening on a port. `url` is the address reachable from the host page.
    */

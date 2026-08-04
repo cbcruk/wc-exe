@@ -359,6 +359,35 @@ function closeShell(id: string): void {
 }
 
 /**
+ * Creates the config directories package managers expect under `$HOME`.
+ *
+ * The runtime has no home directory prepared. npm creates `/home/.npm` for
+ * itself, but pnpm opens `/home/.config/pnpm/config.yaml` without creating the
+ * parent first, so the install dies with ENOENT before doing any work.
+ *
+ * Done through `mkdir` rather than the fs API on purpose: the fs API resolves
+ * even absolute paths under the working directory (§2.2), so it would quietly
+ * create `<workdir>/home/.config` — the wrong place, and the failure would look
+ * identical.
+ */
+async function ensurePackageManagerHome(): Promise<void> {
+  const made = await runCommand('mkdir', [
+    '-p',
+    '/home/.config/pnpm',
+    '/home/.cache',
+  ])
+
+  // pnpm opens its config file rather than tolerating its absence, so the
+  // directory alone is not enough — the file has to be there too. An empty file
+  // is valid YAML and means "no overrides".
+  const touched = await runCommand('touch', ['/home/.config/pnpm/config.yaml'])
+
+  console.log(
+    `[wc-build] Prepared package-manager home (mkdir ${made.exitCode}, touch ${touched.exitCode})`
+  )
+}
+
+/**
  * Works out which package manager this project uses, from the mounted files.
  *
  * Done inside the runtime rather than on the host so there is one answer, taken
@@ -394,6 +423,12 @@ async function resolvePackageManager(): Promise<
   }
 
   const choice = detectPackageManager({ packageManagerField, lockfiles })
+
+  // Done here rather than beside the install: `build` without `--cache` invokes
+  // the manager straight from the host and never reaches installWithCache, so
+  // preparing it there fixed nothing. Every path that installs asks for the
+  // manager first, so this is the one place both go through.
+  await ensurePackageManagerHome()
 
   let runtimeVersion: string | null = null
   if (declaredVersion) {

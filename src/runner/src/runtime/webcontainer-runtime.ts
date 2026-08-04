@@ -74,6 +74,10 @@ export class WebContainerRuntime implements Runtime, SnapshotProvider {
     return this.wc.fs.rm(path, options)
   }
 
+  get workdir(): string {
+    return this.wc.workdir
+  }
+
   onServerReady(listener: (port: number, url: string) => void): void {
     this.wc.on('server-ready', listener)
   }

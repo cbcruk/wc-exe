@@ -539,3 +539,49 @@ node bench/daemon.mjs ../실제-프로젝트 --runs 3
 `github-traffic-dashboard`는 이제 **wc-exe 문제가 아니다.** `oxc-transform`이 WebContainer를 감지해 자체 wasm32-wasi 바인딩을 내려받다가 자기 폴백 경로에서 깨진다. 네이티브 의존성 계열은 §2.2에서 이미 적은 제약이다.
 
 **전부 해결된 것은 아니다.** 실패가 남아 있고 각각 원인이 다르다. 다만 실패 이유가 "매니저를 잘못 골라서"에서 "그 프로젝트 고유의 문제"로 옮겨갔다.
+
+## 16. 중간점검 — 대상 범주를 다시 좁히다
+
+### 16.1 표본을 잘못 골랐었다
+
+§14~15의 "실제 프로젝트 실패"는 **의존성 개수 순으로 고른** 저장소들이었다. 그건 이 도구의 대상 프로필과 정반대로 편향된 선택이다. 결과를 성격별로 다시 세우면 그림이 달라진다:
+
+| 프로젝트                   | 성격                             | 결과                              |
+| -------------------------- | -------------------------------- | --------------------------------- |
+| `react-dayjs-element`      | 라이브러리 (`tsc && vite build`) | ✅                                |
+| `uncharted_waters_3_map`   | 정적 앱 (`vite build`)           | ✅                                |
+| `ytstudio`                 | 정적 HTML 앱 (`vite build`)      | ✅                                |
+| `github-traffic-dashboard` | Workers + DB + 라우터            | ❌ 네이티브 의존성(oxc-transform) |
+| `spell`                    | Next.js                          | ❌                                |
+| `rss-extensions`           | VitePress 문서                   | ❌ 아래 참조                      |
+
+**정적 사이트·라이브러리는 전부 성공했고, 실패는 전부 무거운 앱 프레임워크였다.** wc-exe의 대상이 전자라면 §14의 "절반이 실패" 요약은 잘못된 프레이밍이었다.
+
+### 16.2 다만 범주 안의 실패가 하나 있었고, 그 원인은 wc-exe였다
+
+`rss-extensions`는 VitePress 문서 사이트로 대상 범주 한복판인데 실패했다. 원인은 프레임워크가 아니라 **§15에서 추가한 npx 버전 고정 경로**였다.
+
+```
+ENOENT: no such file or directory, open '/home/.config/pnpm/config.yaml'
+```
+
+런타임에는 준비된 홈 디렉터리가 없다. npm은 자기 `/home/.npm`을 알아서 만들지만 pnpm은 부모를 만들지 않고 설정 파일을 열어서 아무 일도 하기 전에 죽는다.
+
+고치는 과정에서 **내 수정이 두 번 헛돌았다:**
+
+1. `XDG_CONFIG_HOME`을 넘겼는데 pnpm이 무시했다.
+2. 디렉터리 생성을 `installWithCache` 안에 넣었는데, **실패하던 경로는 `--cache` 없는 `build`라 거기를 지나가지 않았다.** 그래서 "고쳤는데 아무것도 안 변한" 상태로 한 번 더 돌렸다. 지금은 두 경로가 모두 지나는 `resolvePackageManager()` 안에 있다.
+
+fs API가 아니라 `mkdir` 명령을 쓰는 이유도 기록해 둔다 — fs API는 절대 경로도 workdir 기준으로 해석하므로(§2.2) `<workdir>/home/.config`를 조용히 만들고 증상은 똑같이 남는다.
+
+### 16.3 남은 것은 pnpm 11 × WebContainer 비호환
+
+디렉터리·파일을 만들어주니 ENOENT는 사라졌고 다음 벽이 나왔다:
+
+```
+[ERROR] this.db.exec is not a function
+```
+
+pnpm 11은 SQLite 기반 저장소를 쓰는데 WebContainer의 Node에 그게 없다. **wc-exe가 고칠 수 있는 문제가 아니다.** `packageManager`가 pnpm 11을 고정한 프로젝트는 현재 설치 불가다.
+
+여기서 자동 폴백(런타임의 pnpm 8로 되돌리기)은 하지 않았다. 그건 락파일을 무시하고 **다른 트리를 조용히 설치**하는 것이고, §15가 없애려던 실패 유형과 정확히 같기 때문이다. 지금은 실패하되 이유가 드러난다.
