@@ -2,11 +2,13 @@ import { WebContainer, type FileSystemTree } from '@webcontainer/api'
 import invariant from 'tiny-invariant'
 import type {
   Runtime,
+  RuntimeFileSystem,
   SnapshotProvider,
   FileTree,
   RuntimeProcess,
   RuntimeDirEnt,
   SpawnOptions,
+  Unsubscribe,
 } from './runtime.types'
 
 /**
@@ -16,7 +18,12 @@ import type {
  * lives behind the {@link Runtime} / {@link SnapshotProvider} interfaces. Only
  * one instance can be booted per page, a WebContainer limitation.
  *
- * Every method other than {@link WebContainerRuntime.boot} throws until boot
+ * Because {@link Runtime} is shaped after WebContainer's own API, almost every
+ * member here is a straight delegation. That is the point: an adapter with no
+ * logic of its own cannot drift from the thing it adapts, and a replacement
+ * backend is then implementing a contract rather than reverse-engineering one.
+ *
+ * Every member other than {@link WebContainerRuntime.boot} throws until boot
  * has completed.
  */
 export class WebContainerRuntime implements Runtime, SnapshotProvider {
@@ -29,6 +36,42 @@ export class WebContainerRuntime implements Runtime, SnapshotProvider {
 
   async boot(): Promise<void> {
     this.webcontainer = await WebContainer.boot()
+  }
+
+  /**
+   * WebContainer's `fs` is nearly this interface already; the wrapper exists
+   * for two members whose shapes differ, and passes the rest straight through.
+   */
+  get fs(): RuntimeFileSystem {
+    const fs = this.wc.fs
+
+    return {
+      readFile: (path) => fs.readFile(path),
+      writeFile: (path, data) => fs.writeFile(path, data),
+      // Always with types: the interface does not offer the bare-names form.
+      readdir: (path) =>
+        fs.readdir(path, { withFileTypes: true }) as Promise<RuntimeDirEnt[]>,
+      mkdir: async (path, options) => {
+        // WebContainer splits recursive into a separate overload with a
+        // different return type, so this branch is required rather than
+        // passing options through.
+        if (options?.recursive) {
+          await fs.mkdir(path, { recursive: true })
+        } else {
+          await fs.mkdir(path)
+        }
+      },
+      rm: (path, options) => fs.rm(path, options),
+      rename: (oldPath, newPath) => fs.rename(oldPath, newPath),
+    }
+  }
+
+  get workdir(): string {
+    return this.wc.workdir
+  }
+
+  get path(): string {
+    return this.wc.path
   }
 
   mount(tree: FileTree, options?: { mountPoint?: string }): Promise<void> {
@@ -45,41 +88,13 @@ export class WebContainerRuntime implements Runtime, SnapshotProvider {
     return this.wc.spawn(command, args, options)
   }
 
-  readFile(path: string): Promise<Uint8Array> {
-    return this.wc.fs.readFile(path)
+  onServerReady(listener: (port: number, url: string) => void): Unsubscribe {
+    return this.wc.on('server-ready', listener)
   }
 
-  writeFile(path: string, data: string | Uint8Array): Promise<void> {
-    return this.wc.fs.writeFile(path, data)
-  }
-
-  readdir(path: string): Promise<RuntimeDirEnt[]> {
-    return this.wc.fs.readdir(path, { withFileTypes: true })
-  }
-
-  async mkdir(path: string, options?: { recursive?: boolean }): Promise<void> {
-    // WebContainer splits recursive into a separate overload with a different
-    // return type, so the branch is required rather than passing options through.
-    if (options?.recursive) {
-      await this.wc.fs.mkdir(path, { recursive: true })
-    } else {
-      await this.wc.fs.mkdir(path)
-    }
-  }
-
-  rm(
-    path: string,
-    options?: { recursive?: boolean; force?: boolean }
-  ): Promise<void> {
-    return this.wc.fs.rm(path, options)
-  }
-
-  get workdir(): string {
-    return this.wc.workdir
-  }
-
-  onServerReady(listener: (port: number, url: string) => void): void {
-    this.wc.on('server-ready', listener)
+  teardown(): void {
+    this.wc.teardown()
+    this.webcontainer = null
   }
 
   exportDir(path: string): Promise<Uint8Array> {

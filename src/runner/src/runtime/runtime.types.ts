@@ -1,7 +1,18 @@
 // Backend-agnostic runtime surface the runner logic is written against.
 // The only place that may reference WebContainer directly is the implementing
-// class (webcontainer-runtime.ts). Adding another backend (e.g. container2wasm)
-// means implementing this interface, not touching the runner logic.
+// class (webcontainer-runtime.ts). Adding another backend means implementing
+// this interface, not touching the runner logic.
+//
+// The shape deliberately mirrors WebContainer's own API — `fs` as a namespace,
+// `spawn`, `workdir`, `path`, `teardown`. Two reasons:
+//
+//   1. It is the contract a replacement backend has to satisfy, and a shape
+//      somebody already knows is far easier to satisfy than one invented here.
+//   2. It keeps WebContainerRuntime an almost pure pass-through, so the adapter
+//      cannot quietly acquire behaviour of its own and become the thing that
+//      actually has to be reimplemented.
+//
+// Where it deviates, the deviation is noted at the member.
 
 /** A file entry in a {@link FileTree}. */
 export interface FileNode {
@@ -31,7 +42,7 @@ export interface TerminalSize {
 export interface SpawnOptions {
   /** Working directory, relative to the runtime's own working directory. */
   cwd?: string
-  /** Extra environment variables for the process. */
+  /** Environment variables to set for the process. */
   env?: Record<string, string | number | boolean>
   /** Set `false` to suppress the output stream entirely. */
   output?: boolean
@@ -62,7 +73,7 @@ export interface RuntimeProcess {
   resize(dimensions: TerminalSize): void
 }
 
-/** A directory entry returned by {@link Runtime.readdir}. */
+/** A directory entry returned by {@link RuntimeFileSystem.readdir}. */
 export interface RuntimeDirEnt {
   name: string
   isDirectory(): boolean
@@ -70,34 +81,25 @@ export interface RuntimeDirEnt {
 }
 
 /**
- * The execution backend the runner drives.
+ * The filesystem of a booted runtime.
  *
- * Implement this to add a backend; nothing outside the implementing class
- * should know which one is in use. {@link boot} must complete before any other
- * method is called.
+ * **Paths are resolved against {@link Runtime.workdir}, including ones that
+ * look absolute.** `readFile('/bin/ls')` reads `<workdir>/bin/ls`, not the
+ * system path — measured, and the cause of a whole afternoon once. Reaching
+ * outside the project means going through the shell.
  */
-export interface Runtime {
-  /** Boots the backend. Call once, before anything else. */
-  boot(): Promise<void>
-  /**
-   * Writes a file tree into the filesystem.
-   *
-   * @param tree Files to write, as nested segments.
-   * @param options.mountPoint Root-relative directory to mount under. Defaults
-   *   to the filesystem root.
-   */
-  mount(tree: FileTree, options?: { mountPoint?: string }): Promise<void>
-  /** Starts a process. Resolves once spawned, not once exited. */
-  spawn(
-    command: string,
-    args: string[],
-    options?: SpawnOptions
-  ): Promise<RuntimeProcess>
+export interface RuntimeFileSystem {
   /** Reads a file as raw bytes. Rejects if it does not exist. */
   readFile(path: string): Promise<Uint8Array>
   /** Writes a file, overwriting any existing contents. */
   writeFile(path: string, data: string | Uint8Array): Promise<void>
-  /** Lists a directory's entries. */
+  /**
+   * Lists a directory's entries.
+   *
+   * Deviation: always returns entries with type information. WebContainer
+   * overloads this to return bare names without `withFileTypes`, and nothing
+   * here wants the weaker form.
+   */
   readdir(path: string): Promise<RuntimeDirEnt[]>
   /**
    * Creates a directory.
@@ -120,19 +122,66 @@ export interface Runtime {
     path: string,
     options?: { recursive?: boolean; force?: boolean }
   ): Promise<void>
-  /**
-   * Absolute path of the runtime's working directory.
-   *
-   * Needed to hand tools an absolute path for their own state: package
-   * managers write config under a home directory that does not exist here, and
-   * a relative override is not always honoured.
-   */
+  /** Moves a path. */
+  rename(oldPath: string, newPath: string): Promise<void>
+}
+
+/** Cancels a listener registered with {@link Runtime.onServerReady}. */
+export type Unsubscribe = () => void
+
+/**
+ * The execution backend the runner drives.
+ *
+ * Implement this to add a backend; nothing outside the implementing class
+ * should know which one is in use. {@link boot} must complete before any other
+ * member is touched.
+ */
+export interface Runtime {
+  /** Boots the backend. Call once, before anything else. */
+  boot(): Promise<void>
+  /** The filesystem. See {@link RuntimeFileSystem} for how paths resolve. */
+  readonly fs: RuntimeFileSystem
+  /** Absolute path of the working directory processes start in. */
   readonly workdir: string
+  /**
+   * Default `PATH` for spawned processes.
+   *
+   * Worth having because it is the only way to discover what a backend can
+   * actually run: the filesystem cannot see the directories on it (see
+   * {@link RuntimeFileSystem}), so the answer has to come from here or from
+   * the shell.
+   */
+  readonly path: string
+  /**
+   * Writes a file tree into the filesystem.
+   *
+   * @param tree Files to write, as nested segments.
+   * @param options.mountPoint Root-relative directory to mount under. Defaults
+   *   to the working directory.
+   */
+  mount(tree: FileTree, options?: { mountPoint?: string }): Promise<void>
+  /** Starts a process. Resolves once spawned, not once exited. */
+  spawn(
+    command: string,
+    args: string[],
+    options?: SpawnOptions
+  ): Promise<RuntimeProcess>
   /**
    * Registers a listener fired when a process inside the runtime starts
    * listening on a port. `url` is the address reachable from the host page.
+   *
+   * Deviation: WebContainer exposes a general `on(event, …)` covering several
+   * events. Only this one is used, and narrowing it keeps the contract a
+   * backend must satisfy small.
    */
-  onServerReady(listener: (port: number, url: string) => void): void
+  onServerReady(listener: (port: number, url: string) => void): Unsubscribe
+  /**
+   * Destroys the runtime and releases its resources.
+   *
+   * The reset of last resort: `docs/persistent-runner.md` §6 lists cases where
+   * a session cannot be trusted and has to be rebuilt rather than cleaned.
+   */
+  teardown(): void
 }
 
 // Snapshotting a directory to a portable blob and re-mounting it is a

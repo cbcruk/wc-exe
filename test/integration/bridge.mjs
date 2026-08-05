@@ -60,6 +60,20 @@ try {
     /H=(\S*)/.exec(mountedHex.output)?.[1]?.slice(0, 80)
   )
 
+  // 0b. the runtime interface mirrors WebContainer's shape; check the members
+  // that were added for that actually work against a real container.
+  const described = await browser.describeRuntime()
+  check(
+    'runtime reports its working directory',
+    described.workdir.startsWith('/'),
+    described.workdir
+  )
+  check(
+    'runtime reports the PATH processes inherit',
+    described.path.includes('/bin'),
+    described.path
+  )
+
   // 1. output capture
   const echo = await browser.runCommand('echo', ['CAPTURE_MARKER_OK'])
   check(

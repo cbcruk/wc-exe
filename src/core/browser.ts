@@ -144,6 +144,25 @@ export class WCBrowser {
   }
 
   /**
+   * Reports the runtime's working directory and default `PATH`.
+   *
+   * `PATH` is the only way to learn what the backend can run: its filesystem
+   * resolves even absolute paths under the working directory, so the
+   * directories on `PATH` are invisible to it.
+   */
+  async describeRuntime(): Promise<{ workdir: string; path: string }> {
+    if (!this.page) throw new Error('Browser not launched')
+
+    return await this.page.evaluate(async () => {
+      return (
+        window as unknown as {
+          wcRunner: { describeRuntime: () => { workdir: string; path: string } }
+        }
+      ).wcRunner.describeRuntime()
+    })
+  }
+
+  /**
    * Asks the runtime which package manager this project uses.
    *
    * Decided from the mounted files rather than the host copy, so the answer

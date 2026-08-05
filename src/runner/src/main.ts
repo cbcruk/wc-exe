@@ -314,6 +314,18 @@ async function openShell(
   shells.set(id, session)
 }
 
+/**
+ * What the runtime is: its working directory and the PATH processes inherit.
+ *
+ * `path` is the only way to discover what the backend can actually run — the
+ * filesystem cannot see the directories on it (paths resolve under workdir), so
+ * the answer has to come from here or from the shell.
+ */
+function describeRuntime(): { workdir: string; path: string } {
+  invariant(runtime, 'Runtime not booted')
+  return { workdir: runtime.workdir, path: runtime.path }
+}
+
 /** Looks up an open shell. */
 function requireShell(id: string): ShellSession {
   const session = shells.get(id)
@@ -401,7 +413,7 @@ async function resolvePackageManager(): Promise<
   let packageManagerField: string | undefined
   let declaredVersion: string | null = null
   try {
-    const raw = await runtime.readFile('package.json')
+    const raw = await runtime.fs.readFile('package.json')
     const parsed = JSON.parse(new TextDecoder().decode(raw))
     packageManagerField =
       typeof parsed?.packageManager === 'string'
@@ -415,7 +427,7 @@ async function resolvePackageManager(): Promise<
   const lockfiles: string[] = []
   for (const { file } of LOCKFILES) {
     try {
-      await runtime.readFile(file)
+      await runtime.fs.readFile(file)
       lockfiles.push(file)
     } catch {
       /* absent */
@@ -509,7 +521,7 @@ async function computeCacheKey(): Promise<string> {
 
   for (const file of LOCK_FILES) {
     try {
-      const contents = await runtime.readFile(file)
+      const contents = await runtime.fs.readFile(file)
       return (await sha256Hex(contents)).slice(0, 32)
     } catch {
       continue
@@ -659,11 +671,11 @@ async function restoreSnapshotInto(
   snapshot: Uint8Array,
   dir: string
 ): Promise<boolean> {
-  await rt.mkdir(dir, { recursive: true })
+  await rt.fs.mkdir(dir, { recursive: true })
   await rt.importSnapshot(snapshot, dir)
 
   try {
-    const entries = await rt.readdir(dir)
+    const entries = await rt.fs.readdir(dir)
     return entries.length > 0
   } catch {
     return false
@@ -926,7 +938,7 @@ async function removePaths(paths: string[]): Promise<number> {
   invariant(runtime, 'Runtime not booted')
 
   for (const p of paths) {
-    await runtime.rm(p, { recursive: true, force: true })
+    await runtime.fs.rm(p, { recursive: true, force: true })
   }
 
   if (paths.length > 0) {
@@ -938,7 +950,7 @@ async function removePaths(paths: string[]): Promise<number> {
 async function writeFile(path: string, content: string): Promise<void> {
   invariant(runtime, 'Runtime not booted')
 
-  await runtime.writeFile(path, content)
+  await runtime.fs.writeFile(path, content)
 
   console.log(`[wc-build] File written: ${path}`)
 }
@@ -964,7 +976,7 @@ async function uploadDist(distPath: string): Promise<number> {
   // different claims. Checking here turns that case into a sentence naming the
   // problem, instead of a bare ENOENT from the directory walk below.
   try {
-    await rt.readdir(distPath)
+    await rt.fs.readdir(distPath)
   } catch {
     throw new Error(
       `The build reported success but produced no output at ${distPath}. ` +
@@ -973,7 +985,7 @@ async function uploadDist(distPath: string): Promise<number> {
   }
 
   async function traverse(currentPath: string): Promise<void> {
-    const entries = await rt.readdir(currentPath)
+    const entries = await rt.fs.readdir(currentPath)
 
     for (const entry of entries) {
       const fullPath =
@@ -982,7 +994,7 @@ async function uploadDist(distPath: string): Promise<number> {
       if (entry.isDirectory()) {
         await traverse(fullPath)
       } else {
-        const content = await rt.readFile(fullPath)
+        const content = await rt.fs.readFile(fullPath)
         const relative = fullPath.slice(distPath.length).replace(/^\//, '')
         const body = content.buffer.slice(
           content.byteOffset,
@@ -1049,6 +1061,7 @@ const wcRunner = {
   mountFromServer,
   runCommand,
   resolvePackageManager,
+  describeRuntime,
   killCommand,
   resizeCommand,
   openShell,

@@ -86,9 +86,15 @@ export class ShellSession {
     private readonly interruptGraceMs: number = INTERRUPT_GRACE_MS
   ) {}
 
-  /** Starts a shell and waits for its first prompt. */
+  /**
+   * Starts a shell and waits for its first prompt.
+   *
+   * Takes only the part of {@link Runtime} it uses. Naming the whole interface
+   * would overstate the dependency and force every unrelated change to it
+   * through this file and its tests.
+   */
   static async open(
-    runtime: Runtime,
+    runtime: Pick<Runtime, 'spawn'>,
     options: ShellSessionOptions = {}
   ): Promise<ShellSession> {
     const process = await runtime.spawn(options.shell ?? 'jsh', [], {

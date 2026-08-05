@@ -39,12 +39,14 @@ function fakeShell() {
   }
 
   const spawns: Array<{ command: string; options?: SpawnOptions }> = []
-  const runtime = {
+  // Typed, not cast: ShellSession declares it needs only `spawn`, so the fake
+  // can satisfy that honestly instead of pretending to be a whole Runtime.
+  const runtime: Pick<Runtime, 'spawn'> = {
     spawn: async (command: string, _args: string[], options?: SpawnOptions) => {
       spawns.push({ command, options })
       return process
     },
-  } as unknown as Runtime
+  }
 
   return {
     runtime,
