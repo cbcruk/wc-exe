@@ -585,3 +585,30 @@ fs API가 아니라 `mkdir` 명령을 쓰는 이유도 기록해 둔다 — fs A
 pnpm 11은 SQLite 기반 저장소를 쓰는데 WebContainer의 Node에 그게 없다. **wc-exe가 고칠 수 있는 문제가 아니다.** `packageManager`가 pnpm 11을 고정한 프로젝트는 현재 설치 불가다.
 
 여기서 자동 폴백(런타임의 pnpm 8로 되돌리기)은 하지 않았다. 그건 락파일을 무시하고 **다른 트리를 조용히 설치**하는 것이고, §15가 없애려던 실패 유형과 정확히 같기 때문이다. 지금은 실패하되 이유가 드러난다.
+
+## 17. 브릿지를 core로 정리
+
+WebContainer를 계속 쓸지는 §18의 측정으로 정할 문제지만, **브릿지 자체는 그 결정과 무관하게 남는 자산**이다. "Node에서 WebContainer를 구동한다"는 코드는 이 CLI에 종속될 이유가 없다.
+
+### 17.1 이미 거의 깨끗했다
+
+의존성을 실제로 세어보니 `core/`에 CLI 의존성이 하나도 없었고 `daemon/`도 마찬가지였다. 잘못 놓인 것은 둘뿐:
+
+- `utils/command-error.ts` — `CommandResult`를 다루는 브릿지 코드인데 CLI 유틸에 있었다 → `core/`로.
+- `types.ts` — 브릿지 타입(`CommandResult`, `ServerHandlers`, `TerminalSize`, …)과 CLI 옵션(`BuildOptions`, `DevOptions`, `InstallOptions`)이 한 파일에 섞여 있었다 → `core/types.ts`와 `types.ts`로 분리.
+
+`core/index.ts`가 브릿지의 단일 진입점이다.
+
+### 17.2 규약이 아니라 강제로
+
+경계를 주석으로만 적어두면 지켜지지 않는다. `core/boundary.test.ts`가 검사한다:
+
+- `commander`·`ora`·`chalk`·`chokidar`·`http-proxy`를 import하면 실패. 이들은 "이건 라이브러리가 아니라 CLI다"를 만드는 것들이다.
+- `commands/`·`daemon/`·`utils/`를 참조하면 실패. 소비자를 거꾸로 참조하는 것이므로.
+- 소스 파일이 5개 미만이면 실패 — 글로브가 깨지면 나머지 검사가 **전부 공허하게 통과**하기 때문이다.
+
+이빨 확인: `core/file-sync.ts`에 `chalk`를 넣으면 첫 번째가, `utils/spinner.js`를 넣으면 두 번째가 실제로 실패한다.
+
+### 17.3 남은 것
+
+패키지를 실제로 쪼개는 것(`@wc-exe/core`)은 이제 기계적인 후속 작업이다 — 경계가 코드로 강제되고 있으므로 워크스페이스 설정만 남는다. 다만 §18 측정 전에 할 이유는 없다.

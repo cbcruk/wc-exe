@@ -1,4 +1,4 @@
-import type { CommandResult } from '../types.js'
+import type { CommandResult } from './types.js'
 
 // Matches CSI escape sequences. Built from a char code because a literal 0x1b
 // is an invisible byte that tooling can silently eat.

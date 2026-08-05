@@ -7,7 +7,7 @@ import type {
   RunCommandOptions,
   ShellExecResult,
   TerminalSize,
-} from '../types.js'
+} from './types.js'
 
 /**
  * Drives the headless Chrome instance that hosts the runner page.

@@ -9,8 +9,8 @@ import {
   writeDistFile,
   type Manifest,
 } from '../core/file-sync.js'
-import { commandFailure } from '../utils/command-error.js'
-import type { CommandResult, ServerHandlers } from '../types.js'
+import { commandFailure } from '../core/command-error.js'
+import type { CommandResult, ServerHandlers } from '../core/types.js'
 
 /** How a session reports what it did, for the CLI to print. */
 export interface SessionBuildResult {

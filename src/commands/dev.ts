@@ -9,8 +9,9 @@ import { startServer, type ServerInfo } from '../core/server.js'
 import { WCBrowser } from '../core/browser.js'
 import { listProjectFiles, readProjectFileBytes } from '../core/file-sync.js'
 import { withSpin } from '../utils/spinner.js'
-import { commandFailure } from '../utils/command-error.js'
-import type { DevOptions, ServerHandlers } from '../types.js'
+import { commandFailure } from '../core/command-error.js'
+import type { ServerHandlers } from '../core/types.js'
+import type { DevOptions } from '../types.js'
 
 /**
  * Runs the project's dev server inside the browser runtime and proxies it to a

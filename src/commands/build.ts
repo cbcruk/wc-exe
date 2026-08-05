@@ -18,8 +18,9 @@ import {
   ensureCacheDirs,
 } from '../core/cache.js'
 import { withSpin } from '../utils/spinner.js'
-import { commandFailure } from '../utils/command-error.js'
-import type { BuildOptions, ServerHandlers } from '../types.js'
+import { commandFailure } from '../core/command-error.js'
+import type { ServerHandlers } from '../core/types.js'
+import type { BuildOptions } from '../types.js'
 
 /**
  * Builds a project inside the browser runtime and writes the output to disk.

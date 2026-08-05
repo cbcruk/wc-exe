@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { commandFailure, outputTail } from './command-error.js'
-import type { CommandResult } from '../types.js'
+import type { CommandResult } from './types.js'
 
 const ESC = String.fromCharCode(27)
 

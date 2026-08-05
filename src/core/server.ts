@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { serve, type ServerType } from '@hono/node-server'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { resolveRunnerDist } from './runner-assets.js'
-import type { ServerHandlers } from '../types.js'
+import type { ServerHandlers } from './types.js'
 
 function toArrayBuffer(view: Uint8Array): ArrayBuffer {
   return view.buffer.slice(
