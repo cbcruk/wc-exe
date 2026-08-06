@@ -4,8 +4,25 @@ import {
   isSnapshotCapable,
   type FileTree,
   type Runtime,
+  type RuntimeProcess,
   type SnapshotProvider,
+  type SpawnOptions,
+  type TerminalSize,
 } from './runtime/runtime.types'
+import { OutputBuffer } from './runtime/output-buffer'
+import {
+  detectPackageManager,
+  installArgs,
+  offlineInstallArgs,
+  usesNpmTarballCache,
+  LOCKFILES,
+  packageManagerCommand,
+  parsePackageManagerVersion,
+  type PackageManager,
+  type PackageManagerChoice,
+  type PackageManagerCommand,
+} from './runtime/package-manager'
+import { ShellSession, type ShellExecResult } from './runtime/shell-session'
 
 const ANSI_REGEX =
   /* eslint-disable-next-line no-control-regex */
@@ -48,7 +65,23 @@ declare global {
   interface Window {
     __WC_READY__: boolean
     wcRunner: typeof wcRunner
+    /** Installed by the host via `page.exposeFunction`; see {@link openShell}. */
+    __wcShellData__?: (id: string, chunk: string) => void
   }
+}
+
+/**
+ * Base the `/api` routes hang off, taken from where this page was served.
+ *
+ * The one-shot server mounts the page at `/`; the daemon mounts one session per
+ * path. Resolving against the page's own directory makes the same bundle work
+ * for both, so the runner never needs to know which it is talking to.
+ */
+const API_BASE = new URL('.', location.href)
+
+/** Absolute URL for an API route, e.g. `apiUrl('api/files')`. */
+function apiUrl(path: string): string {
+  return new URL(path, API_BASE).href
 }
 
 let runtime: Runtime | null = null
@@ -78,7 +111,7 @@ async function boot(): Promise<void> {
 async function mountFromServer(): Promise<number> {
   invariant(runtime, 'Runtime not booted')
 
-  const manifestRes = await fetch('/api/files')
+  const manifestRes = await fetch(apiUrl('api/files'))
   if (!manifestRes.ok) {
     throw new Error(`Failed to fetch file manifest: ${manifestRes.status}`)
   }
@@ -91,7 +124,7 @@ async function mountFromServer(): Promise<number> {
 
   for (const filePath of paths) {
     const fileRes = await fetch(
-      `/api/files/raw?path=${encodeURIComponent(filePath)}`
+      apiUrl(`api/files/raw?path=${encodeURIComponent(filePath)}`)
     )
     if (!fileRes.ok) {
       throw new Error(`Failed to fetch file ${filePath}: ${fileRes.status}`)
@@ -141,36 +174,291 @@ function insertIntoTree(
 }
 
 /**
- * Runs a command to completion, streaming its output to the page console (where
- * the host picks it up in verbose mode).
- *
- * @returns The exit code — a non-zero code is returned, not thrown.
+ * How much command output is retained for the host. Beyond this the oldest
+ * characters are dropped and the result says so — see {@link OutputBuffer}.
  */
-async function runCommand(cmd: string, args: string[]): Promise<number> {
+const OUTPUT_LIMIT = 256 * 1024
+
+/**
+ * Commands currently running, by the handle the caller supplied.
+ *
+ * Needed because {@link runCommand} does not resolve until the command exits,
+ * so a caller can never learn a handle it did not choose itself. The caller
+ * names the command up front and can then cancel it mid-flight.
+ */
+const running = new Map<string, RuntimeProcess>()
+
+/** Outcome of {@link runCommand}. */
+type CommandResult = {
+  /** Exit code. Non-zero is returned, not thrown. */
+  exitCode: number
+  /** Captured output, ANSI escapes intact. Possibly only the tail. */
+  output: string
+  /** Whether `output` is only the tail of what the command actually produced. */
+  truncated: boolean
+  /** Characters dropped from the front. `0` when nothing was lost. */
+  droppedChars: number
+}
+
+/**
+ * Runs a command to completion, streaming its output to the page console (where
+ * the host picks it up in verbose mode) and capturing it for the caller.
+ *
+ * @param handle Optional caller-chosen id. Pass one to be able to
+ *   {@link killCommand} this command while it runs.
+ * @returns The exit code and the captured output.
+ */
+async function runCommand(
+  cmd: string,
+  args: string[],
+  options?: SpawnOptions & { handle?: string }
+): Promise<CommandResult> {
   invariant(runtime, 'Runtime not booted')
 
   console.log(`[wc-build] Running: ${cmd} ${args.join(' ')}`)
 
-  const process = await runtime.spawn(cmd, args)
+  const { handle, ...spawnOptions } = options ?? {}
+  const process = await runtime.spawn(cmd, args, spawnOptions)
+  const buffer = new OutputBuffer(OUTPUT_LIMIT)
+
+  if (handle) running.set(handle, process)
 
   process.output.pipeTo(
     new WritableStream({
       write(chunk) {
+        buffer.push(chunk)
         const filtered = filterOutput(chunk)
         if (filtered) console.log(filtered)
       },
     })
   )
 
-  const exitCode = await process.exit
+  try {
+    const exitCode = await process.exit
 
-  if (exitCode === 0) {
-    console.log(`[wc-build] Command exited with code: ${exitCode}`)
-  } else {
-    console.error(`[wc-build] Command exited with code: ${exitCode}`)
+    if (exitCode === 0) {
+      console.log(`[wc-build] Command exited with code: ${exitCode}`)
+    } else {
+      console.error(`[wc-build] Command exited with code: ${exitCode}`)
+    }
+
+    return {
+      exitCode,
+      output: buffer.text,
+      truncated: buffer.truncated,
+      droppedChars: buffer.droppedChars,
+    }
+  } finally {
+    if (handle) running.delete(handle)
+  }
+}
+
+/**
+ * Terminates a command started with a `handle`.
+ *
+ * @returns `true` if a running command matched, `false` if it had already
+ *   exited or the handle was never used. A miss is not an error — the race
+ *   between cancelling and finishing is normal.
+ */
+function killCommand(handle: string): boolean {
+  const process = running.get(handle)
+  if (!process) return false
+
+  process.kill()
+  return true
+}
+
+/**
+ * Tells a running command its terminal was resized.
+ *
+ * @returns `true` if a running command matched, `false` otherwise.
+ */
+function resizeCommand(handle: string, dimensions: TerminalSize): boolean {
+  const process = running.get(handle)
+  if (!process) return false
+
+  process.resize(dimensions)
+  return true
+}
+
+/**
+ * Open interactive shells, by caller-chosen id.
+ *
+ * Kept per session rather than one global shell because the daemon will hold
+ * several projects open at once, and because a broken shell (see
+ * {@link ShellSession}) has to be discardable without disturbing the others.
+ */
+const shells = new Map<string, ShellSession>()
+
+/**
+ * Opens an interactive shell.
+ *
+ * Output is pushed to `window.__wcShellData__` as it arrives — the host
+ * installs that via `page.exposeFunction`, so a terminal stays responsive
+ * instead of waiting on a poll interval.
+ *
+ * @throws If `id` is already in use.
+ */
+async function openShell(
+  id: string,
+  options?: { cols?: number; rows?: number }
+): Promise<void> {
+  invariant(runtime, 'Runtime not booted')
+  invariant(!shells.has(id), `Shell ${id} is already open`)
+
+  const session = await ShellSession.open(runtime, {
+    terminal: { cols: options?.cols ?? 80, rows: options?.rows ?? 24 },
+    onData: (chunk) => window.__wcShellData__?.(id, chunk),
+  })
+
+  shells.set(id, session)
+}
+
+/**
+ * What the runtime is: its working directory and the PATH processes inherit.
+ *
+ * `path` is the only way to discover what the backend can actually run — the
+ * filesystem cannot see the directories on it (paths resolve under workdir), so
+ * the answer has to come from here or from the shell.
+ */
+function describeRuntime(): { workdir: string; path: string } {
+  invariant(runtime, 'Runtime not booted')
+  return { workdir: runtime.workdir, path: runtime.path }
+}
+
+/** Looks up an open shell. */
+function requireShell(id: string): ShellSession {
+  const session = shells.get(id)
+  invariant(session, `No open shell with id ${id}`)
+  return session
+}
+
+/** Runs one command in an open shell, waiting for it to finish. */
+function shellExec(id: string, command: string): Promise<ShellExecResult> {
+  return requireShell(id).exec(command)
+}
+
+/** Sends Ctrl-C to an open shell. */
+function shellInterrupt(id: string): Promise<void> {
+  return requireShell(id).interrupt()
+}
+
+/** Tells an open shell its terminal was resized. */
+function shellResize(id: string, dimensions: TerminalSize): void {
+  requireShell(id).resize(dimensions)
+}
+
+/**
+ * Why a shell can no longer be trusted, or `null` while it is healthy.
+ * A non-null value is a reset trigger, not a warning — see the ShellSession docs.
+ */
+function shellBrokenReason(id: string): string | null {
+  return requireShell(id).brokenReason
+}
+
+/**
+ * Actively proves a shell's job control still works. Costs a few seconds; the
+ * authoritative check, and the only one that reads no jsh error strings.
+ */
+function shellVerifyJobControl(id: string): Promise<boolean> {
+  return requireShell(id).verifyJobControl()
+}
+
+/** Closes a shell and forgets it. Unknown ids are ignored. */
+function closeShell(id: string): void {
+  shells.get(id)?.close()
+  shells.delete(id)
+}
+
+/**
+ * Creates the config directories package managers expect under `$HOME`.
+ *
+ * The runtime has no home directory prepared. npm creates `/home/.npm` for
+ * itself, but pnpm opens `/home/.config/pnpm/config.yaml` without creating the
+ * parent first, so the install dies with ENOENT before doing any work.
+ *
+ * Done through `mkdir` rather than the fs API on purpose: the fs API resolves
+ * even absolute paths under the working directory (§2.2), so it would quietly
+ * create `<workdir>/home/.config` — the wrong place, and the failure would look
+ * identical.
+ */
+async function ensurePackageManagerHome(): Promise<void> {
+  const made = await runCommand('mkdir', [
+    '-p',
+    '/home/.config/pnpm',
+    '/home/.cache',
+  ])
+
+  // pnpm opens its config file rather than tolerating its absence, so the
+  // directory alone is not enough — the file has to be there too. An empty file
+  // is valid YAML and means "no overrides".
+  const touched = await runCommand('touch', ['/home/.config/pnpm/config.yaml'])
+
+  console.log(
+    `[wc-build] Prepared package-manager home (mkdir ${made.exitCode}, touch ${touched.exitCode})`
+  )
+}
+
+/**
+ * Works out which package manager this project uses, from the mounted files.
+ *
+ * Done inside the runtime rather than on the host so there is one answer, taken
+ * from exactly the tree that will be installed.
+ */
+async function resolvePackageManager(): Promise<
+  PackageManagerChoice & PackageManagerCommand
+> {
+  invariant(runtime, 'Runtime not booted')
+
+  let packageManagerField: string | undefined
+  let declaredVersion: string | null = null
+  try {
+    const raw = await runtime.fs.readFile('package.json')
+    const parsed = JSON.parse(new TextDecoder().decode(raw))
+    packageManagerField =
+      typeof parsed?.packageManager === 'string'
+        ? parsed.packageManager
+        : undefined
+    declaredVersion = parsePackageManagerVersion(packageManagerField)
+  } catch {
+    /* no package.json, or unreadable — fall through to lockfile detection */
   }
 
-  return exitCode
+  const lockfiles: string[] = []
+  for (const { file } of LOCKFILES) {
+    try {
+      await runtime.fs.readFile(file)
+      lockfiles.push(file)
+    } catch {
+      /* absent */
+    }
+  }
+
+  const choice = detectPackageManager({ packageManagerField, lockfiles })
+
+  // Done here rather than beside the install: `build` without `--cache` invokes
+  // the manager straight from the host and never reaches installWithCache, so
+  // preparing it there fixed nothing. Every path that installs asks for the
+  // manager first, so this is the one place both go through.
+  await ensurePackageManagerHome()
+
+  let runtimeVersion: string | null = null
+  if (declaredVersion) {
+    const installed = await runCommand(choice.manager, ['--version'])
+    runtimeVersion = /(\d+\.\d+\.\d+)/.exec(installed.output)?.[1] ?? null
+  }
+
+  const invocation = packageManagerCommand(
+    choice.manager,
+    declaredVersion,
+    runtimeVersion
+  )
+
+  console.log(
+    `[wc-build] Using ${choice.manager} to install (${choice.reason}; ${invocation.note})`
+  )
+
+  return { ...choice, ...invocation }
 }
 
 /** Outcome of {@link installWithCache}. */
@@ -185,6 +473,8 @@ type CacheResult = {
   // on a node_modules MISS when the tarball cache participated.
   npmCacheRestored?: boolean
   npmCacheBytes?: number
+  /** Which package manager actually performed the install. */
+  manager?: PackageManager
 }
 
 // Candidate cache-key sources, most authoritative first: the first one present
@@ -231,7 +521,7 @@ async function computeCacheKey(): Promise<string> {
 
   for (const file of LOCK_FILES) {
     try {
-      const contents = await runtime.readFile(file)
+      const contents = await runtime.fs.readFile(file)
       return (await sha256Hex(contents)).slice(0, 32)
     } catch {
       continue
@@ -381,11 +671,11 @@ async function restoreSnapshotInto(
   snapshot: Uint8Array,
   dir: string
 ): Promise<boolean> {
-  await rt.mkdir(dir, { recursive: true })
+  await rt.fs.mkdir(dir, { recursive: true })
   await rt.importSnapshot(snapshot, dir)
 
   try {
-    const entries = await rt.readdir(dir)
+    const entries = await rt.fs.readdir(dir)
     return entries.length > 0
   } catch {
     return false
@@ -418,6 +708,38 @@ async function restoreNodeModules(
   if (restored) await touchCacheEntry(`nm-${key}.bin`)
 
   return restored
+}
+
+/**
+ * Restores the executable bit on everything in `node_modules/.bin`.
+ *
+ * The snapshot round-trip does not preserve permissions, so a restored
+ * `node_modules` has a `.bin` full of non-executable files and the first thing
+ * an npm script tries to run dies with `spawn <tool> EACCES`.
+ *
+ * That failure is unusually nasty because **npm still exits 0**. The build
+ * reports success, produces nothing, and the first sign of trouble is a
+ * confusing ENOENT when the output directory turns out not to exist. It went
+ * unnoticed until the daemon started taking the cache-hit path on every build.
+ *
+ * `chmod` follows symlinks, and `.bin` entries are symlinks into the packages,
+ * so this reaches the real files.
+ */
+async function restoreBinPermissions(): Promise<void> {
+  invariant(runtime, 'Runtime not booted')
+
+  const { exitCode } = await runCommand('chmod', [
+    '-R',
+    '+x',
+    'node_modules/.bin',
+  ])
+
+  if (exitCode !== 0) {
+    console.warn(
+      `[wc-build] Could not restore permissions on node_modules/.bin (exit ${exitCode}); ` +
+        'the build may fail to spawn its tools'
+    )
+  }
 }
 
 /**
@@ -504,6 +826,7 @@ async function installWithCache(): Promise<CacheResult> {
   invariant(runtime, 'Runtime not booted')
 
   const key = await computeCacheKey()
+  const { manager, command, argsPrefix } = await resolvePackageManager()
 
   // The cache needs a snapshot-capable backend; otherwise fall back to a plain
   // install so a future backend without export/import still works.
@@ -511,37 +834,45 @@ async function installWithCache(): Promise<CacheResult> {
     console.log(
       '[wc-build] Runtime has no snapshot support; installing plainly'
     )
-    const code = await runCommand('npm', ['install'])
-    if (code !== 0) {
-      throw new Error(`npm install failed with exit code ${code}`)
+    const { exitCode } = await runCommand(command, [
+      ...argsPrefix,
+      ...installArgs(),
+    ])
+    if (exitCode !== 0) {
+      throw new Error(`${manager} install failed with exit code ${exitCode}`)
     }
-    return { cached: false, key }
+    return { cached: false, key, manager }
   }
 
   if (await restoreNodeModules(runtime, key)) {
+    await restoreBinPermissions()
     console.log(`[wc-build] node_modules cache HIT (${key.slice(0, 12)})`)
-    return { cached: true, key }
+    return { cached: true, key, manager }
   }
 
   console.log(`[wc-build] node_modules cache MISS (${key.slice(0, 12)})`)
 
   // Even on a full node_modules miss, prime npm's own content-addressed tarball
   // cache from OPFS so only packages new to *this* lockfile hit the network.
-  const npmCacheRestored = await restoreNpmCache(runtime)
-  console.log(
-    npmCacheRestored
-      ? '[wc-build] npm tarball cache restored; installing --prefer-offline'
-      : '[wc-build] no npm tarball cache yet; installing online (will seed it)'
-  )
+  // pnpm and yarn keep their own stores in their own formats, so they skip this
+  // layer and rely on the node_modules snapshot alone.
+  const npmCacheRestored = usesNpmTarballCache(manager)
+    ? await restoreNpmCache(runtime)
+    : false
+  if (usesNpmTarballCache(manager)) {
+    console.log(
+      npmCacheRestored
+        ? '[wc-build] npm tarball cache restored; installing --prefer-offline'
+        : '[wc-build] no npm tarball cache yet; installing online (will seed it)'
+    )
+  }
 
-  const code = await runCommand('npm', [
-    'install',
-    '--prefer-offline',
-    '--cache',
-    NPM_CACHE_DIR,
+  const { exitCode } = await runCommand(command, [
+    ...argsPrefix,
+    ...offlineInstallArgs(manager, NPM_CACHE_DIR),
   ])
-  if (code !== 0) {
-    throw new Error(`npm install failed with exit code ${code}`)
+  if (exitCode !== 0) {
+    throw new Error(`${manager} install failed with exit code ${exitCode}`)
   }
 
   const bytes = await saveNodeModules(runtime, key)
@@ -549,10 +880,14 @@ async function installWithCache(): Promise<CacheResult> {
     `[wc-build] Cached node_modules snapshot: ${(bytes / 1048576).toFixed(1)} MB`
   )
 
-  const npmCacheBytes = await saveNpmCache(runtime)
-  console.log(
-    `[wc-build] Updated npm tarball cache: ${(npmCacheBytes / 1048576).toFixed(1)} MB`
-  )
+  const npmCacheBytes = usesNpmTarballCache(manager)
+    ? await saveNpmCache(runtime)
+    : 0
+  if (usesNpmTarballCache(manager)) {
+    console.log(
+      `[wc-build] Updated npm tarball cache: ${(npmCacheBytes / 1048576).toFixed(1)} MB`
+    )
+  }
 
   await evictCache(`nm-${key}.bin`)
 
@@ -603,7 +938,7 @@ async function removePaths(paths: string[]): Promise<number> {
   invariant(runtime, 'Runtime not booted')
 
   for (const p of paths) {
-    await runtime.rm(p, { recursive: true, force: true })
+    await runtime.fs.rm(p, { recursive: true, force: true })
   }
 
   if (paths.length > 0) {
@@ -615,7 +950,7 @@ async function removePaths(paths: string[]): Promise<number> {
 async function writeFile(path: string, content: string): Promise<void> {
   invariant(runtime, 'Runtime not booted')
 
-  await runtime.writeFile(path, content)
+  await runtime.fs.writeFile(path, content)
 
   console.log(`[wc-build] File written: ${path}`)
 }
@@ -636,8 +971,21 @@ async function uploadDist(distPath: string): Promise<number> {
   const rt = runtime
   let count = 0
 
+  // A build tool that cannot spawn its own binary still exits 0 under npm, so
+  // "the build succeeded" and "the build produced something" are genuinely
+  // different claims. Checking here turns that case into a sentence naming the
+  // problem, instead of a bare ENOENT from the directory walk below.
+  try {
+    await rt.fs.readdir(distPath)
+  } catch {
+    throw new Error(
+      `The build reported success but produced no output at ${distPath}. ` +
+        'Check the build log above — a tool that fails to start can still exit 0.'
+    )
+  }
+
   async function traverse(currentPath: string): Promise<void> {
-    const entries = await rt.readdir(currentPath)
+    const entries = await rt.fs.readdir(currentPath)
 
     for (const entry of entries) {
       const fullPath =
@@ -646,7 +994,7 @@ async function uploadDist(distPath: string): Promise<number> {
       if (entry.isDirectory()) {
         await traverse(fullPath)
       } else {
-        const content = await rt.readFile(fullPath)
+        const content = await rt.fs.readFile(fullPath)
         const relative = fullPath.slice(distPath.length).replace(/^\//, '')
         const body = content.buffer.slice(
           content.byteOffset,
@@ -654,7 +1002,7 @@ async function uploadDist(distPath: string): Promise<number> {
         ) as ArrayBuffer
 
         const res = await fetch(
-          `/api/dist?path=${encodeURIComponent(relative)}`,
+          apiUrl(`api/dist?path=${encodeURIComponent(relative)}`),
           {
             method: 'POST',
             headers: { 'content-type': 'application/octet-stream' },
@@ -712,6 +1060,17 @@ const wcRunner = {
   boot,
   mountFromServer,
   runCommand,
+  resolvePackageManager,
+  describeRuntime,
+  killCommand,
+  resizeCommand,
+  openShell,
+  shellExec,
+  shellInterrupt,
+  shellResize,
+  shellBrokenReason,
+  shellVerifyJobControl,
+  closeShell,
   installWithCache,
   spawnCommand,
   writeFile,

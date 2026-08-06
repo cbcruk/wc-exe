@@ -33,6 +33,7 @@ import {
   readProjectFileBytes,
 } from '../dist/index.js'
 import { average, reportBreakdown, reportVerdict } from './report.mjs'
+import { assertBuildProduced } from './verify.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(__dirname, '..')
@@ -106,8 +107,8 @@ async function runOnce(source, { cache }) {
     let cacheHit = null
     const install = await timed('install', async () => {
       if (!cache) {
-        const code = await browser.runCommand('npm', ['install'])
-        if (code !== 0) throw new Error(`npm install exited ${code}`)
+        const { exitCode } = await browser.runCommand('npm', ['install'])
+        if (exitCode !== 0) throw new Error(`npm install exited ${exitCode}`)
         return
       }
       const result = await browser.installWithCache()
@@ -115,9 +116,12 @@ async function runOnce(source, { cache }) {
     })
 
     const build = await timed('build', async () => {
-      const code = await browser.runCommand('npm', ['run', 'build'])
-      if (code !== 0) throw new Error(`npm run build exited ${code}`)
+      const { exitCode } = await browser.runCommand('npm', ['run', 'build'])
+      if (exitCode !== 0) throw new Error(`npm run build exited ${exitCode}`)
     })
+
+    // Timing a build that produced nothing is worse than not timing it.
+    const producedFiles = await assertBuildProduced(browser)
 
     return {
       bootMs: boot.ms,
@@ -127,6 +131,7 @@ async function runOnce(source, { cache }) {
       // The number that matters for the container2wasm comparison: the
       // CPU/IO burst of install+build, excluding one-time boot.
       installPlusBuildMs: install.ms + build.ms,
+      producedFiles,
       ...(cache ? { cacheHit } : {}),
     }
   } finally {

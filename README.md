@@ -50,6 +50,33 @@ Features:
 - Watches local files and syncs changes
 - Supports HMR (Hot Module Replacement)
 
+### Daemon mode
+
+Booting a WebContainer costs a few seconds on every run. `--daemon` keeps one
+booted in the background and reuses it:
+
+```bash
+wc-exe build --daemon
+```
+
+The daemon starts on first use and shuts itself down after 10 idle minutes.
+
+```bash
+wc-exe daemon status    # what is running, and which projects it holds open
+wc-exe daemon stop
+wc-exe daemon restart
+wc-exe build --daemon --fresh   # discard this project's session first
+```
+
+Measured on the sample fixture: ~4.2s per warm build without the daemon, ~2.0s
+with it. The saving is bounded by boot time, so projects whose build dominates
+will see less.
+
+It listens on 127.0.0.1 only, behind a bearer token stored `0600` in
+`~/.cache/wc-exe/daemon.json`, and refuses any control request carrying an
+`Origin` header — a web page you visit can reach localhost, but cannot drive
+your builds.
+
 ### Install Only
 
 Install dependencies without building:

@@ -2,6 +2,8 @@ import { Command } from 'commander'
 import { build } from './commands/build.js'
 import { dev } from './commands/dev.js'
 import { install } from './commands/install.js'
+import { daemonBuild } from './commands/daemon-build.js'
+import { daemonStatus, stopDaemon } from './daemon/client.js'
 
 const program = new Command()
 
@@ -26,8 +28,29 @@ program
     'Cache node_modules in OPFS and reuse when the lockfile is unchanged'
   )
   .option('--verbose', 'Show detailed logs')
+  .option(
+    '--daemon',
+    'Build through a background daemon that keeps the runtime booted'
+  )
+  .option('--fresh', 'With --daemon, discard any existing session first')
   .action(async (options) => {
     try {
+      if (options.daemon) {
+        await daemonBuild({
+          source: options.source,
+          output: options.output,
+          distDir: options.distDir,
+          timeout:
+            options.timeout === false
+              ? undefined
+              : parseInt(options.timeout, 10),
+          noInstall: !options.install,
+          verbose: options.verbose,
+          fresh: options.fresh,
+        })
+        return
+      }
+
       await build({
         source: options.source,
         output: options.output,
@@ -74,6 +97,50 @@ program
       console.error('\nInstall failed:', (error as Error).message)
       process.exit(1)
     }
+  })
+
+const daemon = program
+  .command('daemon')
+  .description('Manage the background daemon')
+
+daemon
+  .command('status')
+  .description('Show the running daemon, if any')
+  .action(async () => {
+    const running = await daemonStatus()
+    if (!running) {
+      console.log('No daemon is running.')
+      return
+    }
+
+    const { record, health } = running
+    console.log(`pid       ${health.pid}`)
+    console.log(`port      ${record.port}`)
+    console.log(`version   ${health.version}`)
+    console.log(`uptime    ${(health.uptimeMs / 1000).toFixed(0)}s`)
+    console.log(`idle-out  ${(health.idleMs / 1000).toFixed(0)}s`)
+    console.log(`sessions  ${health.sessions.length}`)
+    for (const session of health.sessions) {
+      const state = session.poisoned ? `UNUSABLE: ${session.poisoned}` : 'ok'
+      console.log(`  ${session.source}  [${state}]`)
+    }
+  })
+
+daemon
+  .command('stop')
+  .description('Stop the running daemon')
+  .action(async () => {
+    console.log(
+      (await stopDaemon()) ? 'Daemon stopped.' : 'No daemon was running.'
+    )
+  })
+
+daemon
+  .command('restart')
+  .description('Stop the running daemon; the next build starts a fresh one')
+  .action(async () => {
+    await stopDaemon()
+    console.log('Daemon stopped. The next build will start a new one.')
   })
 
 program.parse()

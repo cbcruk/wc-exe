@@ -9,7 +9,9 @@ import { startServer, type ServerInfo } from '../core/server.js'
 import { WCBrowser } from '../core/browser.js'
 import { listProjectFiles, readProjectFileBytes } from '../core/file-sync.js'
 import { withSpin } from '../utils/spinner.js'
-import type { DevOptions, ServerHandlers } from '../types.js'
+import { commandFailure } from '../core/command-error.js'
+import type { ServerHandlers } from '../core/types.js'
+import type { DevOptions } from '../types.js'
 
 /**
  * Runs the project's dev server inside the browser runtime and proxies it to a
@@ -94,8 +96,10 @@ export async function dev(options: DevOptions): Promise<void> {
       spinner,
       message: 'Installing dependencies...',
       fn: async () => {
-        const code = await browser!.runCommand('npm', ['install'])
-        if (code !== 0) throw new Error('npm install failed')
+        const { manager } = await browser!.packageManager()
+        const result = await browser!.runCommand(manager, ['install'])
+        if (result.exitCode !== 0)
+          throw commandFailure(`${manager} install`, result)
       },
       successMessage: 'Dependencies installed',
       failMessage: (err) => `npm install failed: ${err.message}`,

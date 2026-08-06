@@ -1,0 +1,9 @@
+{
+  "name": "wc-exe-poc-webcontainer-shell-probe",
+  "private": true,
+  "type": "module",
+  "description": "Probe: how SSH-like is a WebContainer really? Inventories the runtime and exercises the PTY (stdin, resize, kill, Ctrl-C).",
+  "dependencies": {
+    "@webcontainer/api": "^1.6.1"
+  }
+}

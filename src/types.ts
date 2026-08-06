@@ -1,4 +1,11 @@
 /**
+ * Options for the CLI commands.
+ *
+ * The bridge's own types live in `core/types.ts`; these describe how the CLI
+ * is invoked and mean nothing to a library consumer.
+ */
+
+/**
  * Options for {@link build}.
  */
 export interface BuildOptions {
@@ -34,73 +41,4 @@ export interface DevOptions {
 export interface InstallOptions {
   /** Reuse an OPFS-cached `node_modules` when the lockfile is unchanged. */
   cache?: boolean
-}
-
-/**
- * Nested directory listing used to mount a project into the runtime.
- * Keys are single path segments, not slash-separated paths.
- */
-export interface FileSystemTree {
-  [name: string]: FileSystemTreeNode
-}
-
-/** A single entry in a {@link FileSystemTree}. */
-export type FileSystemTreeNode = FileNode | DirectoryNode
-
-/** A file entry in a {@link FileSystemTree}. */
-export interface FileNode {
-  file: {
-    contents: string | Uint8Array
-  }
-}
-
-/** A directory entry in a {@link FileSystemTree}. */
-export interface DirectoryNode {
-  directory: FileSystemTree
-}
-
-/**
- * Message emitted by the in-browser runner while a command runs.
- */
-export interface WCMessage {
-  type: 'output' | 'error' | 'ready' | 'exit'
-  /** Output or error text, for `output` / `error` messages. */
-  data?: string
-  /** Process exit code, for `exit` messages. */
-  code?: number
-}
-
-/**
- * Outcome of a cache-aware install, as reported by the in-browser runner.
- *
- * Mirrors the runner's own `CacheResult`; kept here because the two sides are
- * built as separate bundles and cannot share a type import.
- */
-export interface CacheResult {
-  /** Whether `node_modules` was restored from a snapshot instead of installed. */
-  cached: boolean
-  /** Lockfile hash the snapshot is keyed on. */
-  key: string
-  /** Size of the snapshot just written. Absent on a cache HIT. */
-  bytes?: number
-  /** Whether npm's tarball cache was restored before installing. MISS only. */
-  npmCacheRestored?: boolean
-  /** Size of the tarball cache snapshot. MISS only. */
-  npmCacheBytes?: number
-}
-
-/**
- * Host-side callbacks the local server exposes to the in-browser runner.
- * Each maps to one `/api` route in {@link createApp}.
- */
-export interface ServerHandlers {
-  /** Project-relative paths to mount, as returned by `GET /api/files`. */
-  listFiles: () => Promise<string[]>
-  /** Reads one project file, as returned by `GET /api/files/raw`. */
-  readFile: (relPath: string) => Promise<Uint8Array>
-  /**
-   * Persists one build artifact, as accepted by `POST /api/dist`.
-   * Omit to make the route respond `501` (e.g. in `dev`, which never uploads).
-   */
-  writeDistFile?: (relPath: string, data: Uint8Array) => Promise<void>
 }

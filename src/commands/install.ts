@@ -13,7 +13,9 @@ import {
   ensureCacheDirs,
 } from '../core/cache.js'
 import { withSpin } from '../utils/spinner.js'
-import type { InstallOptions, ServerHandlers } from '../types.js'
+import { commandFailure } from '../core/command-error.js'
+import type { ServerHandlers } from '../core/types.js'
+import type { InstallOptions } from '../types.js'
 
 /**
  * Installs the current project's dependencies inside the browser runtime,
@@ -120,9 +122,8 @@ export async function install(options: InstallOptions): Promise<void> {
         spinner,
         message: 'Installing dependencies (npm install)...',
         fn: async () => {
-          const code = await browser!.runCommand('npm', ['install'])
-          if (code !== 0)
-            throw new Error(`npm install failed with exit code ${code}`)
+          const result = await browser!.runCommand('npm', ['install'])
+          if (result.exitCode !== 0) throw commandFailure('npm install', result)
         },
         successMessage: 'Dependencies installed successfully',
         failMessage: (err) => `npm install failed: ${err.message}`,

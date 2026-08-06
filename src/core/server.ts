@@ -1,12 +1,8 @@
 import { Hono } from 'hono'
 import { serve, type ServerType } from '@hono/node-server'
 import { serveStatic } from '@hono/node-server/serve-static'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
-import type { ServerHandlers } from '../types.js'
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const runnerPath = path.resolve(__dirname, '../src/runner/dist')
+import { resolveRunnerDist } from './runner-assets.js'
+import type { ServerHandlers } from './types.js'
 
 function toArrayBuffer(view: Uint8Array): ArrayBuffer {
   return view.buffer.slice(
@@ -63,7 +59,7 @@ export function createApp(handlers: ServerHandlers): Hono {
     return c.body(null, 204)
   })
 
-  app.use('/*', serveStatic({ root: runnerPath }))
+  app.use('/*', serveStatic({ root: resolveRunnerDist() }))
 
   return app
 }
@@ -96,12 +92,24 @@ export function startServer(
         {
           fetch: app.fetch,
           port,
+          // 127.0.0.1 only. These routes hand out the project's source files,
+          // so binding every interface published the user's code to the local
+          // network for the duration of the build. It also made a port clash
+          // undetectable: binding INADDR_ANY can succeed while another process
+          // already holds 127.0.0.1 on the same port, after which requests land
+          // on whichever got there first.
+          hostname: '127.0.0.1',
         },
         (info) => {
           resolve({
             server,
             port: info.port,
-            url: `http://localhost:${info.port}`,
+            // 127.0.0.1, not `localhost`. OPFS is keyed by origin as a
+            // string, so the two are different stores even though they reach
+            // the same server — the daemon and this path would each keep their
+            // own node_modules cache and neither could use the other's. It also
+            // avoids `localhost` resolving to ::1 while we listen on IPv4.
+            url: `http://127.0.0.1:${info.port}`,
           })
         }
       )

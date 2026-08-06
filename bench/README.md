@@ -108,6 +108,37 @@ vscode-container-wasm actually use. So:
 - **stdin EOF kills the guest** — with stdin closed the guest reads EOF at boot
   and exits 1. Pass c2w's `-no-stdin` and redirect `</dev/null`.
 
+## 3. Is the daemon worth it? (`bench/daemon.mjs`)
+
+```bash
+pnpm build
+node bench/daemon.mjs ../my-real-project --runs 3
+```
+
+Drives the real CLI end to end and compares cold / one-shot `--cache` warm /
+daemon warm, then reports the per-build saving and how many builds the daemon's
+first run takes to pay back. If the daemon is not faster, it says so.
+
+## Every harness checks that the build produced something
+
+This is not belt and braces. `npm run build` **exits 0 when its build tool
+cannot be spawned at all** — which is what happened when a restored
+`node_modules` came back without executable bits. For a long time every
+cache-hit run reported a fast, successful, entirely empty build, and these
+harnesses recorded the timings without complaint.
+
+So `bench/verify.mjs` counts the output and fails, naming the likely cause, when
+there is none. Reintroducing that bug now produces:
+
+```
+  boot: 1.68s   mount: 0.14s   install: 0.31s   build: 0.61s
+Benchmark failed: The build exited 0 but dist/ does not exist. A build tool that
+fails to start still exits 0 under npm — check the build log for EACCES ...
+```
+
+Fast, tidy, and entirely fictional. Any number in this file predating that check
+should be treated as unverified.
+
 ## Recording results
 
 Measured on macOS (M-series, 16 GB), sample-vite-app:

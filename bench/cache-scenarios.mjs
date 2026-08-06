@@ -27,6 +27,7 @@ import {
   listProjectFiles,
   readProjectFileBytes,
 } from '../dist/index.js'
+import { assertBuildProduced } from './verify.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(__dirname, '..')
@@ -98,9 +99,11 @@ async function runScenario({ label, wipe, withExtraDep }) {
     const installMs = Math.round(performance.now() - installStart)
 
     const buildStart = performance.now()
-    const code = await browser.runCommand('npm', ['run', 'build'])
+    const { exitCode } = await browser.runCommand('npm', ['run', 'build'])
     const buildMs = Math.round(performance.now() - buildStart)
-    if (code !== 0) throw new Error(`build failed (${code})`)
+    if (exitCode !== 0) throw new Error(`build failed (${exitCode})`)
+    // A cache hit that restores an unusable node_modules still exits 0 here.
+    const producedFiles = await assertBuildProduced(browser)
 
     console.log(
       `  ${label}: install ${(installMs / 1000).toFixed(2)}s | build ${(
@@ -113,7 +116,7 @@ async function runScenario({ label, wipe, withExtraDep }) {
           : '')
     )
 
-    return { label, bootMs, installMs, buildMs, ...result }
+    return { label, bootMs, installMs, buildMs, producedFiles, ...result }
   } finally {
     await browser.close()
     await new Promise((r) => serverInfo.server.close(() => r()))
