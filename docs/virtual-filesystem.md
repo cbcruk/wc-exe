@@ -505,6 +505,31 @@ warm 실행을 분해하면 인터셉트가 대체하는 조각이 가장 작다
 
 **증명된 게 아니다.** 리스크 둘이 그대로다: ① 픽스처 하나에서 "훅이 안 걸린다"를 일반화하는 건 이 탐색이 이미 두 번 저지른 실수다 ② npm의 트리 해석(peer deps·`overrides`·optional/platform deps·workspaces)을 재현하지 못하면 빌드가 **조용히** 깨진다(위 «하이브리드 착지점»의 본체 비용).
 
+#### 애셋 파이프라인 — 스톡 vite 템플릿이 막히던 지점 (2026-08)
+
+lazy fault-in 작업에서 걸린 것이 여기였다: `npm create vite` React 앱이 **`.png`·`.svg` import 때문에 아예 빌드되지 않았다**("stream did not contain valid UTF-8", "Unexpected JSX expression in src/assets/react.svg"). 번들러가 그 파일을 JS로 파싱하려 들기 때문이다.
+
+기준을 먼저 잡았다 — 네이티브 `vite build`가 `sample-asset-app`(111B svg + 7,028B png)에 대해 하는 일: **4KB 미만은 data URI로 인라인**(svg는 base64가 아니라 url-encode), **넘으면 콘텐츠 해시로 emit**(`assets/big-C1H63osM.png`). 둘 다 `--vfs=memfs`에 구현했고, **emit된 png는 vite가 낸 것과 바이트 동일**하다(파일명 해시만 다르다 — 여기는 sha256 앞 8자리, vite는 rollup 알고리즘).
+
+애셋 해시는 번들러의 애셋 파이프라인이 아니라 **`load`에서 바이트로부터 직접** 낸다. 그러면 이름이 내용을 식별하고 나중에 뒤엎을 재작성이 없다 — preload 작업이 이미 한 번 저지른 실수를 피한 것이다.
+
+**`public/`도 붙였다.** 해시 없이 출력 루트로 그대로 복사한다. `<use href="/icons.svg">`처럼 리터럴 URL로 참조되는 파일은 번들러가 아예 보지 못하므로 emit할 방법이 없다. lazy 채우기에선 이 목록을 **볼륨이 아니라 매니페스트**에서 뽑는다 — 아무도 안 읽은 파일은 볼륨에 없고, `public/`이야말로 그래프가 절대 안 닿는 디렉터리다.
+
+**플러그인 VFS는 못 한다.** 내용을 텍스트로 싣기 때문에 애셋이 실패 대신 **깨진 채로** 들어온다. 이제 `asset imports need --vfs=memfs: …`로 거부한다.
+
+**검사 두 개를 추가하고, 그 검사가 실패하는지 확인했다** — "파일이 dist에 있다"는 "브라우저가 쓸 수 있다"가 아니므로:
+
+| 고의 파손                    | static | runtime |
+| ---------------------------- | ------ | ------- |
+| 참조만 남기고 파일을 안 올림 | ✗ 잡음 | ✗ 잡음  |
+| 인라인 data URI를 망가뜨림   | ✓ 통과 | ✗ 잡음  |
+
+두 번째 줄이 둘 다 있어야 하는 이유다 — 망가진 data URI는 static이 볼 수 없다. 그리고 runtime 검사의 **대기**는 선택이 아니다: 앱이 삽입한 이미지는 `networkidle2` 이후에 로드를 시작하므로 일찍 읽으면 멀쩡한 그림에 0이 나온다. 이 검사의 첫 실행에서 실제로 그 오탐이 났다.
+
+**결과**: 스톡 `react-ts` 템플릿이 빌드된다(`hero-881ffbca.png`·`react-35ef61ed.svg`·`vite-5be21acd.svg` emit, `favicon.svg`·`icons.svg` 복사). 남은 검증 실패는 하네스가 이 저장소 픽스처의 문자열(`#213547`·`count is`)을 찾기 때문이지 빌드 문제가 아니다.
+
+**아직 안 되는 것**: CSS `url()` 참조(픽스처 스타일시트에 없어서 미검증이기도 하다), `?url`/`?raw`/`?inline` 쿼리(떼고 무시한다), `new URL('./x.png', import.meta.url)`.
+
 #### 훅은 비어 있고, 비용은 옮겨갔다 (10개 프로젝트 실측)
 
 ①의 리스크를 먼저 줄였다. `bench/install-shape.mjs`가 설치된 프로젝트를 받아 **런타임 클로저**(루트의 `dependencies`+`optionalDependencies`를 재귀, devDependencies는 제외 — 인터셉트는 프로젝트의 vite를 실행하지 않으므로)와 **레지스트리 설치 시 실제로 도는 훅**(`preinstall`·`install`·`postinstall` + `binding.gyp`의 암묵적 `node-gyp rebuild`; `prepare`·`prepublish`는 published 타르볼에 안 돌므로 제외)을 센다.
@@ -852,7 +877,7 @@ Builder { build(project, options) → dist }
    전자가 지금 가능한 것이고, 후자가 실제로 결정을 내려주는 것이다. **"이 탐색의 마지막 숫자"였던 지위는 미결 8에게 넘어갔다.**
 
 2. 플러그인 호환성 — 위에서 말한 경계. 무엇을 얼마나 지원할지가 곧 범위 결정이다.
-3. 미검증 생태계 형태 — **일부 해소.** `browser` 필드 remap·`imports` 필드·깊은 `exports` 와일드카드는 `sample-exports-app`으로 검증했고(네이티브 vite 기준 대조), **`--vfs=memfs`만 전부 통과한다**(§9). 남은 것: worker/wasm import, CSS `@import`/`url()` 애셋 참조, sourcemap, multi-page.
+3. 미검증 생태계 형태 — **상당 부분 해소.** `browser` 필드 remap·`imports` 필드·깊은 `exports` 와일드카드는 `sample-exports-app`으로, **애셋 import와 `public/`는 `sample-asset-app`으로** 검증했다(둘 다 네이티브 vite 기준 대조). 양쪽 다 **`--vfs=memfs`만 통과한다**(§9). 남은 것: CSS `url()` 참조, `?url`/`?raw` 쿼리, `new URL(…, import.meta.url)`, worker/wasm import, sourcemap, multi-page.
 4. 캐시 고도화(§5): cacache blob 무한 증가는 상한으로 막았지만, lockfile diff 기반 부분 무효화(burrow `src/npm`의 stale-lock retry가 원형)는 아직 안 했다.
 5. **`Builder` 이음새** — 인터셉트를 두 번째 백엔드로 올리려면 `Runtime` 위에 "프로젝트 → `dist/`" 층이 필요하다(위 «이음새의 고도»). 1의 측정이 유리하게 나온 **뒤에** 긋는다.
 6. ~~**fs-proxy memfs 이식 실험**~~ — **완료(`--vfs=memfs`).** 동작하고 출력이 바이트 동일하며, 지연 VFS도 **되찾았다**(동기 XHR fault-in) — 대가가 1.8×에서 약 9%로 내려갔고 규모가 큰 앱에선 eager 대비 4×다. 미결 3의 해당 형태들은 이 모드에서만 올바로 해석된다(위 3 참조). vrowzer의 10MB 페이로드 패치는 **필요 없었다**. §9 참조.

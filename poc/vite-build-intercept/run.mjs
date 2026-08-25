@@ -413,6 +413,22 @@ async function verify(
       }
     }
 
+    // Assets: every hashed asset URL the bundle references must exist on disk.
+    // Emitting the reference and not the file is a build that looks fine until
+    // it 404s in a browser.
+    const assetRefs = [
+      ...js.matchAll(
+        /["'`](\/assets\/[A-Za-z0-9._-]+\.(?:png|jpe?g|gif|svg|webp|avif|ico|bmp|woff2?|ttf|otf|eot|mp4|webm|mp3|wav|ogg|wasm))["'`]/g
+      ),
+    ].map((m) => m[1])
+    for (const ref of [...new Set(assetRefs)]) {
+      try {
+        await fs.access(path.join(outDir, ref.replace(/^\//, '')))
+      } catch {
+        problems.push(`bundle references an asset that is missing: ${ref}`)
+      }
+    }
+
     if (usesDynamicImport) {
       if (jsFiles.length < 2) {
         problems.push(
@@ -616,6 +632,33 @@ async function verifyBuiltAppRuns(outDir, chromePath, chunkDelayMs = 0) {
       } catch {
         const got = await page.$eval('#lazy-out', (el) => el.textContent)
         problems.push(`lazy chunk never loaded (#lazy-out = "${got}")`)
+      }
+    }
+
+    // Assets actually decode. `naturalWidth` is 0 for an image that failed to
+    // load, so this separates "the URL is in the HTML" from "the browser got
+    // bytes it could use" — which is the difference between an inlined data URI
+    // that is malformed and one that works.
+    //
+    // The wait matters: images inserted by the app start loading after
+    // `networkidle2`, and reading `naturalWidth` before they settle reports 0
+    // for pictures that are perfectly fine. That false positive showed up on
+    // the first run of this check.
+    await page
+      .waitForFunction(() => [...document.images].every((i) => i.complete), {
+        timeout: 10000,
+      })
+      .catch(() => problems.push('images never finished loading'))
+    const images = await page.$$eval('img', (nodes) =>
+      nodes.map((n) => ({
+        id: n.id,
+        src: n.getAttribute('src')?.slice(0, 24) ?? '',
+        width: n.naturalWidth,
+      }))
+    )
+    for (const img of images) {
+      if (img.width === 0) {
+        problems.push(`image did not load: #${img.id} src="${img.src}…"`)
       }
     }
 

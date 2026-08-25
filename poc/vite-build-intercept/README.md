@@ -74,6 +74,9 @@ node poc/vite-build-intercept/run.mjs --vfs=memfs --eager
 
 # the fixture that separates the two resolvers (local packages, no install)
 node poc/vite-build-intercept/run.mjs test/fixtures/sample-exports-app --vfs=memfs
+
+# assets: one inlined as a data URI, one emitted with a content hash
+node poc/vite-build-intercept/run.mjs test/fixtures/sample-asset-app --vfs=memfs
 ```
 
 Defaults to `test/fixtures/sample-vite-app`. Needs a Chromium (`CHROME_PATH` if
@@ -207,9 +210,9 @@ Also note the size: 10 MB of wasm plus ~1.5 MB of JS for rolldown, plus another
   hashed assets, HTML rewrite). Vite's config resolution, plugin ecosystem,
   framework plugins (`@vitejs/plugin-react`, svelte, …), `publicDir`, multi-page
   input, legacy targets and env/`define` handling are all absent.
-- **Five fixtures.** React, code-splitting and the resolution shapes below all
-  work, but these remain untried: worker/wasm imports, CSS `@import`/`url()`
-  asset references, sourcemaps, multi-page input.
+- **Six fixtures.** React, code-splitting, the resolution shapes and asset
+  imports all work, but these remain untried: worker/wasm imports, CSS
+  `@import`/`url()` references, sourcemaps, multi-page input.
   `browser` field remaps, `imports` fields and deep `exports` wildcards **are**
   now covered (`sample-exports-app`) — and only `--vfs=memfs` gets them right.
 - Nothing about `postinstall`, native addons, or anything else needing a real
@@ -570,6 +573,88 @@ ship from`cjs/`/`umd/`), and the new fixture did on the first run. Both VFS
    with nothing about resolution. It now records the abort as a problem and the
    static findings survive — which is how the table above became legible.
 
+## Assets (`sample-asset-app`)
+
+`import url from './logo.png'` is what stopped a stock `npm create vite` app
+from building at all — the bundler tried to parse the file as JavaScript and
+reported "stream did not contain valid UTF-8" and "Unexpected JSX expression in
+src/assets/react.svg". vite turns that import into a URL and emits the file with
+a content hash, unless it is under `assetsInlineLimit` (4 KB), where it becomes
+a data URI and nothing is emitted.
+
+Ground truth from native `vite build` on the fixture — a 111 B svg and a
+7,028 B png:
+
+```
+dist/assets/big-C1H63osM.png    7.03 kB      <- emitted, hashed
+data:image/svg+xml,%3csvg%20…                <- inlined, url-encoded not base64
+```
+
+Both branches are implemented for `--vfs=memfs`, and the emitted png comes out
+**byte-identical to the one vite emits**; only the hash in the filename differs
+(sha256-8hex here, rollup's algorithm there — nothing depends on matching it).
+SVG inlines as url-encoded text rather than base64 because that is what vite
+does and it is usually smaller; the escaping is not character-for-character
+vite's, and both are valid data URIs.
+
+Assets are hashed from their own bytes in `load`, not through the bundler's
+asset pipeline, so the name identifies the content with no later rewrite to
+invalidate it — the mistake the preload work already made once.
+
+`public/` is copied verbatim to the output root, no hashing and no graph
+involvement. It is how vite ships files referenced by a literal URL
+(`<use href="/icons.svg">`), which the bundler never sees and could never emit.
+Under the lazy fill this comes from the manifest rather than the volume: a file
+nobody has read is not there to be listed, and `public/` is exactly the
+directory the graph never touches.
+
+The plugin-fed VFS **cannot** do this — it loads file contents as text, so an
+asset would arrive mangled rather than fail. It now refuses with
+`asset imports need --vfs=memfs: "./assets/big.png" from "src/main.ts"` instead.
+
+### The checks, and evidence that they fail
+
+Two were added, because "the file is in dist" is not "the browser could use it":
+
+- **static** — every `/assets/*.{png,svg,…}` URL in the bundle must exist on
+  disk. Emitting the reference without the file is a build that looks clean and
+  404s.
+- **runtime** — every `<img>` must end up with `naturalWidth > 0`, after waiting
+  for `document.images` to settle. That wait is not optional: images inserted by
+  the app start loading after `networkidle2`, and reading too early reports 0
+  for pictures that are fine. That false positive appeared on this check's first
+  run.
+
+Sabotaged deliberately to confirm they bite:
+
+| sabotage                              | static   | runtime  |
+| ------------------------------------- | -------- | -------- |
+| emit the reference, withhold the file | ✗ caught | ✗ caught |
+| corrupt the inlined data URI          | ✓ passes | ✗ caught |
+
+The second row is the argument for having both: nothing static can see a
+malformed data URI.
+
+### What a stock template does now — and what still stops it
+
+`npm create vite@latest --template react-ts` builds:
+
+```
+assets/main-CQVHnqe_.js  193,753 B     favicon.svg  9,522 B
+assets/style-df5617f1.css  3,720 B     icons.svg    5,031 B
+assets/hero-881ffbca.png  13,057 B     index.html     457 B
+assets/react-35ef61ed.svg  4,126 B
+assets/vite-5be21acd.svg   8,709 B
+```
+
+Its remaining verification failures are the harness's, not the build's: the
+static checks look for `#213547` and `count is`, which are this repo's fixtures'
+strings.
+
+Still not implemented, and untested: **CSS `url()` references** (the fixture's
+stylesheet has none), vite's `?url` / `?raw` / `?inline` query suffixes (stripped
+and ignored), and `new URL('./x.png', import.meta.url)`.
+
 ## lightningcss on the rolldown path: works, but the second wasm is not free
 
 vite 8 minifies CSS with lightningcss, so the rolldown path uses
@@ -749,5 +834,7 @@ harness hit exactly that.
    `sample-exports-app` correctly.
 7. ~~A fixture that separates the two resolvers~~ — **done**
    (`sample-exports-app`, ground-truthed against native `vite build`).
-8. Only then: plugin compatibility, sourcemaps, multi-page input, asset
-   references.
+8. ~~The asset pipeline~~ — **done for module imports and `public/`**
+   (`sample-asset-app`). CSS `url()`, `?url`/`?raw` and
+   `new URL(…, import.meta.url)` remain.
+9. Only then: plugin compatibility, sourcemaps, multi-page input.
