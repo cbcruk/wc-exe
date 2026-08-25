@@ -183,11 +183,12 @@ The template projects have tiny closures (0–23 packages, ≤16 MB of a 53–80
 runtime, so `vue-app`'s closure is 118 of 135 packages and 79.2 MB, filtering to
 **38.4 MB**.
 
-That number lands on the mode that has to move it eagerly. `--vfs=memfs` cannot
-fetch lazily, and 15.2 MB already costs ~280 ms of the React build; 38 MB is
-2.5× that. So install-free interception looks **feasible on correctness** and
-moves the problem to **transfer volume** — the same wall `--vfs=memfs` already
-hit, larger.
+That number only bites if the whole closure has to move. It did when this was
+measured — and directly afterwards `--vfs=memfs` gained a lazy fill (synchronous
+XHR fault-in; see the PoC README), which reads what the graph touches instead:
+**0.7 MB of a 60.9 MB tree** on a comparable app. So read `sendable` as a worst
+case, not a transfer cost. Install-free interception looks **feasible on
+correctness**, and the transfer objection it seemed to raise mostly went away.
 
 One shape does not have that problem: caching **tarballs**, not extracted trees.
 The repo's cacache already does this (§5), and it is the right shape here for

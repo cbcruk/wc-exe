@@ -61,6 +61,11 @@ function parseArgs(argv) {
     //   memfs            — written into rolldown's own filesystem, so its
     //                      native resolver does the work
     vfs: rest.includes('--vfs=memfs') ? 'memfs' : 'plugin',
+    // memfs only. The default fills the volume lazily — manifest and
+    // directories up front, file contents faulted in through synchronous XHR
+    // when the bundler opens one. `--eager` restores the whole-tree transfer,
+    // so the difference stays measurable.
+    lazy: !rest.includes('--eager'),
     // Ships every node_modules file to the volume, including ones that cannot
     // be a module. Exists so the filter's effect can be A/B'd.
     bulkFilter: !rest.includes('--no-bulk-filter'),
@@ -258,8 +263,8 @@ function createApp({ projectDir, outDir, vendor, bulkFilter }) {
 
   // Everything, in one response, for `--vfs=memfs`.
   //
-  // That mode cannot fetch lazily — the bundler's fs calls are synchronous —
-  // so the alternative is ~2,150 round trips on a React project. Framing is
+  // Used by `--vfs=memfs --eager`, where the whole tree has to arrive before
+  // the build starts, so the alternative is ~2,150 round trips. Framing is
   // `u32 pathLen | path | u32 bodyLen | body`, repeated; binary so non-UTF-8
   // files inside packages survive.
   app.get('/api/bulk', async () => {
@@ -625,8 +630,21 @@ async function verifyBuiltAppRuns(outDir, chromePath, chunkDelayMs = 0) {
 }
 
 async function main() {
-  const { project, keep, cssMinify, preload, vfs, bulkFilter, chunkDelayMs } =
-    parseArgs(process.argv)
+  const {
+    project,
+    keep,
+    cssMinify,
+    preload,
+    vfs,
+    lazy,
+    bulkFilter,
+    chunkDelayMs,
+  } = parseArgs(process.argv)
+
+  if (!lazy && vfs !== 'memfs') {
+    console.error('\n--eager applies to --vfs=memfs only.\n')
+    process.exit(1)
+  }
 
   const projectDir = path.resolve(REPO_ROOT, project)
   const outDir = path.join(HERE, 'out')
@@ -667,7 +685,7 @@ async function main() {
   console.log(
     `  vfs:     ${
       vfs === 'memfs'
-        ? "memfs  (rolldown's own resolver walks the volume)"
+        ? `memfs${lazy ? '' : '+eager'}  (rolldown's own resolver walks the volume)`
         : 'plugin (resolveId/load, with our resolver)'
     }`
   )
@@ -721,11 +739,12 @@ async function main() {
       timeout: 60000,
     })
     result = await page.evaluate(
-      (css, pre, v) =>
-        window.__pocBuild({ cssMinify: css, preload: pre, vfs: v }),
+      (css, pre, v, lz) =>
+        window.__pocBuild({ cssMinify: css, preload: pre, vfs: v, lazy: lz }),
       cssMinify,
       preload,
-      vfs
+      vfs,
+      lazy
     )
     result.hostWallclockMs = Math.round(performance.now() - hostStart)
   } finally {
