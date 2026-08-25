@@ -69,6 +69,9 @@ node poc/vite-build-intercept/run.mjs --no-css-minify
 # let rolldown's own resolver walk the VFS instead of ours (see below)
 node poc/vite-build-intercept/run.mjs --vfs=memfs
 
+# same, but transfer the whole tree up front instead of faulting files in
+node poc/vite-build-intercept/run.mjs --vfs=memfs --eager
+
 # the fixture that separates the two resolvers (local packages, no install)
 node poc/vite-build-intercept/run.mjs test/fixtures/sample-exports-app --vfs=memfs
 ```
@@ -364,9 +367,9 @@ Three things make it work:
    filesystem rather than two copies. vrowzer has to _replace_ the internal
    memfs to get this — they ship multiple bundles that must share a volume; the
    PoC bundles once, so it does not.
-2. **One request, not 2,150.** The bundler's fs calls are synchronous, so
-   nothing can be fetched on demand: the tree must be resident before the build
-   starts. `/api/bulk` streams every file in one binary response.
+2. **The files have to get there.** By default they arrive lazily, faulted in
+   as the bundler opens them (next section). `--eager` instead streams the
+   whole tree in one binary response through `/api/bulk`.
 3. **CSS still needs a plugin.** rolldown refuses CSS input, so stylesheets are
    still routed through a virtual module id. That is the only hook left.
 
@@ -387,23 +390,58 @@ to be.
 replace two more of the four additions the previous section lists. Only the
 lazy VFS survives as ours, inverted.
 
-### What it costs: laziness, and the bill is node_modules-sized
+### The cost was laziness — until it wasn't
 
-| React fixture            | plugin VFS | memfs VFS      |
-| ------------------------ | ---------- | -------------- |
-| get files in front of it | 16–17 ms   | 307–321 ms     |
-| bundle + generate        | 194–197 ms | 192–195 ms     |
-| **total in-page**        | **355 ms** | **634–653 ms** |
+The first version of this mode filled the whole volume before starting, because
+"the bundler's fs calls are synchronous, so nothing can be fetched on demand"
+reads like a hard constraint. It is not one. It is true of `fetch`; it is not
+true of the page, which can still issue a **synchronous XMLHttpRequest**. The
+reason that is a bad idea in a web app — it blocks the main thread — does not
+apply to a headless build runner with no UI to block. Measured: 3 ms for a local
+request, under COOP/COEP.
 
-**The bundle burst is unchanged** — rolldown does not care where the bytes came
-from. The entire difference is the VFS step, and it splits ~90/10 between
-transferring the tree and writing it into memfs (278 ms fetch + 28 ms write on a
-typical run). It is a transport problem, not a memfs problem.
+Where to hook was settled by instrumenting rolldown rather than guessing. It
+never calls `readFileSync`; it goes through the descriptor API — `lstatSync`,
+`openSync`, `readSync`, `fstatSync`, `closeSync`, `realpathSync` — against the
+page's own `memfs.fs` object. The page's WASI and the wasi worker's fs-proxy
+both land on that object, so patching its methods covers both paths.
 
-On the vanilla fixture the two modes are a wash (299–303 ms vs 280–308 ms): with
-no dependencies there is nothing to be eager about.
+So the default fill is now lazy: the **manifest and directories** go in up
+front (a missing directory has to report ENOENT truthfully or resolution
+breaks), project sources are loaded eagerly because the graph reaches all of
+them, and dependency contents are faulted in on ENOENT. The fault-in never
+fabricates content — a path gets its real bytes or the original error. `--eager`
+restores the whole-tree transfer so the difference stays A/B-able.
 
-### Two thirds of that transfer was never a module
+| React fixture      | plugin VFS     | memfs (lazy)   | memfs `--eager` |
+| ------------------ | -------------- | -------------- | --------------- |
+| get files in front | 16–17 ms       | 19–20 ms       | 299–304 ms      |
+| bundle + generate  | 183–196 ms     | 209–218 ms     | 194–205 ms      |
+| **total in-page**  | **326–337 ms** | **358–367 ms** | **624–645 ms**  |
+
+The fault-in cost lands _inside_ the bundle burst, which is why that column
+rises 184 → 213 ms: 19–20 ms of blocking XHR for **19 files, 0.2 MB**, out of a
+2,255-path manifest.
+
+It scales the way the reasoning says it should. On a stock `npm create vite`
+React app with real dependencies added (14,997 paths, 60.9 MB after the
+unimportable filter):
+
+| react-app          | memfs (lazy)          | memfs `--eager`                    |
+| ------------------ | --------------------- | ---------------------------------- |
+| get files in front | 64 ms                 | 1,511 ms (1,357 fetch + 153 write) |
+| faulted in         | **32 files · 0.7 MB** | — (all 8,655 files · 60.4 MB)      |
+| **total**          | **497 ms**            | **2,012 ms**                       |
+
+**4× faster, reading 1.2% of what the eager mode moves**, with byte-identical
+output. So `--vfs=memfs` costs ~9% against the plugin-fed path rather than
+1.8×, and it is the mode that resolves dependencies correctly.
+
+> That app only builds after its `.png` and `.svg` imports are removed — the
+> asset pipeline is untouched in both modes and is the next real gap, not a
+> property of either fill strategy.
+
+### Two thirds of an eager transfer was never a module
 
 Unfiltered, the React fixture ships **44.5 MB** — and 17.9 MB of it is two
 copies of the **esbuild native binary**, with another ~5 MB of `.map` and 3.6 MB
@@ -415,10 +453,14 @@ of `.node`. None of that can ever be a JavaScript module.
 content filter, **not** a resolver — it decides nothing about where a specifier
 points, which is the whole thing this mode hands back to rolldown.
 
-| React fixture | files | sent        | VFS step       | total          |
-| ------------- | ----- | ----------- | -------------- | -------------- |
-| unfiltered    | 2,255 | 44.5 MB     | 482 ms         | 858 ms         |
-| filtered      | 1,618 | **15.2 MB** | **307–321 ms** | **634–653 ms** |
+| React fixture, `--eager` | files | sent        | VFS step       | total          |
+| ------------------------ | ----- | ----------- | -------------- | -------------- |
+| unfiltered               | 2,255 | 44.5 MB     | 482 ms         | 858 ms         |
+| filtered                 | 1,618 | **15.2 MB** | **307–321 ms** | **634–653 ms** |
+
+The lazy fill makes this largely moot — it reads 0.2 MB — but the filter still
+matters for `--eager`, and the reasoning behind it is what the `sendable` column
+of `bench/install-shape.mjs` reports.
 
 Output stays byte-identical either way. `--no-bulk-filter` restores the
 unfiltered transfer so the effect stays A/B-able.
@@ -458,7 +500,7 @@ not worth a standing patch.
 | resolution semantics we own | 109 code lines        | **0**                            |
 | plumbing we own             | lazy manifest + fetch | 71 (page) + 78 (host) code lines |
 | dependency patched          | none                  | none                             |
-| React total                 | 355 ms                | 634–653 ms                       |
+| React total                 | 326–337 ms            | 358–367 ms                       |
 
 The line counts are close to a wash. What changes is their **character**: 109
 lines of resolution semantics that have to match Node's algorithm — and that
@@ -466,8 +508,9 @@ lines of resolution semantics that have to match Node's algorithm — and that
 shapes (`browser` field remaps, deep `exports` wildcards) — become ~150 lines of
 transport that is either right or obviously broken.
 
-Whether that trade is worth ~1.8× on a React build depends on how much those
-shapes matter — and the next section stops that being a guess.
+What that trade costs is now ~9% on a React build, not the 1.8× it looked like
+before the fill went lazy — and the next section stops "how much do those shapes
+matter" being a guess.
 
 ## The resolution shapes that decide it (`sample-exports-app`)
 

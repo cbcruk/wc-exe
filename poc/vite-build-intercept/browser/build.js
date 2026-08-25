@@ -427,9 +427,12 @@ function vfsPlugin(collectedCss, preload) {
 // volume the wasi binding preopens at `/`, and lets **rolldown's own resolver**
 // answer that question, exactly as it would against a real disk.
 //
-// The trade is laziness: the bundler's fs calls are synchronous, so nothing can
-// be fetched on demand and the whole tree has to be resident before the build
-// starts. That cost is measured, not assumed — see README.
+// This mode has two ways to fill that volume. `populateVolumeLazy` is the
+// default and the one to read first; `populateVolume` below is the eager
+// alternative it replaced, kept so the difference stays A/B-able. The eager one
+// exists because "the bundler's fs calls are synchronous, so nothing can be
+// fetched on demand" looked like a hard constraint. It is not — see
+// installFaultIn.
 
 /** Where the project is mounted inside the volume. */
 const MEMFS_ROOT = '/project'
@@ -449,9 +452,9 @@ function joinAbs(baseDir, rel) {
  * Fill the volume from `/api/bulk`, which streams every project and dependency
  * file in one response.
  *
- * One request rather than one per file because this mode cannot be lazy: a
- * React app's node_modules is ~2,150 files, and paying a round trip for each
- * would swamp the build it is meant to serve. The framing is
+ * Eager alternative to the lazy fill, kept for A/B (`--eager`). One request
+ * rather than one per file, because if the whole tree has to arrive then paying
+ * a round trip per file would swamp the build it is meant to serve. The framing is
  * `u32 pathLen | path | u32 bodyLen | body`, repeated — binary so files that
  * are not UTF-8 (fonts, wasm, images inside packages) survive the trip.
  */
@@ -499,6 +502,119 @@ async function populateVolume(volume) {
     bytes,
     fetchMs,
     writeMs: Math.round(performance.now() - tWrite),
+  }
+}
+
+/**
+ * Fill the volume lazily instead: directories and a path manifest up front,
+ * file contents only when the bundler actually opens one.
+ *
+ * The eager mode above exists because "the bundler's fs calls are synchronous,
+ * so nothing can be fetched on demand" — which is true of `fetch`, and not true
+ * of the page. A **synchronous XMLHttpRequest** still works, and the reason it
+ * is a bad idea in a web app (it blocks the main thread) does not apply to a
+ * headless build runner with no UI to block. Measured: 3 ms for a local
+ * request, under COOP/COEP.
+ *
+ * Where to hook was decided by instrumenting rolldown rather than guessing. It
+ * never calls `readFileSync`; it goes through the descriptor API —
+ * `lstatSync`, `openSync`, `readSync`, `fstatSync`, `closeSync`,
+ * `realpathSync` — against the page's own `memfs.fs` object. Both the page's
+ * WASI and the wasi worker's fs-proxy land on that same object, so patching its
+ * methods covers both.
+ *
+ * The fault-in triggers on ENOENT and never fabricates content: a path either
+ * gets its real bytes or the original error. Directories are pre-created from
+ * the manifest, because a missing directory has to report ENOENT truthfully for
+ * resolution to work — only files are deferred.
+ */
+function installFaultIn(volume, fsObject, knownFiles, stats) {
+  const load = (abs) => {
+    if (typeof abs !== 'string' || !abs.startsWith(`${MEMFS_ROOT}/`))
+      return false
+    const rel = abs.slice(MEMFS_ROOT.length + 1)
+    if (!knownFiles.has(rel) || stats.loaded.has(rel)) return false
+
+    const t0 = performance.now()
+    const req = new XMLHttpRequest()
+    req.open('GET', `/api/files/raw?path=${encodeURIComponent(rel)}`, false)
+    // `responseType = 'arraybuffer'` is illegal on a synchronous main-thread
+    // XHR. This is the standard way out: the charset makes every byte survive
+    // as a code unit, and the low byte is the byte.
+    req.overrideMimeType('text/plain; charset=x-user-defined')
+    req.send(null)
+    if (req.status !== 200) return false
+
+    const text = req.responseText
+    const bytes = new Uint8Array(text.length)
+    for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i) & 0xff
+    volume.writeFileSync(abs, bytes)
+
+    stats.loaded.add(rel)
+    stats.files++
+    stats.bytes += bytes.length
+    stats.ms += performance.now() - t0
+    return true
+  }
+
+  for (const name of ['lstatSync', 'statSync', 'openSync', 'realpathSync']) {
+    const original = fsObject[name]
+    if (typeof original !== 'function') continue
+    fsObject[name] = function (target, ...rest) {
+      try {
+        return original.call(this, target, ...rest)
+      } catch (err) {
+        if (err?.code !== 'ENOENT' || !load(target)) throw err
+        return original.call(this, target, ...rest)
+      }
+    }
+  }
+}
+
+/**
+ * Manifest + directories only. Source files are loaded eagerly (there are few
+ * and the graph reaches all of them); dependency contents wait for a read.
+ */
+async function populateVolumeLazy(volume) {
+  const t0 = performance.now()
+  const [srcRes, depRes] = await Promise.all([
+    fetch('/api/files'),
+    fetch('/api/dep-files'),
+  ])
+  if (!srcRes.ok) throw new Error(`manifest failed: ${srcRes.status}`)
+  if (!depRes.ok) throw new Error(`dep manifest failed: ${depRes.status}`)
+  const sourcePaths = await srcRes.json()
+  const depPaths = await depRes.json()
+
+  const known = new Set([...sourcePaths, ...depPaths])
+  const dirs = new Set()
+  for (const rel of known) {
+    const full = `${MEMFS_ROOT}/${rel}`
+    dirs.add(full.slice(0, full.lastIndexOf('/')))
+  }
+  for (const dir of dirs) volume.mkdirSync(dir, { recursive: true })
+
+  const stats = { files: 0, bytes: 0, ms: 0, loaded: new Set() }
+  installFaultIn(volume, rolldownModule.memfs.fs, known, stats)
+
+  // Sources eagerly, in parallel — the fault-in path is serial by construction.
+  await Promise.all(
+    sourcePaths.map(async (rel) => {
+      const res = await fetch(`/api/files/raw?path=${encodeURIComponent(rel)}`)
+      if (!res.ok) throw new Error(`file failed: ${rel} ${res.status}`)
+      const bytes = new Uint8Array(await res.arrayBuffer())
+      volume.writeFileSync(`${MEMFS_ROOT}/${rel}`, bytes)
+      stats.loaded.add(rel)
+      stats.files++
+      stats.bytes += bytes.length
+    })
+  )
+
+  return {
+    stats,
+    manifestMs: Math.round(performance.now() - t0),
+    knownPaths: known.size,
+    sourceCount: sourcePaths.length,
   }
 }
 
@@ -567,7 +683,7 @@ function rewriteHtml(html, jsFile, cssFile) {
 // Build
 // ---------------------------------------------------------------------------
 
-async function runBuild(cssMinify, preload, vfsMode) {
+async function runBuild(cssMinify, preload, vfsMode, lazy) {
   const timings = {}
   const t0 = performance.now()
 
@@ -585,7 +701,16 @@ async function runBuild(cssMinify, preload, vfsMode) {
   let populated = null
   let html
 
-  if (memfsMode) {
+  if (memfsMode && lazy) {
+    const lazyInfo = await populateVolumeLazy(volume)
+    populated = lazyInfo.stats
+    sourceCount = lazyInfo.sourceCount
+    html = volume.readFileSync(`${MEMFS_ROOT}/index.html`, 'utf8')
+    log(
+      `volume: ${lazyInfo.knownPaths} paths known, ` +
+        `${lazyInfo.sourceCount} source files loaded up front`
+    )
+  } else if (memfsMode) {
     populated = await populateVolume(volume)
     html = volume.readFileSync(`${MEMFS_ROOT}/index.html`, 'utf8')
     timings.volumeFetchMs = populated.fetchMs
@@ -649,6 +774,17 @@ async function runBuild(cssMinify, preload, vfsMode) {
     cssSource = lightningcss ? minifyCssWithLightning(cssJoined) : cssJoined
   }
   timings.bundleMs = Math.round(performance.now() - tBuild)
+
+  if (memfsMode && lazy) {
+    // Only knowable now: the manifest said what exists, the graph said what
+    // mattered. That gap is the whole argument for this mode.
+    timings.faultInMs = Math.round(populated.ms)
+    log(
+      `faulted in ${populated.files} files, ` +
+        `${(populated.bytes / 1048576).toFixed(1)} MB ` +
+        `(${timings.faultInMs}ms of blocking XHR)`
+    )
+  }
 
   // Collect emitted files. CSS is appended by hand (rather than emitFile) so
   // the hashing stays visible and independent of the bundler's asset pipeline.
@@ -747,6 +883,8 @@ async function runBuild(cssMinify, preload, vfsMode) {
       : [...vfs.keys()].filter((k) => k.startsWith('node_modules/')).length,
     volumeFiles: populated?.files ?? null,
     volumeBytes: populated?.bytes ?? null,
+    // Lazy mode: how much of the manifest the graph actually touched.
+    faultedInFiles: populated?.loaded ? populated.files : null,
     timings,
     outputs: files.map((f) => ({ path: f.path, bytes: f.text.length })),
   }
@@ -767,9 +905,11 @@ window.__pocBuild = async (options = {}) => {
   const cssMinify = options.cssMinify !== false
   const preload = options.preload !== false
   const vfsMode = options.vfs === 'memfs' ? 'memfs' : 'plugin'
+  // Lazy unless the host asked for the eager fill.
+  const lazy = options.lazy !== false
   try {
-    const result = await runBuild(cssMinify, preload, vfsMode)
-    result.vfs = vfsMode
+    const result = await runBuild(cssMinify, preload, vfsMode, lazy)
+    result.vfs = vfsMode + (vfsMode === 'memfs' && !lazy ? '+eager' : '')
     log('DONE', JSON.stringify(result.timings))
     return result
   } catch (err) {
