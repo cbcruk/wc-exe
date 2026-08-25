@@ -119,6 +119,94 @@ Drives the real CLI end to end and compares cold / one-shot `--cache` warm /
 daemon warm, then reports the per-build saving and how many builds the daemon's
 first run takes to pay back. If the daemon is not faster, it says so.
 
+## 4. What an interception build needs out of `npm install` (`bench/install-shape.mjs`)
+
+`docs/virtual-filesystem.md` open item 8. The interception PoC does not install
+anything — it reads `node_modules` off disk — so it does not yet address the
+problem wc-exe exists for. Closing that means the host fetching tarballs and
+unpacking them into the browser's volume, and §9's stated blocker is **lifecycle
+scripts**, which need a process a virtual filesystem cannot provide.
+
+That blocker is the right answer to "reproduce `npm install` faithfully" and
+possibly the wrong one to "produce the module graph an interception build
+needs". This harness measures the difference:
+
+```bash
+node bench/install-shape.mjs <projectDir> [more...]   # needs node_modules present
+node bench/install-shape.mjs --json <projectDir>
+```
+
+It counts only the scripts npm runs when installing a **published** package —
+`preinstall`, `install`, `postinstall`, plus the implicit `node-gyp rebuild` a
+`binding.gyp` triggers. `prepare` and `prepublish` are excluded on purpose: they
+do not run for a registry tarball, and counting them is what made this fixture
+look like it had "3 hooks" when it had one.
+
+### Measured: 10 projects, zero hooks that matter
+
+Nine scaffolded with `npm create vite@latest` (vite 8.2.2) plus the repo's own
+vite-5 fixture. `react-app` and `vue-app` add realistic runtime dependencies
+(react-router/axios/zod/date-fns/react-query/recharts; pinia/vue-router/
+element-plus/axios).
+
+| project          | pkgs | closure | hooks | in closure | node_modules | closure | sendable |
+| ---------------- | ---- | ------- | ----- | ---------- | ------------ | ------- | -------- |
+| vanilla-ts       | 16   | 0       | 0     | 0          | 53.0 MB      | 0.0 MB  | 0.0 MB   |
+| react-ts         | 27   | 3       | 0     | 0          | 80.2 MB      | 7.2 MB  | 7.2 MB   |
+| vue-ts           | 48   | 23      | 0     | 0          | 72.4 MB      | 16.1 MB | 10.4 MB  |
+| svelte-ts        | 50   | 0       | 0     | 0          | 66.2 MB      | 0.0 MB  | 0.0 MB   |
+| preact-ts        | 89   | 1       | 0     | 0          | 70.3 MB      | 1.5 MB  | 0.3 MB   |
+| lit-ts           | 22   | 6       | 0     | 0          | 55.8 MB      | 2.8 MB  | 0.7 MB   |
+| solid-ts         | 77   | 4       | 0     | 0          | 71.5 MB      | 3.4 MB  | 1.2 MB   |
+| react-app        | 112  | 76      | 0     | 0          | 129.5 MB     | 53.5 MB | 33.6 MB  |
+| vue-app          | 135  | 118     | 0     | 0          | 135.2 MB     | 79.2 MB | 38.4 MB  |
+| sample-react-app | 67   | 5       | 1     | 0          | 44.4 MB      | 4.7 MB  | 4.7 MB   |
+
+`closure` is the runtime dependency closure — the root's `dependencies` and
+`optionalDependencies`, transitively, with devDependencies skipped because an
+interception build never runs the project's vite. `sendable` applies the same
+filter `/api/bulk` uses, so it is what would actually go on the wire.
+
+**Zero lifecycle scripts in any runtime closure, across all ten.** The single
+hook found anywhere is `esbuild`'s `postinstall`, in the one vite-5 project, and
+it is a devDependency fetching a native binary this pipeline never loads.
+
+**The vite 8 projects have no install hooks at all.** Their native binaries —
+`@rolldown/binding-*`, `lightningcss-linux-*`, `@oxlint/*` — arrive as
+platform-specific `optionalDependencies` rather than a `postinstall` download.
+That shift is why the wall is lower than §9 assumed when it was written.
+
+### But the cost moved rather than vanished
+
+The template projects have tiny closures (0–23 packages, ≤16 MB of a 53–80 MB
+`node_modules`). Realistic apps invert that: what you `npm install` yourself is
+runtime, so `vue-app`'s closure is 118 of 135 packages and 79.2 MB, filtering to
+**38.4 MB**.
+
+That number lands on the mode that has to move it eagerly. `--vfs=memfs` cannot
+fetch lazily, and 15.2 MB already costs ~280 ms of the React build; 38 MB is
+2.5× that. So install-free interception looks **feasible on correctness** and
+moves the problem to **transfer volume** — the same wall `--vfs=memfs` already
+hit, larger.
+
+One shape does not have that problem: caching **tarballs**, not extracted trees.
+The repo's cacache already does this (§5), and it is the right shape here for
+the reason wc-exe exists — antivirus cost is per file, and 40 MB of tarballs is
+a few hundred files where the extracted tree is 13,340.
+
+### What this does not measure
+
+- **Ten projects, seven of them scaffolds.** Neither `sharp`-style native
+  addons nor monorepos/workspaces appear. Zero hooks here is evidence, not a
+  proof.
+- **`vanilla-ts` and `svelte-ts` report a closure of 0**, which is literally
+  correct and quietly misleading: Svelte's compiler is a devDependency, so a
+  build that actually handled `.svelte` files would need more than the runtime
+  closure. Read the numbers as _what the PoC as it stands would need_.
+- Nothing about whether a host-built tree matches npm's — peer deps,
+  `overrides`, platform/optional deps, workspaces. §9's warning stands: that is
+  where the cost of this direction actually lives.
+
 ## Every harness checks that the build produced something
 
 This is not belt and braces. `npm run build` **exits 0 when its build tool
