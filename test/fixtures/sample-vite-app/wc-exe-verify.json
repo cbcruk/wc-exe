@@ -1,0 +1,12 @@
+{
+  "_": "Assertions only this project can make. The harness's generic checks run either way; see verify() in poc/vite-build-intercept/run.mjs.",
+  "cssMarker": "#213547",
+  "jsMarker": "count is",
+  "renderedText": "Sample Vite App",
+  "fontFamily": "Inter|system-ui",
+  "counter": {
+    "selector": "#counter",
+    "before": "count is 0",
+    "after": "count is 1"
+  }
+}

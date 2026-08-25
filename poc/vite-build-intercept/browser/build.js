@@ -824,11 +824,36 @@ function findHtmlEntry(html) {
   return vfsKey(m[1])
 }
 
+/**
+ * Stylesheets linked from the HTML rather than imported from a module.
+ *
+ * vite bundles those into the same CSS asset as the imported ones; this
+ * pipeline only ever collected what the module graph reached, so a project
+ * doing it this way shipped an HTML that still pointed at `./src/index.css` —
+ * a 404 in the built output. The lit template does exactly that, and it is what
+ * running the harness against outside projects turned up first.
+ *
+ * Returns project-relative paths; `data:` and absolute URLs are left alone.
+ */
+function htmlStylesheetLinks(html) {
+  const out = []
+  for (const m of html.matchAll(/<link[^>]+rel=["']stylesheet["'][^>]*>/gi)) {
+    const href = m[0].match(/href=["']([^"']+)["']/i)?.[1]
+    if (!href || /^(?:[a-z]+:|\/\/)/i.test(href)) continue
+    out.push(vfsKey(href))
+  }
+  return out
+}
+
 function rewriteHtml(html, jsFile, cssFile) {
   let out = html.replace(
     /<script[^>]*type=["']module["'][^>]*src=["'][^"']+["'][^>]*><\/script>/i,
     `<script type="module" crossorigin src="/${jsFile}"></script>`
   )
+  // Drop the source stylesheet links; their contents are in the emitted asset
+  // now, and leaving them would point the built page at files that are not
+  // there.
+  out = out.replace(/<link[^>]+rel=["']stylesheet["'][^>]*>\s*/gi, '')
   if (cssFile) {
     out = out.replace(
       /<\/head>/i,
@@ -889,6 +914,22 @@ async function runBuild(cssMinify, preload, vfsMode, lazy) {
   const entry = findHtmlEntry(html)
   log(`entry from index.html: ${entry}`)
 
+  // Stylesheets the HTML links directly never enter the module graph, so
+  // collect them before the build rather than during it.
+  const htmlCss = []
+  if (memfsMode) {
+    const vfsFs = rolldownModule.memfs.fs
+    for (const rel of htmlStylesheetLinks(html)) {
+      try {
+        htmlCss.push(
+          `/* ${rel} */\n${vfsFs.readFileSync(`${MEMFS_ROOT}/${rel}`, 'utf8')}`
+        )
+      } catch {
+        log(`html stylesheet not found, skipped: ${rel}`)
+      }
+    }
+  }
+
   // --- the measured burst: bundle + generate -------------------------------
   const tBuild = performance.now()
   const css = []
@@ -928,7 +969,7 @@ async function runBuild(cssMinify, preload, vfsMode, lazy) {
 
   // Read the collected CSS only now: rolldown defers module loading until
   // generate(), so reading any earlier silently produces no stylesheet.
-  const cssJoined = css.join('\n')
+  const cssJoined = [...htmlCss, ...css].join('\n')
   let cssSource = ''
   if (cssJoined.trim()) {
     cssSource = lightningcss ? minifyCssWithLightning(cssJoined) : cssJoined

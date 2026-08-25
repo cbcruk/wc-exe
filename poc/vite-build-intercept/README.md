@@ -520,7 +520,7 @@ matter" being a guess.
 The trade above is only worth taking if the hand-written resolver actually gets
 things wrong. `test/fixtures/sample-exports-app` settles that. It ships four
 tiny local packages, each with a **`node` file and a `browser` file carrying
-different markers**, and `resolution-expectations.json` names which marker must
+different markers**, and `wc-exe-verify.json` names which marker must
 appear in the bundle and which must not. Picking the wrong file is otherwise a
 _silent success_ — the build works, it just ships the wrong source.
 
@@ -654,6 +654,72 @@ strings.
 Still not implemented, and untested: **CSS `url()` references** (the fixture's
 stylesheet has none), vite's `?url` / `?raw` / `?inline` query suffixes (stripped
 and ignored), and `new URL('./x.png', import.meta.url)`.
+
+## Verifying projects that are not fixtures
+
+The checks used to hardcode this repo's fixtures: `#213547` from their
+stylesheet, `count is` from their counter, `Sample … App` from their heading.
+That was fine while a fixture was the only thing that built. Once a stock
+`npm create vite` template built, those strings turned every outside project
+into three false failures and buried whatever had actually gone wrong.
+
+So they split in two.
+
+**Generic, always run.** These hold for any project:
+
+- the HTML references a built JS asset, and a CSS one if the build emitted CSS,
+  and both exist on disk
+- no TypeScript or JSX syntax survived into the JS
+- **the emitted stylesheet is not inside the JS** — a 40-character slice from
+  the middle of the CSS asset must not appear in the bundle. That is the
+  content-free version of the old `#213547` check, and it works on any project's
+  stylesheet
+- every `/assets/*.{png,svg,…}` URL in the bundle exists on disk
+- at runtime: no page errors, no failed requests, **something rendered** into
+  the mount node (a build whose entry never ran leaves the empty div the HTML
+  shipped), the referenced stylesheet contributed at least one parsed rule, and
+  every `<img>` reached `naturalWidth > 0`
+
+**Opt-in, from `wc-exe-verify.json` at the project root.** Anything that needs
+to know what the app says: `cssMarker`, `jsMarker`, `lazyMarker`,
+`renderedText`, `fontFamily`, `counter`, `lazy`, and the `mustContain` /
+`mustNotContain` pair that `sample-exports-app` uses for resolution. A project
+without the file gets the generic set and no false failures.
+
+### First measurement of "an arbitrary project"
+
+Seven `npm create vite@latest` templates, none of them carrying an expectations
+file:
+
+| template   | build | verify | what stops it                                                          |
+| ---------- | ----- | ------ | ---------------------------------------------------------------------- |
+| vanilla-ts | ✅    | ✅     | —                                                                      |
+| react-ts   | ✅    | ✅     | —                                                                      |
+| preact-ts  | ✅    | ✅     | —                                                                      |
+| lit-ts     | ✅    | ✅     | —                                                                      |
+| vue-ts     | ❌    | —      | `.vue` needs the Vue compiler                                          |
+| svelte-ts  | ❌    | —      | `.svelte` needs the Svelte compiler                                    |
+| solid-ts   | ✅    | ❌     | Solid's JSX transform — builds, then `Unexpected token '<'` at runtime |
+
+**Four of seven, and all three failures are the same root cause**: a framework
+plugin this pipeline does not run. That is open item 2 exactly, now with a
+number against it instead of a prediction. The solid-ts row is the instructive
+one — it builds cleanly and breaks in the browser, which is why the runtime
+check is not optional.
+
+### Two harness bugs the sweep found immediately
+
+1. **SVG served as `application/octet-stream`.** The runtime server typed only
+   `.html`, `.js` and `.css`. A browser will sniff a PNG out of a wrong type and
+   render it; it deliberately will not do that for SVG. Three "image did not
+   load" failures were the harness, not the build.
+2. **Stylesheets linked from the HTML were dropped.** Only CSS reached through
+   the module graph was collected, so the lit template — which writes
+   `<link rel="stylesheet" href="./src/index.css">` — shipped an HTML pointing
+   at a file that was not in `dist/`. Those links are now collected into the
+   emitted asset and the source links removed.
+
+Neither was visible from inside this repo, because no fixture did either thing.
 
 ## lightningcss on the rolldown path: works, but the second wasm is not free
 
