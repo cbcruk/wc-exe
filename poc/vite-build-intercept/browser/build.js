@@ -2,42 +2,46 @@
 //
 // The thesis under test (docs/virtual-filesystem.md §2 layer C, §9): a
 // production bundle can be produced entirely in a browser tab by swapping the
-// native bundler binaries for their browser builds — rollup -> @rollup/browser,
-// esbuild -> esbuild-wasm — and feeding them a virtual filesystem instead of
-// node:fs.
+// native bundler binary for its browser build — rolldown ->
+// @rolldown/browser — and feeding it a virtual filesystem instead of node:fs.
 //
 // This reimplements what `vite build` DOES for a vanilla app (discover the
 // entry from index.html, transform TS, extract CSS, emit hashed assets,
 // rewrite the HTML). It is NOT vite itself running — see README for why that
 // distinction matters and what it does and does not prove.
+//
+// There used to be a second pipeline here (@rollup/browser + esbuild-wasm,
+// matching vite 5–7). It is gone: under interception the *project's* vite
+// version does not choose the bundler — we replace vite's pipeline rather than
+// run it — so one bundler suffices, and rolldown is the one that handles CJS
+// and can be handed a filesystem of its own. See README for the full
+// accounting.
 
-// Bundlers are imported dynamically so only the selected one is fetched:
-//   rollup   = vite 5's pipeline  (@rollup/browser + esbuild-wasm)
-//   rolldown = vite 8's pipeline  (@rolldown/browser alone — it transforms TS
-//              and minifies itself via oxc, so esbuild is not needed)
-let esbuild = null
 let lightningcss = null
+/**
+ * The loaded rolldown module. Kept because `--vfs=memfs` needs more than the
+ * `rolldown` function off it: the prebundle re-exports the wasi binding's
+ * memfs volume, and that volume IS the filesystem rolldown's native resolver
+ * walks (see scripts/prebundle-rolldown.mjs).
+ */
+let rolldownModule = null
 
-async function loadBundler(kind, cssMinify) {
-  if (kind === 'rolldown') {
-    const m = await import('/vendor/rolldown/rolldown.js')
-    if (cssMinify) {
-      // Warm lightningcss here, not at first use: its wasm init is ~0.6s and
-      // would otherwise land inside the measured bundle burst.
-      lightningcss = await import('/vendor/lightningcss/index.mjs')
-      await lightningcss.default('/vendor/lightningcss/lightningcss_node.wasm')
-    }
-    return m.rolldown
+async function loadBundler(cssMinify) {
+  const m = await import('/vendor/rolldown/rolldown.js')
+  rolldownModule = m
+  if (cssMinify) {
+    // Warm lightningcss here, not at first use: its wasm init is ~0.6s and
+    // would otherwise land inside the measured bundle burst.
+    lightningcss = await import('/vendor/lightningcss/index.mjs')
+    await lightningcss.default('/vendor/lightningcss/lightningcss_node.wasm')
   }
-  const m = await import('/vendor/rollup/rollup.browser.js')
-  esbuild = await import('/vendor/esbuild/esm/browser.min.js')
-  return m.rollup
+  return m.rolldown
 }
 
 /**
  * Minify CSS with lightningcss-wasm — the tool vite 8 uses (its deps are
- * rolldown, lightningcss and postcss). Only the rolldown path loads it; the
- * rollup path minifies CSS with esbuild, matching vite 5.
+ * rolldown, lightningcss and postcss), so this matches the toolchain the
+ * intercepted bundler comes from.
  *
  * The module is initialized during toolchain setup (see loadBundler). Its wasm
  * resolves relative to the module URL, so serving the package directory is
@@ -51,11 +55,6 @@ function minifyCssWithLightning(cssText) {
   })
   return new TextDecoder().decode(code)
 }
-
-// Placeholder written by renderDynamicImport and replaced in generateBundle,
-// once final chunk filenames are known. This is the same two-phase trick vite
-// uses (its marker is __VITE_PRELOAD__).
-const PRELOAD_MARKER = '__WC_PRELOAD_DEPS__'
 
 /**
  * Runtime helper injected into the entry chunk — our equivalent of vite's
@@ -300,15 +299,65 @@ async function resolveBare(source) {
 }
 
 // ---------------------------------------------------------------------------
-// The vite-like rollup plugin: VFS + esbuild-wasm transforms + CSS extraction
+// Preload hooks — shared by both VFS modes
 // ---------------------------------------------------------------------------
 
-function vfsPlugin(collectedCss, kind, preload) {
-  // rolldown transforms TypeScript and minifies itself (oxc); with it we only
-  // supply the VFS and the CSS extraction. With rollup we must also drive
-  // esbuild-wasm for both jobs.
-  const needsEsbuild = kind !== 'rolldown'
+/**
+ * The `__wcPreload` wiring, as plugin hooks. Extracted because it is identical
+ * whether the VFS reaches the bundler through plugin hooks or through
+ * rolldown's own filesystem (see `--vfs=memfs`): it operates on the emitted
+ * bundle, long after module contents stopped mattering.
+ */
+function preloadHooks(preload) {
+  return {
+    // rolldown never calls `renderDynamicImport` — vite's own two-phase trick
+    // (emit a marker, resolve it once filenames are final) is unavailable, so
+    // the wrapping happens here instead, rewriting the already-emitted
+    // `import("./chunk.js")` calls. Filenames are final at this point, which is
+    // also what makes the rehash below necessary.
+    generateBundle(_options, bundle) {
+      if (!preload) return
+      const entry = Object.values(bundle).find(
+        (c) => c.type === 'chunk' && c.isEntry
+      )
+      const entryLoads = new Set(entry?.imports ?? [])
 
+      for (const chunk of Object.values(bundle)) {
+        if (chunk.type !== 'chunk') continue
+
+        // oxc (rolldown's minifier) emits string literals as backtick
+        // templates, hence the quote class.
+        if (!chunk.dynamicImports?.length) continue
+        let rewrote = false
+        chunk.code = chunk.code.replace(
+          /import\(\s*(["'`])(\.\/[^"'`]+\.js)\1\s*\)/g,
+          (whole, _quote, spec) => {
+            const target = chunk.dynamicImports.find(
+              (t) => t.split('/').pop() === spec.split('/').pop()
+            )
+            if (!target) return whole
+            const deps = chunkPreloadDeps(bundle, target, entryLoads)
+            if (deps.length === 0) return whole
+            rewrote = true
+            return `__wcPreload(() => ${whole}, ${JSON.stringify(deps)})`
+          }
+        )
+        if (rewrote) chunk.code = PRELOAD_HELPER + chunk.code
+      }
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// VFS mode A: feed the bundler through plugin hooks, with our own resolver
+// ---------------------------------------------------------------------------
+//
+// rolldown transforms TypeScript and minifies itself (oxc), so this supplies
+// only the VFS and the CSS extraction — plus the module resolution, which is
+// the part `--vfs=memfs` exists to hand back (and which `sample-exports-app`
+// shows this mode gets wrong on `browser` and `imports` fields).
+
+function vfsPlugin(collectedCss, preload) {
   return {
     name: 'wc-exe-vfs',
 
@@ -352,112 +401,139 @@ function vfsPlugin(collectedCss, kind, preload) {
       return loadFile(id)
     },
 
-    async transform(code, id) {
+    transform(code) {
       // Dependencies branch on process.env.NODE_ENV (React picks its dev vs
       // production build that way). Nothing defines `process` in a browser, so
-      // substitute it the way vite's `define` does.
-      let source = code
-      if (source.includes('process.env.NODE_ENV')) {
-        source = source.replace(/process\.env\.NODE_ENV/g, '"production"')
-      }
-
-      if (!needsEsbuild)
-        return source === code ? null : { code: source, map: null }
-
-      const loader = id.match(/\.tsx$/)
-        ? 'tsx'
-        : id.match(/\.ts$|\.mts$/)
-          ? 'ts'
-          : id.match(/\.jsx$/)
-            ? 'jsx'
-            : null
-      if (!loader) return source === code ? null : { code: source, map: null }
-
-      // The interception that matters: the project's TypeScript/JSX is
-      // transformed by esbuild-wasm, never by a native esbuild binary.
-      const out = await esbuild.transform(source, {
-        loader,
-        target: 'es2020',
-        sourcefile: id,
-        jsx: 'automatic',
-      })
-      return { code: out.code, map: null }
-    },
-
-    // Wrap every dynamic import so the target chunk's own dependencies can be
-    // preloaded alongside it. The dep list is not known yet — filenames are
-    // assigned after rendering — so a marker goes in and generateBundle
-    // resolves it.
-    renderDynamicImport() {
-      if (!preload) return null
+      // substitute it the way vite's `define` does. The memfs mode uses
+      // rolldown's `define` option for the same job.
+      if (!code.includes('process.env.NODE_ENV')) return null
       return {
-        left: '__wcPreload(() => import(',
-        right: `), ${PRELOAD_MARKER})`,
+        code: code.replace(/process\.env\.NODE_ENV/g, '"production"'),
+        map: null,
       }
     },
 
-    // Final filenames exist here, so resolve the markers and inject the helper.
-    generateBundle(_options, bundle) {
-      if (!preload) return
-      const entry = Object.values(bundle).find(
-        (c) => c.type === 'chunk' && c.isEntry
+    ...preloadHooks(preload),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// VFS mode B: hand the files to rolldown's own filesystem (`--vfs=memfs`)
+// ---------------------------------------------------------------------------
+//
+// The other mode feeds the bundler through `resolveId`/`load` and therefore has
+// to answer "where does `react-dom/client` live?" itself — the conditional
+// `exports` walker above. This mode instead writes the project into the memfs
+// volume the wasi binding preopens at `/`, and lets **rolldown's own resolver**
+// answer that question, exactly as it would against a real disk.
+//
+// The trade is laziness: the bundler's fs calls are synchronous, so nothing can
+// be fetched on demand and the whole tree has to be resident before the build
+// starts. That cost is measured, not assumed — see README.
+
+/** Where the project is mounted inside the volume. */
+const MEMFS_ROOT = '/project'
+
+/** Join `rel` onto an absolute directory, resolving `.` and `..`. */
+function joinAbs(baseDir, rel) {
+  const out = []
+  for (const part of baseDir.split('/').concat(rel.split('/'))) {
+    if (!part || part === '.') continue
+    if (part === '..') out.pop()
+    else out.push(part)
+  }
+  return `/${out.join('/')}`
+}
+
+/**
+ * Fill the volume from `/api/bulk`, which streams every project and dependency
+ * file in one response.
+ *
+ * One request rather than one per file because this mode cannot be lazy: a
+ * React app's node_modules is ~2,150 files, and paying a round trip for each
+ * would swamp the build it is meant to serve. The framing is
+ * `u32 pathLen | path | u32 bodyLen | body`, repeated — binary so files that
+ * are not UTF-8 (fonts, wasm, images inside packages) survive the trip.
+ */
+async function populateVolume(volume) {
+  const tFetch = performance.now()
+  const res = await fetch('/api/bulk')
+  if (!res.ok) throw new Error(`bulk fetch failed: ${res.status}`)
+  const buf = new Uint8Array(await res.arrayBuffer())
+  const fetchMs = Math.round(performance.now() - tFetch)
+  const tWrite = performance.now()
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength)
+  const decoder = new TextDecoder()
+  const madeDirs = new Set()
+  let off = 0
+  let files = 0
+  let bytes = 0
+
+  while (off < buf.length) {
+    const pathLen = view.getUint32(off)
+    off += 4
+    const rel = decoder.decode(buf.subarray(off, off + pathLen))
+    off += pathLen
+    const bodyLen = view.getUint32(off)
+    off += 4
+    const body = buf.subarray(off, off + bodyLen)
+    off += bodyLen
+
+    const full = `${MEMFS_ROOT}/${rel}`
+    const dir = full.slice(0, full.lastIndexOf('/'))
+    if (!madeDirs.has(dir)) {
+      volume.mkdirSync(dir, { recursive: true })
+      madeDirs.add(dir)
+    }
+    // slice(): the body is a view into the one big response buffer, and memfs
+    // keeps whatever it is handed — without the copy every file would pin the
+    // entire download.
+    volume.writeFileSync(full, body.slice())
+    files++
+    bytes += bodyLen
+  }
+  // Split because the two halves have different fixes: transfer responds to
+  // compression, memfs writes do not.
+  return {
+    files,
+    bytes,
+    fetchMs,
+    writeMs: Math.round(performance.now() - tWrite),
+  }
+}
+
+/**
+ * The only plugin this mode needs.
+ *
+ * rolldown refuses CSS input outright ("Bundling CSS is no longer supported"),
+ * so stylesheets still have to be routed through a virtual module id — the same
+ * dodge the other mode uses, and the same reason the id must not end in `.css`.
+ * Everything else — resolution, TS, CJS interop, `exports` maps — is rolldown's
+ * job here, which is the whole point of the mode.
+ */
+function memfsPlugin(collectedCss, volume, preload) {
+  return {
+    name: 'wc-exe-memfs-css',
+
+    resolveId(source, importer) {
+      if (!source.endsWith('.css')) return null
+      const abs = source.startsWith('/')
+        ? source
+        : joinAbs(dirnameOf(importer ?? `${MEMFS_ROOT}/index.html`), source)
+      return CSS_VIRTUAL_PREFIX + abs + CSS_VIRTUAL_SUFFIX
+    },
+
+    load(id) {
+      if (!id.startsWith(CSS_VIRTUAL_PREFIX)) return null
+      const key = id.slice(
+        CSS_VIRTUAL_PREFIX.length,
+        id.length - CSS_VIRTUAL_SUFFIX.length
       )
-      const entryLoads = new Set(entry?.imports ?? [])
-
-      for (const chunk of Object.values(bundle)) {
-        if (chunk.type !== 'chunk') continue
-
-        if (chunk.code.includes(PRELOAD_MARKER)) {
-          // rollup path: renderDynamicImport already wrapped the imports, so
-          // only the dep lists are outstanding. Targets appear in source order,
-          // matching marker order, so consume them in step.
-          const targets = [...chunk.dynamicImports]
-          chunk.code = chunk.code.replaceAll(PRELOAD_MARKER, () => {
-            const target = targets.shift()
-            const deps = target
-              ? chunkPreloadDeps(bundle, target, entryLoads)
-              : []
-            return JSON.stringify(deps)
-          })
-          chunk.code = PRELOAD_HELPER + chunk.code
-          continue
-        }
-
-        // rolldown path: it does not call renderDynamicImport, so nothing was
-        // wrapped. Rewrite the emitted `import("./chunk.js")` calls here
-        // instead — the filenames are final at this point. oxc emits string
-        // literals as backtick templates, hence the quote class.
-        if (!chunk.dynamicImports?.length) continue
-        let rewrote = false
-        chunk.code = chunk.code.replace(
-          /import\(\s*(["'`])(\.\/[^"'`]+\.js)\1\s*\)/g,
-          (whole, _quote, spec) => {
-            const target = chunk.dynamicImports.find(
-              (t) => t.split('/').pop() === spec.split('/').pop()
-            )
-            if (!target) return whole
-            const deps = chunkPreloadDeps(bundle, target, entryLoads)
-            if (deps.length === 0) return whole
-            rewrote = true
-            return `__wcPreload(() => ${whole}, ${JSON.stringify(deps)})`
-          }
-        )
-        if (rewrote) chunk.code = PRELOAD_HELPER + chunk.code
-      }
+      collectedCss.push(`/* ${key} */\n${volume.readFileSync(key, 'utf8')}`)
+      return 'export default ""'
     },
 
-    // Minify inside the rollup pipeline, which is where vite does it too (its
-    // esbuild minifier runs as a renderChunk hook). Doing it here rather than
-    // after generate() matters: rollup then hashes the *minified* output, so
-    // asset filenames match what a real build would produce.
-    async renderChunk(code) {
-      if (!needsEsbuild) return null // rolldown minifies via its output option
-      const out = await esbuild.transform(code, {
-        minify: true,
-        target: 'es2020',
-      })
-      return { code: out.code, map: null }
-    },
+    ...preloadHooks(preload),
   }
 }
 
@@ -491,22 +567,40 @@ function rewriteHtml(html, jsFile, cssFile) {
 // Build
 // ---------------------------------------------------------------------------
 
-async function runBuild(kind, cssMinify, preload) {
+async function runBuild(cssMinify, preload, vfsMode) {
   const timings = {}
   const t0 = performance.now()
 
-  const bundleWith = await loadBundler(kind, cssMinify)
-  if (esbuild) {
-    await esbuild.initialize({ wasmURL: '/vendor/esbuild/esbuild.wasm' })
-  }
+  const bundleWith = await loadBundler(cssMinify)
   timings.toolInitMs = Math.round(performance.now() - t0)
-  log(`${kind} toolchain ready (${timings.toolInitMs}ms)`)
+  log(`rolldown toolchain ready (${timings.toolInitMs}ms)`)
 
+  const memfsMode = vfsMode === 'memfs'
+  const volume = memfsMode ? rolldownModule.memfs.volume : null
+
+  // --- get the project in front of the bundler ------------------------------
   const tVfs = performance.now()
-  const { sourceCount, depCount } = await loadManifests()
+  let sourceCount = 0
+  let depCount = 0
+  let populated = null
+  let html
+
+  if (memfsMode) {
+    populated = await populateVolume(volume)
+    html = volume.readFileSync(`${MEMFS_ROOT}/index.html`, 'utf8')
+    timings.volumeFetchMs = populated.fetchMs
+    timings.volumeWriteMs = populated.writeMs
+    log(
+      `volume: ${populated.files} files, ` +
+        `${(populated.bytes / 1048576).toFixed(1)} MB ` +
+        `(fetch ${populated.fetchMs}ms + write ${populated.writeMs}ms)`
+    )
+  } else {
+    ;({ sourceCount, depCount } = await loadManifests())
+    html = vfs.get('index.html')
+  }
   timings.manifestMs = Math.round(performance.now() - tVfs)
 
-  const html = vfs.get('index.html')
   if (!html) throw new Error('index.html not found in VFS')
   const entry = findHtmlEntry(html)
   log(`entry from index.html: ${entry}`)
@@ -515,42 +609,49 @@ async function runBuild(kind, cssMinify, preload) {
   const tBuild = performance.now()
   const css = []
   const bundle = await bundleWith({
-    input: entry,
-    plugins: [vfsPlugin(css, kind, preload)],
+    input: memfsMode ? `${MEMFS_ROOT}/${entry}` : entry,
+    plugins: memfsMode
+      ? [memfsPlugin(css, volume, preload)]
+      : [vfsPlugin(css, preload)],
     onwarn: (w) => log('bundler warn:', w.message ?? w),
+    ...(memfsMode
+      ? {
+          cwd: MEMFS_ROOT,
+          // Pick `browser` over `node` in conditional exports — the hand-rolled
+          // resolver's EXPORT_CONDITIONS order, expressed as rolldown's own
+          // option instead of reimplemented.
+          platform: 'browser',
+          // React and friends branch on this to pick their dev vs production
+          // build, and a page has no `process`. The other mode substitutes it
+          // in a transform hook; here it is what vite's `define` does.
+          define: { 'process.env.NODE_ENV': JSON.stringify('production') },
+        }
+      : {}),
   })
 
-  const outputOptions = {
+  const { output } = await bundle.generate({
     format: 'es',
     entryFileNames: 'assets/[name]-[hash].js',
     chunkFileNames: 'assets/[name]-[hash].js',
     assetFileNames: 'assets/[name]-[hash][extname]',
-  }
-  // rolldown minifies through an output option rather than a renderChunk hook.
-  if (kind === 'rolldown') outputOptions.minify = true
-
-  const { output } = await bundle.generate(outputOptions)
+    // rolldown minifies through an output option rather than a renderChunk
+    // hook, so the hash is computed over the minified bytes — which is what a
+    // real build does too.
+    minify: true,
+  })
   await bundle.close()
 
-  // Read the collected CSS only now: rollup populates it during rollup(), but
-  // rolldown defers module loading until generate(), so reading any earlier
-  // silently produces no stylesheet.
+  // Read the collected CSS only now: rolldown defers module loading until
+  // generate(), so reading any earlier silently produces no stylesheet.
   const cssJoined = css.join('\n')
   let cssSource = ''
   if (cssJoined.trim()) {
-    // Each pipeline minifies CSS with the tool its vite era uses: vite 5 →
-    // esbuild, vite 8 → lightningcss.
-    cssSource = esbuild
-      ? (await esbuild.transform(cssJoined, { loader: 'css', minify: true }))
-          .code
-      : lightningcss
-        ? minifyCssWithLightning(cssJoined)
-        : cssJoined
+    cssSource = lightningcss ? minifyCssWithLightning(cssJoined) : cssJoined
   }
   timings.bundleMs = Math.round(performance.now() - tBuild)
 
   // Collect emitted files. CSS is appended by hand (rather than emitFile) so
-  // the hashing stays visible and independent of rollup's asset pipeline.
+  // the hashing stays visible and independent of the bundler's asset pipeline.
   const files = []
   let jsEntryFile = null
   for (const chunk of output) {
@@ -567,16 +668,15 @@ async function runBuild(kind, cssMinify, preload) {
   }
   if (!jsEntryFile) throw new Error('no entry chunk produced')
 
-  // Rehash anything generateBundle rewrote. Both preload paths mutate chunk
-  // code after the bundler has hashed it — the marker replacement and the
-  // helper prepend on rollup, the whole rewrite on rolldown — so without this
-  // a chunk's name no longer identifies its bytes. Concretely, building with
-  // and without preload produced the same filename holding different content,
-  // which is a cache-poisoning bug.
+  // Rehash anything generateBundle rewrote. The preload wiring mutates chunk
+  // code after the bundler has hashed it, so without this a chunk's name no
+  // longer identifies its bytes. Concretely, building with and without preload
+  // produced the same filename holding different content, which is a
+  // cache-poisoning bug.
   //
-  // vite avoids the problem differently, using rollup's hash placeholders so
-  // the final content is hashed in the first place. Renaming afterwards is the
-  // equivalent outcome for a post-processing pipeline like this one.
+  // vite avoids the problem differently, using the bundler's hash placeholders
+  // so the final content is hashed in the first place. Renaming afterwards is
+  // the equivalent outcome for a post-processing pipeline like this one.
   const renamed = new Map()
   for (const f of files) {
     if (!f.path.endsWith('.js')) continue
@@ -639,8 +739,14 @@ async function runBuild(kind, cssMinify, preload) {
     ok: true,
     sourceCount,
     depCount,
-    depFilesRead: [...vfs.keys()].filter((k) => k.startsWith('node_modules/'))
-      .length,
+    // In memfs mode nothing is read lazily, so "how many dependency files did
+    // the graph actually touch" has no answer — the whole tree was resident
+    // before the build began. Report what that cost instead.
+    depFilesRead: memfsMode
+      ? null
+      : [...vfs.keys()].filter((k) => k.startsWith('node_modules/')).length,
+    volumeFiles: populated?.files ?? null,
+    volumeBytes: populated?.bytes ?? null,
     timings,
     outputs: files.map((f) => ({ path: f.path, bytes: f.text.length })),
   }
@@ -658,12 +764,12 @@ async function sha8(text) {
 }
 
 window.__pocBuild = async (options = {}) => {
-  const kind = options.bundler === 'rolldown' ? 'rolldown' : 'rollup'
   const cssMinify = options.cssMinify !== false
   const preload = options.preload !== false
+  const vfsMode = options.vfs === 'memfs' ? 'memfs' : 'plugin'
   try {
-    const result = await runBuild(kind, cssMinify, preload)
-    result.bundler = kind
+    const result = await runBuild(cssMinify, preload, vfsMode)
+    result.vfs = vfsMode
     log('DONE', JSON.stringify(result.timings))
     return result
   } catch (err) {

@@ -4,10 +4,10 @@
 // headless Chromium through the build, writes the produced dist/ to disk, and
 // verifies the output is a real, self-consistent bundle.
 //
-// On the rollup path it needs NO COOP/COEP headers: esbuild-wasm's async API
-// and @rollup/browser both work without SharedArrayBuffer, unlike WebContainer
-// and container2wasm. The rolldown path DOES need them — its wasi binding
-// transfers a SharedArrayBuffer to a worker. Neither path uses a CDN.
+// It needs COOP/COEP headers: @rolldown/browser's wasi binding transfers a
+// SharedArrayBuffer to a worker, so cross-origin isolation is mandatory — the
+// same requirement WebContainer and container2wasm carry. It does NOT use a
+// CDN; the bundler is served out of this package.
 //
 // Usage:
 //   pnpm --dir poc/vite-build-intercept install   # once
@@ -24,6 +24,16 @@ import crypto from 'node:crypto'
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(HERE, '../..')
 
+/**
+ * Skipped when scanning the *project*. `dist` and `coverage` are the project's
+ * own build output, not input.
+ *
+ * Deliberately not reused for node_modules: a dependency's `dist/` is the part
+ * that gets imported. Applying this set there silently dropped every package
+ * that ships from `dist/` — the build then resolved nothing and emitted an
+ * external import, with only a warning to say so. `sample-exports-app` exists
+ * partly because it caught that.
+ */
 const IGNORE = new Set([
   'node_modules',
   '.git',
@@ -32,18 +42,28 @@ const IGNORE = new Set([
   'coverage',
 ])
 
+/** Skipped when scanning node_modules: metadata, never module sources. */
+const DEP_IGNORE = new Set(['.bin', '.cache'])
+
 function parseArgs(argv) {
   const rest = argv.slice(2)
   return {
     project:
       rest.find((a) => !a.startsWith('--')) ?? 'test/fixtures/sample-vite-app',
     keep: rest.includes('--keep'),
-    bundler: rest.includes('--bundler=rolldown') ? 'rolldown' : 'rollup',
-    // Skips lightningcss on the rolldown path. Exists because loading a second
+    // Skips lightningcss. Exists because loading a second
     // wasm module measurably slows the bundle burst — see README.
     cssMinify: !rest.includes('--no-css-minify'),
     // Disables the __vitePreload equivalent, so its effect can be A/B'd.
     preload: !rest.includes('--no-preload'),
+    // How the project reaches the bundler.
+    //   plugin (default) — through resolveId/load, with our own resolver
+    //   memfs            — written into rolldown's own filesystem, so its
+    //                      native resolver does the work
+    vfs: rest.includes('--vfs=memfs') ? 'memfs' : 'plugin',
+    // Ships every node_modules file to the volume, including ones that cannot
+    // be a module. Exists so the filter's effect can be A/B'd.
+    bulkFilter: !rest.includes('--no-bulk-filter'),
     // Artificial per-chunk latency when serving the built app for the runtime
     // check. Makes a request waterfall visible; 0 keeps normal runs fast.
     chunkDelayMs: Number(
@@ -52,16 +72,15 @@ function parseArgs(argv) {
   }
 }
 
-async function listFiles(root, base = '', extraIgnore = null) {
+async function listFiles(root, base = '', ignore = IGNORE) {
   const entries = await fs.readdir(path.join(root, base), {
     withFileTypes: true,
   })
   const out = []
   for (const e of entries) {
-    if (IGNORE.has(e.name)) continue
-    if (extraIgnore?.has(e.name)) continue
+    if (ignore.has(e.name)) continue
     const rel = base ? `${base}/${e.name}` : e.name
-    if (e.isDirectory()) out.push(...(await listFiles(root, rel, extraIgnore)))
+    if (e.isDirectory()) out.push(...(await listFiles(root, rel, ignore)))
     else if (e.isFile()) out.push(rel)
   }
   return out
@@ -104,19 +123,65 @@ async function findChrome() {
   throw new Error('Chrome not found — set CHROME_PATH')
 }
 
-function createApp({ projectDir, outDir, vendor, needsCoi }) {
+/**
+ * Extensions that cannot be a JavaScript module, and so are never worth sending
+ * to the volume in `--vfs=memfs`.
+ *
+ * This is a content filter, not a resolver: it decides nothing about *where* a
+ * specifier points, which is the job memfs mode exists to hand back to
+ * rolldown. Dropping it (`--no-bulk-filter`) only makes the transfer bigger.
+ */
+const UNIMPORTABLE_EXTENSIONS = new Set([
+  '.map',
+  '.md',
+  '.markdown',
+  '.flow',
+  // a native addon; the browser build could never load one
+  '.node',
+])
+
+/** Whether a node_modules file is worth putting in the volume. */
+async function worthSending(full, rel) {
+  const base = path.basename(rel)
+  if (/\.d\.[cm]?ts$/.test(base)) return false // type declarations only
+  const ext = path.extname(base)
+  if (UNIMPORTABLE_EXTENSIONS.has(ext)) return false
+
+  // Extensionless files are the expensive case — the React fixture's
+  // node_modules carries two 9 MB esbuild binaries (vite's own dependency),
+  // half its total weight. A module has to
+  // be text, so sniff for a NUL rather than guessing from the name (LICENSE
+  // and bin/rollup are both extensionless, and only one is a binary).
+  if (ext === '') {
+    let handle
+    try {
+      handle = await fs.open(full, 'r')
+      const { buffer, bytesRead } = await handle.read(
+        Buffer.alloc(1024),
+        0,
+        1024,
+        0
+      )
+      return !buffer.subarray(0, bytesRead).includes(0)
+    } catch {
+      return true // unreadable header; let the normal read decide
+    } finally {
+      await handle?.close()
+    }
+  }
+  return true
+}
+
+function createApp({ projectDir, outDir, vendor, bulkFilter }) {
   const app = new Hono()
 
-  // Only the rolldown path needs this: its wasi binding posts a
-  // SharedArrayBuffer to a worker, which requires cross-origin isolation.
-  // @rollup/browser + esbuild-wasm need no such headers.
-  if (needsCoi) {
-    app.use('*', async (c, next) => {
-      await next()
-      c.header('Cross-Origin-Embedder-Policy', 'require-corp')
-      c.header('Cross-Origin-Opener-Policy', 'same-origin')
-    })
-  }
+  // Mandatory: rolldown's wasi binding posts a SharedArrayBuffer to a worker,
+  // which requires cross-origin isolation.
+  app.use('*', async (c, next) => {
+    await next()
+    c.header('Cross-Origin-Embedder-Policy', 'require-corp')
+    c.header('Cross-Origin-Opener-Policy', 'same-origin')
+  })
 
   app.get('/', async (c) =>
     c.html(await fs.readFile(path.join(HERE, 'browser/index.html'), 'utf8'))
@@ -129,8 +194,8 @@ function createApp({ projectDir, outDir, vendor, needsCoi }) {
     })
   })
 
-  // Bundler browser builds, served straight from node_modules so their own
-  // relative wasm fetches (rollup's bindings_wasm_bg.wasm) resolve.
+  // The bundler's browser build, served so its own relative wasm fetch
+  // (rolldown-binding.wasm32-wasi.wasm) resolves next to it.
   app.get('/vendor/:kind/:file{.+}', async (c) => {
     const kind = c.req.param('kind')
     const file = c.req.param('file')
@@ -174,7 +239,7 @@ function createApp({ projectDir, outDir, vendor, needsCoi }) {
     } catch {
       return c.json([])
     }
-    const rel = await listFiles(root, '', new Set(['.bin', '.cache']))
+    const rel = await listFiles(root, '', DEP_IGNORE)
     return c.json(rel.map((p) => `node_modules/${p}`))
   })
 
@@ -189,6 +254,62 @@ function createApp({ projectDir, outDir, vendor, needsCoi }) {
     } catch {
       return c.text(`not found: ${rel}`, 404)
     }
+  })
+
+  // Everything, in one response, for `--vfs=memfs`.
+  //
+  // That mode cannot fetch lazily — the bundler's fs calls are synchronous —
+  // so the alternative is ~2,150 round trips on a React project. Framing is
+  // `u32 pathLen | path | u32 bodyLen | body`, repeated; binary so non-UTF-8
+  // files inside packages survive.
+  app.get('/api/bulk', async () => {
+    const sources = await listFiles(projectDir)
+    let deps = []
+    const depRoot = path.join(projectDir, 'node_modules')
+    try {
+      await fs.access(depRoot)
+      deps = (await listFiles(depRoot, '', DEP_IGNORE)).map(
+        (p) => `node_modules/${p}`
+      )
+    } catch {
+      // no dependencies installed; sources alone
+    }
+
+    const parts = []
+    let skipped = 0
+    for (const rel of [...sources, ...deps]) {
+      const full = safeJoin(projectDir, rel)
+      if (
+        bulkFilter &&
+        rel.startsWith('node_modules/') &&
+        !(await worthSending(full, rel))
+      ) {
+        skipped++
+        continue
+      }
+      let body
+      try {
+        body = await fs.readFile(full)
+      } catch {
+        continue // vanished or unreadable (dangling symlink); skip it
+      }
+      const name = Buffer.from(rel, 'utf8')
+      const header = Buffer.alloc(4)
+      header.writeUInt32BE(name.length, 0)
+      const size = Buffer.alloc(4)
+      size.writeUInt32BE(body.length, 0)
+      parts.push(header, name, size, body)
+    }
+    const payload = Buffer.concat(parts)
+    if (skipped) {
+      console.log(
+        `  [host] bulk: ${skipped} unimportable dependency files skipped, ` +
+          `${(payload.length / 1048576).toFixed(1)} MB sent`
+      )
+    }
+    return new Response(payload, {
+      headers: { 'content-type': 'application/octet-stream' },
+    })
   })
 
   app.post('/api/dist', async (c) => {
@@ -210,7 +331,7 @@ function createApp({ projectDir, outDir, vendor, needsCoi }) {
  */
 async function verify(
   outDir,
-  { usesDynamicImport = false, expectPreload = false } = {}
+  { usesDynamicImport = false, expectPreload = false, resolution = null } = {}
 ) {
   const problems = []
   const read = (p) => fs.readFile(path.join(outDir, p), 'utf8')
@@ -264,6 +385,29 @@ async function verify(
       await fs.readdir(path.join(outDir, 'assets')).catch(() => [])
     ).filter((f) => f.endsWith('.js'))
 
+    // Dependency-resolution shapes (a fixture opts in with
+    // resolution-expectations.json). Each shape ships a `browser` file and a
+    // `node` file with different markers, so picking the wrong one is a silent
+    // success otherwise: the build still works, it just bundles the wrong
+    // source. Checking the absence matters as much as the presence.
+    if (resolution) {
+      const allJs = (
+        await Promise.all(jsFiles.map((f) => read(`assets/${f}`)))
+      ).join('\n')
+      for (const marker of resolution.mustContain ?? []) {
+        if (!allJs.includes(marker)) {
+          problems.push(`resolution: bundle is missing ${marker}`)
+        }
+      }
+      for (const marker of resolution.mustNotContain ?? []) {
+        if (allJs.includes(marker)) {
+          problems.push(
+            `resolution: bundle contains ${marker} — the wrong variant was resolved`
+          )
+        }
+      }
+    }
+
     if (usesDynamicImport) {
       if (jsFiles.length < 2) {
         problems.push(
@@ -273,8 +417,8 @@ async function verify(
       if (js.includes('LAZY_CHUNK_LOADED')) {
         problems.push('lazy module was inlined into the entry chunk')
       }
-      // oxc (rolldown's minifier) emits string literals as backtick templates,
-      // esbuild uses double quotes — accept either.
+      // oxc (rolldown's minifier) emits string literals as backtick
+      // templates, hence the quote class.
       const refs = [
         ...js.matchAll(/import\(\s*["'`]([^"'`]+\.js)["'`]\s*\)/g),
       ].map((m) => m[1])
@@ -405,6 +549,20 @@ async function verifyBuiltAppRuns(outDir, chromePath, chunkDelayMs = 0) {
   const problems = []
   let lazyLoadMs = null
   try {
+    // Anything thrown in here becomes a problem rather than ending the run: a
+    // build broken enough to crash the page usually has static problems too,
+    // and those are the ones that say *why*. Losing them to the first
+    // exception is how a resolution failure reads as "no #counter".
+    await runRuntimeChecks()
+  } catch (err) {
+    problems.push(`runtime check aborted: ${err.message}`)
+  } finally {
+    await browser.close()
+    await new Promise((r) => srv.server.close(() => r()))
+  }
+  return { problems, lazyLoadMs }
+
+  async function runRuntimeChecks() {
     const page = await browser.newPage()
     page.on('pageerror', (e) => problems.push(`runtime error: ${e.message}`))
     page.on('requestfailed', (r) =>
@@ -463,25 +621,19 @@ async function verifyBuiltAppRuns(outDir, chromePath, chunkDelayMs = 0) {
     if (before !== 'count is 0' || after !== 'count is 1') {
       problems.push(`counter behaviour wrong: "${before}" -> "${after}"`)
     }
-  } finally {
-    await browser.close()
-    await new Promise((r) => srv.server.close(() => r()))
   }
-
-  return { problems, lazyLoadMs }
 }
 
 async function main() {
-  const { project, keep, bundler, cssMinify, preload, chunkDelayMs } =
+  const { project, keep, cssMinify, preload, vfs, bulkFilter, chunkDelayMs } =
     parseArgs(process.argv)
+
   const projectDir = path.resolve(REPO_ROOT, project)
   const outDir = path.join(HERE, 'out')
 
   const vendor = {
-    rollup: path.join(HERE, 'node_modules/@rollup/browser/dist/es'),
-    esbuild: path.join(HERE, 'node_modules/esbuild-wasm'),
     rolldown: path.join(HERE, 'vendor/rolldown'),
-    // vite 8's CSS tool, used by the rolldown path only.
+    // vite 8's CSS tool, matching the toolchain rolldown comes from.
     lightningcss: path.join(HERE, 'node_modules/lightningcss-wasm'),
     // lightningcss-wasm's napi glue, resolved via the page's import map.
     'napi-wasm': path.join(
@@ -489,10 +641,10 @@ async function main() {
       'node_modules/lightningcss-wasm/node_modules/napi-wasm'
     ),
   }
-  const needed =
-    bundler === 'rolldown'
-      ? ['rolldown', ...(cssMinify ? ['lightningcss', 'napi-wasm'] : [])]
-      : ['rollup', 'esbuild']
+  const needed = [
+    'rolldown',
+    ...(cssMinify ? ['lightningcss', 'napi-wasm'] : []),
+  ]
   for (const [k, dir] of Object.entries(vendor).filter(([k]) =>
     needed.includes(k)
   )) {
@@ -511,17 +663,19 @@ async function main() {
   console.log(
     '\nwc-exe PoC — production build in the browser via bundler interception'
   )
+  console.log('  bundler: rolldown  (@rolldown/browser, vite 8 toolchain)')
   console.log(
-    `  bundler: ${bundler}${bundler === 'rolldown' ? '  (vite 8 pipeline: @rolldown/browser)' : '  (vite 5 pipeline: @rollup/browser + esbuild-wasm)'}`
+    `  vfs:     ${
+      vfs === 'memfs'
+        ? "memfs  (rolldown's own resolver walks the volume)"
+        : 'plugin (resolveId/load, with our resolver)'
+    }`
   )
   console.log(`  project: ${projectDir}`)
   console.log(`  output:  ${outDir}`)
   console.log(
-    `  headers: ${
-      bundler === 'rolldown'
-        ? 'COOP/COEP (rolldown wasi needs SharedArrayBuffer)'
-        : 'none (no COOP/COEP needed)'
-    }  vendors: local\n`
+    '  headers: COOP/COEP (rolldown wasi needs SharedArrayBuffer)' +
+      '  vendors: local\n'
   )
 
   await fs.rm(outDir, { recursive: true, force: true })
@@ -531,7 +685,7 @@ async function main() {
     projectDir,
     outDir,
     vendor,
-    needsCoi: bundler === 'rolldown',
+    bulkFilter,
   })
   const server = await new Promise((resolve, reject) => {
     const s = serve({ fetch: app.fetch, port: 0 }, (info) =>
@@ -567,11 +721,11 @@ async function main() {
       timeout: 60000,
     })
     result = await page.evaluate(
-      (b, css, pre) =>
-        window.__pocBuild({ bundler: b, cssMinify: css, preload: pre }),
-      bundler,
+      (css, pre, v) =>
+        window.__pocBuild({ cssMinify: css, preload: pre, vfs: v }),
       cssMinify,
-      preload
+      preload,
+      vfs
     )
     result.hostWallclockMs = Math.round(performance.now() - hostStart)
   } finally {
@@ -590,9 +744,14 @@ async function main() {
   // Preload only matters when a lazily-imported chunk has dependencies of its
   // own, i.e. the bundler emitted a shared chunk beyond entry + one lazy chunk.
   const jsOutputs = result.outputs.filter((o) => o.path.endsWith('.js'))
+  const resolution = await fs
+    .readFile(path.join(projectDir, 'resolution-expectations.json'), 'utf8')
+    .then(JSON.parse)
+    .catch(() => null)
   const staticProblems = await verify(outDir, {
     usesDynamicImport,
     expectPreload: preload && jsOutputs.length > 2,
+    resolution,
   })
   const { problems: runtimeProblems, lazyLoadMs } = await verifyBuiltAppRuns(
     outDir,

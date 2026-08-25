@@ -1,0 +1,20 @@
+{
+  "name": "sample-exports-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "pkg-browser-map": "file:node_modules/pkg-browser-map",
+    "pkg-browser-string": "file:node_modules/pkg-browser-string",
+    "pkg-deep-exports": "file:node_modules/pkg-deep-exports",
+    "pkg-subpath-imports": "file:node_modules/pkg-subpath-imports"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}
