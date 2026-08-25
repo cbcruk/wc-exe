@@ -330,13 +330,49 @@ function createApp({ projectDir, outDir, vendor, bulkFilter }) {
 }
 
 /**
+ * Optional per-project assertions, from `wc-exe-verify.json` at the project
+ * root.
+ *
+ * The checks below used to hardcode this repo's fixtures — `#213547` from their
+ * stylesheet, `count is` from their counter, `Sample … App` from their heading.
+ * That was fine while the only thing that built was a fixture. Now that a stock
+ * `npm create vite` template builds, those strings turn every outside project
+ * into three false failures and hide whatever really went wrong.
+ *
+ * So the checks split in two. The generic ones below hold for any project and
+ * always run; the ones that need to know what the app says live in this file,
+ * and a project without one simply gets the generic set.
+ *
+ *   cssMarker        a string the emitted CSS must contain, and the JS must not
+ *   jsMarker         a string the bundled JS must contain
+ *   lazyMarker       a string that must appear in exactly one non-entry chunk
+ *   renderedText     regex the mount node's HTML must match
+ *   fontFamily       regex the computed font-family must match
+ *   counter          { selector, before, after } — a click that must change text
+ *   lazy             { trigger, output, text } — a click that must load a chunk
+ *   mustContain      strings the bundle must contain (was resolution-expectations)
+ *   mustNotContain   strings the bundle must not contain
+ */
+async function loadExpectations(projectDir) {
+  const raw = await fs
+    .readFile(path.join(projectDir, 'wc-exe-verify.json'), 'utf8')
+    .catch(() => null)
+  if (!raw) return {}
+  try {
+    return JSON.parse(raw)
+  } catch (err) {
+    throw new Error(`wc-exe-verify.json is not valid JSON: ${err.message}`)
+  }
+}
+
+/**
  * Check the emitted bundle is actually coherent, not just present: the HTML
  * must point at files that exist, the JS must be transformed (no TypeScript
- * left) and must contain the app's own code, and the CSS must be real.
+ * left), and the CSS must have been extracted out of it.
  */
 async function verify(
   outDir,
-  { usesDynamicImport = false, expectPreload = false, resolution = null } = {}
+  { usesDynamicImport = false, expectPreload = false, expect = {} } = {}
 ) {
   const problems = []
   const read = (p) => fs.readFile(path.join(outDir, p), 'utf8')
@@ -354,11 +390,12 @@ async function verify(
     js = await read(jsRef).catch(() => null)
     if (!js) problems.push(`referenced JS missing on disk: ${jsRef}`)
   }
+  let css = null
   if (cssRef) {
-    const css = await read(cssRef).catch(() => null)
+    css = await read(cssRef).catch(() => null)
     if (!css) problems.push(`referenced CSS missing on disk: ${cssRef}`)
-    else if (!css.includes('#213547')) {
-      problems.push('CSS asset does not contain the fixture stylesheet')
+    else if (expect.cssMarker && !css.includes(expect.cssMarker)) {
+      problems.push(`CSS asset does not contain ${expect.cssMarker}`)
     }
   }
 
@@ -372,15 +409,27 @@ async function verify(
     ]) {
       if (re.test(js)) problems.push(`JS still contains ${what}`)
     }
-    // The app's own code must be bundled in (both fixtures render this text).
-    if (!js.includes('count is')) {
-      problems.push('bundled JS is missing the app code (module graph broken)')
+    if (expect.jsMarker && !js.includes(expect.jsMarker)) {
+      problems.push(
+        `bundled JS is missing ${expect.jsMarker} (module graph broken)`
+      )
     }
-    // CSS must have been extracted out of the JS, like a vite build. Match a
-    // value unique to the fixture stylesheet: react-dom itself ships a list of
-    // CSS property names, so testing for 'font-family' false-positives.
-    if (js.includes('#213547')) {
-      problems.push('CSS leaked into the JS bundle instead of being extracted')
+
+    // CSS must have been extracted out of the JS, like a vite build. Generic
+    // version of what used to be a hardcoded `#213547`: take a slice out of the
+    // middle of the emitted stylesheet and require the JS not to contain it.
+    // Sampling the middle avoids the leading `:root{` that a JS-in-CSS string
+    // could plausibly share, and works for any project's stylesheet.
+    if (css && css.length >= 80) {
+      const probe = css.slice(
+        Math.floor(css.length / 2),
+        Math.floor(css.length / 2) + 40
+      )
+      if (js.includes(probe)) {
+        problems.push(
+          'CSS leaked into the JS bundle instead of being extracted'
+        )
+      }
     }
 
     // Code-splitting: when the fixture uses a dynamic import(), the lazy module
@@ -391,20 +440,20 @@ async function verify(
     ).filter((f) => f.endsWith('.js'))
 
     // Dependency-resolution shapes (a fixture opts in with
-    // resolution-expectations.json). Each shape ships a `browser` file and a
+    // wc-exe-verify.json). Each shape ships a `browser` file and a
     // `node` file with different markers, so picking the wrong one is a silent
     // success otherwise: the build still works, it just bundles the wrong
     // source. Checking the absence matters as much as the presence.
-    if (resolution) {
+    if (expect.mustContain || expect.mustNotContain) {
       const allJs = (
         await Promise.all(jsFiles.map((f) => read(`assets/${f}`)))
       ).join('\n')
-      for (const marker of resolution.mustContain ?? []) {
+      for (const marker of expect.mustContain ?? []) {
         if (!allJs.includes(marker)) {
           problems.push(`resolution: bundle is missing ${marker}`)
         }
       }
-      for (const marker of resolution.mustNotContain ?? []) {
+      for (const marker of expect.mustNotContain ?? []) {
         if (allJs.includes(marker)) {
           problems.push(
             `resolution: bundle contains ${marker} — the wrong variant was resolved`
@@ -435,7 +484,7 @@ async function verify(
           `dynamic import did not produce a separate chunk (${jsFiles.length} JS file(s))`
         )
       }
-      if (js.includes('LAZY_CHUNK_LOADED')) {
+      if (expect.lazyMarker && js.includes(expect.lazyMarker)) {
         problems.push('lazy module was inlined into the entry chunk')
       }
       // oxc (rolldown's minifier) emits string literals as backtick
@@ -452,17 +501,19 @@ async function verify(
           problems.push(`entry imports a chunk that is missing on disk: ${ref}`)
         }
       }
-      const marked = []
-      for (const f of jsFiles) {
-        const body = await fs
-          .readFile(path.join(outDir, 'assets', f), 'utf8')
-          .catch(() => '')
-        if (body.includes('LAZY_CHUNK_LOADED')) marked.push(f)
-      }
-      if (marked.length !== 1) {
-        problems.push(
-          `expected exactly one chunk to carry the lazy module, found ${marked.length}`
-        )
+      if (expect.lazyMarker) {
+        const marked = []
+        for (const f of jsFiles) {
+          const body = await fs
+            .readFile(path.join(outDir, 'assets', f), 'utf8')
+            .catch(() => '')
+          if (body.includes(expect.lazyMarker)) marked.push(f)
+        }
+        if (marked.length !== 1) {
+          problems.push(
+            `expected exactly one chunk to carry the lazy module, found ${marked.length}`
+          )
+        }
       }
 
       // Preload: when a lazily-imported chunk has its own dependencies, the
@@ -523,12 +574,34 @@ async function verify(
  * Proves the HTML, the bundled JS and the extracted CSS are wired together and
  * that the transformed TypeScript behaves — not merely that files were written.
  */
-async function verifyBuiltAppRuns(outDir, chromePath, chunkDelayMs = 0) {
+async function verifyBuiltAppRuns(
+  outDir,
+  chromePath,
+  chunkDelayMs = 0,
+  expect = {}
+) {
   const app = new Hono()
+  // Content types matter here, not just for tidiness. A browser will sniff a
+  // PNG out of `application/octet-stream` and render it, but it deliberately
+  // will not do that for SVG — so serving one with the wrong type makes a
+  // perfectly good build fail the image check. That is what the first run
+  // against outside projects reported, three times.
   const types = {
     '.html': 'text/html; charset=utf-8',
     '.js': 'text/javascript; charset=utf-8',
     '.css': 'text/css; charset=utf-8',
+    '.svg': 'image/svg+xml',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+    '.avif': 'image/avif',
+    '.ico': 'image/x-icon',
+    '.json': 'application/json',
+    '.woff': 'font/woff',
+    '.woff2': 'font/woff2',
+    '.wasm': 'application/wasm',
   }
   app.get('/*', async (c) => {
     let rel = decodeURIComponent(new URL(c.req.url).pathname).replace(
@@ -594,44 +667,75 @@ async function verifyBuiltAppRuns(outDir, chromePath, chunkDelayMs = 0) {
       waitUntil: 'networkidle2',
     })
 
-    // The mount node differs per fixture (#app for vanilla, #root for React).
-    const rendered = await page
-      .$eval('#app, #root', (el) => el.innerHTML)
-      .catch(() => '')
-    if (!/Sample .* App/.test(rendered)) {
-      problems.push('app did not render into its mount node')
+    // Generic: the app put *something* on the page. A build whose entry never
+    // executed leaves the mount node as the empty div the HTML shipped, so this
+    // catches a broken module graph without knowing what the app says.
+    const rendered = await page.evaluate(() => {
+      const mount = document.querySelector('#app, #root, main, body')
+      return mount ? mount.innerHTML.trim() : ''
+    })
+    if (rendered.length < 20) {
+      problems.push(
+        `app rendered nothing into the page (${rendered.length} chars)`
+      )
+    }
+    if (
+      expect.renderedText &&
+      !new RegExp(expect.renderedText).test(rendered)
+    ) {
+      problems.push(`rendered markup does not match /${expect.renderedText}/`)
     }
 
-    // CSS asset applied? The stylesheet sets a font-family on :root.
-    const font = await page.evaluate(
-      () => getComputedStyle(document.documentElement).fontFamily
+    // Generic: the stylesheet is attached and the browser parsed it. A 404 or a
+    // malformed file leaves zero rules, which no amount of markup can fake.
+    const cssRules = await page.evaluate(() =>
+      [...document.styleSheets].reduce((n, sheet) => {
+        try {
+          return n + sheet.cssRules.length
+        } catch {
+          return n
+        }
+      }, 0)
     )
-    if (!/Inter|system-ui/.test(font)) {
-      problems.push(`stylesheet not applied (font-family: ${font})`)
+    const hasCssAsset = await fs
+      .readFile(path.join(outDir, 'index.html'), 'utf8')
+      .then((h) => /href="\/[^"]+\.css"/.test(h))
+      .catch(() => false)
+    if (hasCssAsset && cssRules === 0) {
+      problems.push('stylesheet is referenced but contributed no rules')
+    }
+
+    if (expect.fontFamily) {
+      const font = await page.evaluate(
+        () => getComputedStyle(document.documentElement).fontFamily
+      )
+      if (!new RegExp(expect.fontFamily).test(font)) {
+        problems.push(`stylesheet not applied (font-family: ${font})`)
+      }
     }
 
     // Code-splitting at runtime: clicking must fetch and execute the lazy
     // chunk. This is what proves the split chunk is genuinely loadable, not
     // merely present on disk.
-    const hasLazy = (await page.$('#lazy')) !== null
-    if (hasLazy) {
-      const before = await page.$eval('#lazy-out', (el) => el.textContent)
+    if (expect.lazy) {
+      const { trigger, output, text } = expect.lazy
+      const before = await page.$eval(output, (el) => el.textContent)
       if (before !== '') {
         problems.push(`lazy output was populated before loading: "${before}"`)
       }
       const started = performance.now()
-      await page.click('#lazy')
+      await page.click(trigger)
       try {
         await page.waitForFunction(
-          () =>
-            document.querySelector('#lazy-out')?.textContent ===
-            'LAZY_CHUNK_LOADED',
-          { timeout: 15000 }
+          (sel, want) => document.querySelector(sel)?.textContent === want,
+          { timeout: 15000 },
+          output,
+          text
         )
         lazyLoadMs = Math.round(performance.now() - started)
       } catch {
-        const got = await page.$eval('#lazy-out', (el) => el.textContent)
-        problems.push(`lazy chunk never loaded (#lazy-out = "${got}")`)
+        const got = await page.$eval(output, (el) => el.textContent)
+        problems.push(`lazy chunk never loaded (${output} = "${got}")`)
       }
     }
 
@@ -662,12 +766,15 @@ async function verifyBuiltAppRuns(outDir, chromePath, chunkDelayMs = 0) {
       }
     }
 
-    // The transformed TypeScript actually works: click increments the counter.
-    const before = await page.$eval('#counter', (el) => el.textContent)
-    await page.click('#counter')
-    const after = await page.$eval('#counter', (el) => el.textContent)
-    if (before !== 'count is 0' || after !== 'count is 1') {
-      problems.push(`counter behaviour wrong: "${before}" -> "${after}"`)
+    // The transformed TypeScript actually behaves: a click changes the text.
+    if (expect.counter) {
+      const { selector, before: want, after: then } = expect.counter
+      const before = await page.$eval(selector, (el) => el.textContent)
+      await page.click(selector)
+      const after = await page.$eval(selector, (el) => el.textContent)
+      if (before !== want || after !== then) {
+        problems.push(`counter behaviour wrong: "${before}" -> "${after}"`)
+      }
     }
   }
 }
@@ -691,6 +798,7 @@ async function main() {
 
   const projectDir = path.resolve(REPO_ROOT, project)
   const outDir = path.join(HERE, 'out')
+  const expect = await loadExpectations(projectDir)
 
   const vendor = {
     rolldown: path.join(HERE, 'vendor/rolldown'),
@@ -806,19 +914,16 @@ async function main() {
   // Preload only matters when a lazily-imported chunk has dependencies of its
   // own, i.e. the bundler emitted a shared chunk beyond entry + one lazy chunk.
   const jsOutputs = result.outputs.filter((o) => o.path.endsWith('.js'))
-  const resolution = await fs
-    .readFile(path.join(projectDir, 'resolution-expectations.json'), 'utf8')
-    .then(JSON.parse)
-    .catch(() => null)
   const staticProblems = await verify(outDir, {
     usesDynamicImport,
     expectPreload: preload && jsOutputs.length > 2,
-    resolution,
+    expect,
   })
   const { problems: runtimeProblems, lazyLoadMs } = await verifyBuiltAppRuns(
     outDir,
     await findChrome(),
-    chunkDelayMs
+    chunkDelayMs,
+    expect
   )
   const problems = [...staticProblems, ...runtimeProblems]
 
