@@ -96,6 +96,82 @@ function chunkPreloadDeps(bundle, target, alreadyLoaded) {
   return [...seen].map((f) => `/${f}`)
 }
 
+// ---------------------------------------------------------------------------
+// Assets — what vite does with `import url from './logo.png'`
+// ---------------------------------------------------------------------------
+//
+// The import becomes a URL string, and the file is emitted with a content hash
+// — unless it is under `assetsInlineLimit` (4 KB by default), in which case it
+// becomes a data URI and nothing is emitted. Ground truth from native
+// `vite build` on `sample-asset-app`: a 111 B svg inlines as
+// `data:image/svg+xml,…` and a 7,028 B png comes out as
+// `assets/big-C1H63osM.png`.
+//
+// Without this the bundler tries to parse the file as JavaScript, which is why
+// a stock `npm create vite` app failed with "stream did not contain valid
+// UTF-8" and "Unexpected JSX expression in src/assets/react.svg".
+
+const ASSET_MIME_TYPES = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.webp': 'image/webp',
+  '.avif': 'image/avif',
+  '.ico': 'image/x-icon',
+  '.bmp': 'image/bmp',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
+  '.eot': 'application/vnd.ms-fontobject',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.ogg': 'audio/ogg',
+  '.wasm': 'application/wasm',
+}
+
+/** vite's default `assetsInlineLimit`. */
+const ASSET_INLINE_LIMIT = 4096
+
+const ASSET_VIRTUAL_PREFIX = 'virtual:wc-asset:'
+// Same reason as the CSS suffix: rolldown picks a module type from the id's
+// extension, so the id must end in something it will treat as JavaScript.
+const ASSET_VIRTUAL_SUFFIX = '.js'
+
+/** The extension of `p`, lowercased, including the dot. */
+function extnameOf(p) {
+  const base = p.slice(p.lastIndexOf('/') + 1)
+  const dot = base.lastIndexOf('.')
+  return dot <= 0 ? '' : base.slice(dot).toLowerCase()
+}
+
+function isAssetPath(p) {
+  const ext = extnameOf(p.split('?')[0])
+  return ext !== '' && Object.hasOwn(ASSET_MIME_TYPES, ext)
+}
+
+/**
+ * The `data:` URI vite would emit for a small asset.
+ *
+ * SVG goes in as text rather than base64 — that is what vite does, and it is
+ * usually smaller. The escaping is not identical to vite's (which leaves `'`
+ * and `=` unescaped); both are valid data URIs, and nothing here depends on
+ * matching vite byte for byte.
+ */
+function assetDataUri(bytes, ext) {
+  const mime = ASSET_MIME_TYPES[ext] ?? 'application/octet-stream'
+  if (ext === '.svg') {
+    return `data:${mime},${encodeURIComponent(new TextDecoder().decode(bytes))}`
+  }
+  let binary = ''
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
+  return `data:${mime};base64,${btoa(binary)}`
+}
+
 // CSS is routed through a virtual module id so the bundler never sees a `.css`
 // extension. rolldown hard-refuses CSS input ("Bundling CSS is no longer
 // supported"), and vite's own build extracts styles rather than bundling them,
@@ -362,6 +438,16 @@ function vfsPlugin(collectedCss, preload) {
     name: 'wc-exe-vfs',
 
     async resolveId(source, importer) {
+      // Before anything else, because asset imports are usually relative and
+      // would otherwise be resolved as ordinary modules and loaded as text —
+      // producing a parse error that says nothing about assets. This mode
+      // fetches file contents as text and has no way to emit binary output.
+      if (importer && isAssetPath(source)) {
+        throw new Error(
+          `asset imports need --vfs=memfs: "${source}" from "${importer}"`
+        )
+      }
+
       // Entry (host passes a VFS-relative path).
       if (!importer) {
         const hit = resolveInVfs(source)
@@ -437,6 +523,26 @@ function vfsPlugin(collectedCss, preload) {
 /** Where the project is mounted inside the volume. */
 const MEMFS_ROOT = '/project'
 
+/**
+ * Every project-relative path the volume knows about, in either fill mode.
+ *
+ * Needed because the volume itself cannot answer that question under the lazy
+ * fill — a file that has not been faulted in is not there to be listed, so
+ * `readdirSync` would quietly report an empty `public/`.
+ */
+const volumePaths = new Set()
+
+/**
+ * Everything under the project's `public/`, as project-relative paths.
+ *
+ * From the manifest rather than the volume, because under the lazy fill a file
+ * nobody has read yet is not in the volume to be listed — and `public/` is
+ * precisely the directory whose files the graph never touches.
+ */
+function publicFiles() {
+  return [...volumePaths].filter((rel) => rel.startsWith('public/'))
+}
+
 /** Join `rel` onto an absolute directory, resolving `.` and `..`. */
 function joinAbs(baseDir, rel) {
   const out = []
@@ -492,6 +598,7 @@ async function populateVolume(volume) {
     // keeps whatever it is handed — without the copy every file would pin the
     // entire download.
     volume.writeFileSync(full, body.slice())
+    volumePaths.add(rel)
     files++
     bytes += bodyLen
   }
@@ -557,7 +664,16 @@ function installFaultIn(volume, fsObject, knownFiles, stats) {
     return true
   }
 
-  for (const name of ['lstatSync', 'statSync', 'openSync', 'realpathSync']) {
+  // `readFileSync` is in the list because the build reads some files directly
+  // rather than through the bundler — CSS, assets, `public/` — and those can
+  // live inside node_modules just as easily as in src.
+  for (const name of [
+    'lstatSync',
+    'statSync',
+    'openSync',
+    'realpathSync',
+    'readFileSync',
+  ]) {
     const original = fsObject[name]
     if (typeof original !== 'function') continue
     fsObject[name] = function (target, ...rest) {
@@ -587,6 +703,7 @@ async function populateVolumeLazy(volume) {
   const depPaths = await depRes.json()
 
   const known = new Set([...sourcePaths, ...depPaths])
+  for (const rel of known) volumePaths.add(rel)
   const dirs = new Set()
   for (const rel of known) {
     const full = `${MEMFS_ROOT}/${rel}`
@@ -627,26 +744,68 @@ async function populateVolumeLazy(volume) {
  * Everything else — resolution, TS, CJS interop, `exports` maps — is rolldown's
  * job here, which is the whole point of the mode.
  */
-function memfsPlugin(collectedCss, volume, preload) {
+function memfsPlugin(collectedCss, collectedAssets, vfsFs, preload) {
+  const absolutize = (source, importer) =>
+    source.startsWith('/')
+      ? source
+      : joinAbs(dirnameOf(importer ?? `${MEMFS_ROOT}/index.html`), source)
+
   return {
-    name: 'wc-exe-memfs-css',
+    name: 'wc-exe-memfs-css-assets',
 
     resolveId(source, importer) {
-      if (!source.endsWith('.css')) return null
-      const abs = source.startsWith('/')
-        ? source
-        : joinAbs(dirnameOf(importer ?? `${MEMFS_ROOT}/index.html`), source)
-      return CSS_VIRTUAL_PREFIX + abs + CSS_VIRTUAL_SUFFIX
+      if (source.endsWith('.css')) {
+        return (
+          CSS_VIRTUAL_PREFIX + absolutize(source, importer) + CSS_VIRTUAL_SUFFIX
+        )
+      }
+      if (isAssetPath(source)) {
+        // Strip any `?query` — vite uses those for `?url`/`?raw`, which this
+        // does not implement; the bare form is what resolves to a file.
+        const abs = absolutize(source.split('?')[0], importer)
+        return ASSET_VIRTUAL_PREFIX + abs + ASSET_VIRTUAL_SUFFIX
+      }
+      return null
     },
 
-    load(id) {
-      if (!id.startsWith(CSS_VIRTUAL_PREFIX)) return null
-      const key = id.slice(
-        CSS_VIRTUAL_PREFIX.length,
-        id.length - CSS_VIRTUAL_SUFFIX.length
-      )
-      collectedCss.push(`/* ${key} */\n${volume.readFileSync(key, 'utf8')}`)
-      return 'export default ""'
+    async load(id) {
+      if (id.startsWith(CSS_VIRTUAL_PREFIX)) {
+        const key = id.slice(
+          CSS_VIRTUAL_PREFIX.length,
+          id.length - CSS_VIRTUAL_SUFFIX.length
+        )
+        collectedCss.push(`/* ${key} */\n${vfsFs.readFileSync(key, 'utf8')}`)
+        return 'export default ""'
+      }
+
+      if (id.startsWith(ASSET_VIRTUAL_PREFIX)) {
+        const key = id.slice(
+          ASSET_VIRTUAL_PREFIX.length,
+          id.length - ASSET_VIRTUAL_SUFFIX.length
+        )
+        const bytes = new Uint8Array(vfsFs.readFileSync(key))
+        const ext = extnameOf(key)
+
+        if (bytes.length <= ASSET_INLINE_LIMIT) {
+          return `export default ${JSON.stringify(assetDataUri(bytes, ext))}`
+        }
+
+        // Hashed here rather than through the bundler's asset pipeline, and
+        // hashed from the bytes themselves — so the name identifies the content
+        // with no later rewrite to invalidate it, which is the mistake the
+        // preload work already made once.
+        const name = key.slice(
+          key.lastIndexOf('/') + 1,
+          key.length - ext.length
+        )
+        const path = `assets/${name}-${await sha8(bytes)}${ext}`
+        if (!collectedAssets.some((a) => a.path === path)) {
+          collectedAssets.push({ path, bytes })
+        }
+        return `export default ${JSON.stringify(`/${path}`)}`
+      }
+
+      return null
     },
 
     ...preloadHooks(preload),
@@ -733,10 +892,11 @@ async function runBuild(cssMinify, preload, vfsMode, lazy) {
   // --- the measured burst: bundle + generate -------------------------------
   const tBuild = performance.now()
   const css = []
+  const assets = []
   const bundle = await bundleWith({
     input: memfsMode ? `${MEMFS_ROOT}/${entry}` : entry,
     plugins: memfsMode
-      ? [memfsPlugin(css, volume, preload)]
+      ? [memfsPlugin(css, assets, rolldownModule.memfs.fs, preload)]
       : [vfsPlugin(css, preload)],
     onwarn: (w) => log('bundler warn:', w.message ?? w),
     ...(memfsMode
@@ -815,7 +975,7 @@ async function runBuild(cssMinify, preload, vfsMode, lazy) {
   // the equivalent outcome for a post-processing pipeline like this one.
   const renamed = new Map()
   for (const f of files) {
-    if (!f.path.endsWith('.js')) continue
+    if (!f.path.endsWith('.js') || typeof f.text !== 'string') continue
     if (!f.text.includes('function __wcPreload')) continue
     const hash = await sha8(f.text)
     const next = f.path.replace(/-[^-.]+\.js$/, `-${hash}.js`)
@@ -854,6 +1014,26 @@ async function runBuild(cssMinify, preload, vfsMode, lazy) {
     files.push({ path: cssFile, text: cssSource })
   }
 
+  // Assets the graph referenced and that were over the inline limit. They are
+  // already named by their content hash, so nothing downstream renames them.
+  for (const asset of assets)
+    files.push({ path: asset.path, bytes: asset.bytes })
+
+  // `public/` is copied verbatim to the output root — no hashing, no graph
+  // involvement. It is how vite ships files referenced by a literal URL
+  // (`<use href="/icons.svg">`), which the bundler never sees and so can never
+  // emit. Without this a stock vite template 404s at runtime while building
+  // cleanly.
+  if (memfsMode) {
+    const vfsFs = rolldownModule.memfs.fs
+    for (const rel of publicFiles()) {
+      files.push({
+        path: rel.slice('public/'.length),
+        bytes: new Uint8Array(vfsFs.readFileSync(`${MEMFS_ROOT}/${rel}`)),
+      })
+    }
+  }
+
   files.push({
     path: 'index.html',
     text: rewriteHtml(html, jsEntryFile, cssFile),
@@ -864,7 +1044,7 @@ async function runBuild(cssMinify, preload, vfsMode, lazy) {
     const res = await fetch(`/api/dist?path=${encodeURIComponent(f.path)}`, {
       method: 'POST',
       headers: { 'content-type': 'application/octet-stream' },
-      body: new TextEncoder().encode(f.text),
+      body: f.bytes ?? new TextEncoder().encode(f.text),
     })
     if (!res.ok) throw new Error(`upload failed: ${f.path} ${res.status}`)
   }
@@ -886,15 +1066,17 @@ async function runBuild(cssMinify, preload, vfsMode, lazy) {
     // Lazy mode: how much of the manifest the graph actually touched.
     faultedInFiles: populated?.loaded ? populated.files : null,
     timings,
-    outputs: files.map((f) => ({ path: f.path, bytes: f.text.length })),
+    outputs: files.map((f) => ({
+      path: f.path,
+      bytes: f.bytes ? f.bytes.length : f.text.length,
+    })),
   }
 }
 
-async function sha8(text) {
-  const digest = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(text)
-  )
+async function sha8(input) {
+  const bytes =
+    typeof input === 'string' ? new TextEncoder().encode(input) : input
+  const digest = await crypto.subtle.digest('SHA-256', bytes)
   return Array.from(new Uint8Array(digest))
     .slice(0, 4)
     .map((b) => b.toString(16).padStart(2, '0'))
