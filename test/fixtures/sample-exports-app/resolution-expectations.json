@@ -1,0 +1,14 @@
+{
+  "note": "Markers the built bundle must and must not contain. Each pair is one resolution shape; the WRONG_NODE variant shipping means the resolver silently picked the node file.",
+  "mustContain": [
+    "BROWSER_STRING_OK",
+    "BROWSER_MAP_OK",
+    "SUBPATH_IMPORTS_OK",
+    "DEEP_EXPORTS_OK"
+  ],
+  "mustNotContain": [
+    "BROWSER_STRING_WRONG_NODE",
+    "BROWSER_MAP_WRONG_NODE",
+    "SUBPATH_IMPORTS_WRONG_NODE"
+  ]
+}

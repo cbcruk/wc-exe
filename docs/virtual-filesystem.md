@@ -64,6 +64,15 @@
 
 이게 사용자가 감을 잡은 그 방향이 맞다. "QEMU를 wasm으로 돌릴 수 있다 → 그 안에 리눅스 → 그 안에 node → 파일은 전부 게스트 안(=브라우저 메모리)에만" 이라는 논리는 정확히 성립하고, 이미 동작하는 데모까지 있다.
 
+### "저수준으로 간다"에는 방향이 둘 있다
+
+이 스펙트럼은 "에뮬레이션 깊이 순"으로 정렬돼 있어서 아래로 갈수록 저수준이라는 인상을 준다. 그런데 **WebContainer(B)보다 저수준으로 간다**는 말은 실제로 정반대의 두 가지를 뜻할 수 있고, 측정 결과도 정반대로 나왔다.
+
+- **아래로 깊게 — 에뮬레이션을 더 한다 (D).** 진짜 커널, 진짜 프로세스. 가장 근본적이지만 **빌드 버스트에서 35× 느리다**(§7). CPU 에뮬레이션 세금이 wc-exe가 없애려던 I/O 병목보다 크다. 이 방향은 이미 판정이 났다.
+- **옆으로 얕게 — 추상화를 걷어낸다 (C).** npm도 vite도 Node도 돌리지 않고 그 아래의 **번들러를 직접 구동**한다. 브라우저 rolldown 버스트가 네이티브 vite 5와 같은 범위다(§9). 이 방향은 이기고 있다.
+
+즉 "StackBlitz보다 저수준으로"라는 직관이 향하는 곳은 D가 아니라 **C**다. 그리고 C의 대가는 성능이 아니라 **범용성**이다 — 프로세스가 없으니 lifecycle scripts가 영원히 안 열리고(§9), 플러그인 생태계를 우리가 떠안는다(§10). **성능을 얻으려 내려가는 게 아니라, 폐쇄 런타임 의존을 버리려고 내려가는 것**이다. 그러니 판단 기준도 속도가 아니라 "그 의존이 실제로 얼마를 청구하는가"여야 한다(§10 확정 7).
+
 ---
 
 ## 3. QEMU/container2wasm 심층 — 되는 것과 대가
@@ -91,6 +100,7 @@
 | B. WebContainer (현행)      | ✅                              | 없음               | 중간              | 높음          | —                                |
 | B'. burrow (§8)             | △ 자체 런타임 의미론            | 없음               | 중간              | 초기          | 완전(단, 범용성 ↓)               |
 | B''. almostnode (§9)        | △ dev·CLI 중심, **빌드 미검증** | 없음               | 가벼움(250KB+CDN) | 초기          | 완전(단, execSync·네이티브 불가) |
+| B'''. vrowzer (§9)          | ❌ dev 전용, 빌드 미연결        | 없음               | 무거움(11MB wasm) | 초기          | 완전(단, vite 버전 고정)         |
 | C. wasm 도구 + WASI fs      | △ 고정 파이프라인만             | 없음               | 가벼움            | 중간          | 부분                             |
 | D. QEMU-wasm/container2wasm | ✅✅ (진짜 리눅스)              | 없음               | 무거움            | 실험적·발전중 | 완전                             |
 
@@ -375,7 +385,7 @@ almostnode가 dev server까지만 보여주고 **행사하지 않은** 그 경�
 
 #### vite 8 = rolldown 경로도 구현·검증 (`--bundler=rolldown`)
 
-**vite 8.1.5의 의존성은 `rolldown`·`lightningcss`·`postcss` — rollup도 esbuild도 없다.** 즉 지금 vite를 인터셉트한다는 건 rolldown을 인터셉트한다는 뜻이다. `@rolldown/browser`(1.2.1)가 실제로 존재하고, `lightningcss-wasm`도 있다 — vite 8 툴체인 전체에 브라우저 빌드가 있다.
+**vite 8의 의존성은 `rolldown`·`lightningcss`·`postcss` — rollup도 esbuild도 없다.** 즉 지금 vite를 인터셉트한다는 건 rolldown을 인터셉트한다는 뜻이다. `@rolldown/browser`(1.2.1)가 실제로 존재하고, `lightningcss-wasm`도 있다 — vite 8 툴체인 전체에 브라우저 빌드가 있다.
 
 - **결과: 이쪽도 static·runtime 검증 통과.** rolldown은 TS 변환과 minify를 자체(oxc)로 하므로 **esbuild-wasm이 아예 불필요**하다.
 - **번들 버스트 144–153ms vs rollup 366–511ms → 약 2.4~3.5× 빠름.** 초기화가 더 무거운데도(10MB wasm, ~0.5s) 총 시간도 앞선다(0.75s vs 0.81–0.93s). 참고로 같은 머신 네이티브 `vite build`(v5)가 157ms 자체 보고 → **브라우저 rolldown 버스트가 네이티브 vite 5와 같은 범위**다.
@@ -386,8 +396,9 @@ almostnode가 dev server까지만 보여주고 **행사하지 않은** 그 경�
 
 - **이건 `vite build`가 도는 게 아니다.** vanilla `index.html` 앱에 대해 vite가 하는 일(엔트리 발견, TS 변환, CSS 추출, 해시 애셋, HTML 재작성)을 재구현한 것이다. vite의 config 해석·플러그인 생태계·프레임워크 플러그인·multi-page·legacy 타겟은 전부 없다.
 - ~~의존성이 검증되지 않았다~~ → **React·동적 import 청킹 모두 시험 완료(아래).** 남은 미검증: `browser` 필드 remap, 깊은 `exports` 와일드카드, worker/wasm import, CSS `@import`/`url()` 애셋 참조.
+- **`npm install`을 하지 않는다 — 이게 가장 큰 구멍이다.** `run.mjs`는 프로젝트 디렉터리의 `node_modules`를 **읽을** 뿐이고, PoC 어디에도 설치 단계가 없다. README의 React 사용법부터가 "먼저 `npm install` 하세요"다. 즉 **인터셉트는 현재 상태로 wc-exe의 존재 이유를 지키지 못한다** — 보안 SW가 스캔하는 그 수만 개 파일이 이미 디스크에 있어야 돌아가니까. 아래 《install 없는 인터셉트》 참조.
 
-**왜 vite를 포팅하지 않는가 (실측)**: vite 5.4의 `dist/node`는 node 빌트인 **24개**(`child_process`·`worker_threads`·`net`·`tls`·`dns`·`inspector`·`module` 포함)를 import하고, 최소 한 청크가 `execSync`/`spawnSync`를 쓴다 — almostnode가 막히는 바로 그 벽이다. 인터셉트 방식은 vite를 **실행하는 대신 대체**하므로 그 24개가 전부 불필요하다. **vite를 우회하는 게 포팅보다 훨씬 싸다** — 대신 생태계 호환성으로 값을 치르고, "임의 프로젝트를 빌드"가 약속인 wc-exe에겐 그 청구서가 곧 핵심 질문이다.
+**왜 vite를 포팅하지 않는가 (실측)**: vite 5.4의 `dist/node`는 node 빌트인 **24개**(`child_process`·`worker_threads`·`net`·`tls`·`dns`·`inspector`·`module` 포함)를 import하고, 최소 한 청크가 `execSync`/`spawnSync`를 쓴다 — almostnode가 막히는 바로 그 벽이다. 인터셉트 방식은 vite를 **실행하는 대신 대체**하므로 그 24개가 전부 불필요하다. **vite를 우회하는 게 포팅보다 훨씬 싸다** — 대신 생태계 호환성으로 값을 치르고, "임의 프로젝트를 빌드"가 약속인 wc-exe에겐 그 청구서가 곧 핵심 질문이다. **단, 이 24개는 vite 5.4의 shipped `dist/node` 기준이다.** 실제로 포팅하면 얼마가 남는지는 vrowzer가 답했다 — 16개, 대신 25k줄 포크(아래 《실증 사례: vrowzer》).
 
 #### React 시험 결과 — rolldown은 통과, rollup은 CJS에서 실패
 
@@ -402,7 +413,7 @@ almostnode가 dev server까지만 보여주고 **행사하지 않은** 그 경�
 
 - **rolldown은 React를 빌드하고 결과가 동작한다.** 런타임 검증 통과 — 컴포넌트가 마운트되고 스타일시트가 적용되고 클릭 시 카운터가 증가한다(= JSX·hooks·state 정상). bare specifier 해석, 조건부 `exports` 맵, **CJS→ESM interop**이 전부 통했다.
 - **rollup은 예측한 그 지점에서 실패한다**: `RollupError: "useState" is not exported by "node_modules/react/index.js"`. React가 CommonJS로 배포되고 rollup은 `module.exports`를 자체적으로 소비하지 못한다 — `@rollup/plugin-commonjs`가 필요하고, 그 플러그인의 의존 체인(`glob`·`resolve` 등)은 rolldown이 요구했던 것과 같은 사전 번들링을 또 요구한다. rolldown은 oxc로 CJS를 native 처리해 이 문제가 아예 없다.
-- **rollup 경로는 고칠 가치가 없다.** 현행 vite는 rolldown이므로(8.1.5 deps에 rollup·esbuild 없음) 이 CJS 갭은 레거시 파이프라인의 속성이다. rollup 경로는 "COOP/COEP 불필요 + 다운로드 작음"이라는 이점 때문에 의존성 없는 프로젝트용 변형으로 남긴다.
+- **rollup 경로는 고칠 가치가 없다.** rolldown은 oxc로 CJS를 native 처리해 이 문제가 아예 없다. 이 CJS 갭이 결국 rollup 경로를 걷어내는 두 근거 중 첫 번째가 됐다(아래 «rolldown 단일화»).
 
 **충실도**: React 번들 JS가 141,063 B로 **네이티브 `vite build`(142,671 B)의 1% 이내**다(더 작은 건 modulepreload 폴리필이 없어서). 같은 머신 네이티브 vite가 970ms인데 브라우저 rolldown 번들 버스트는 505ms — 다만 PoC가 하는 일이 더 적으므로 동일 비교는 아니다.
 
@@ -466,7 +477,224 @@ emit 형태도 vite와 같다: `__wcPreload(() => import("./featureA-….js"), [
 
 하네스가 이 불변식을 직접 검사한다 — 헬퍼를 담은 청크는 파일명의 해시가 그 바이트의 해시와 같아야 한다. 재해시를 끄면 이 검사가 실패하므로 실효성이 있다. vite는 rollup의 해시 플레이스홀더로 애초에 최종 내용을 해시해서 같은 결과에 도달한다 — 후처리 파이프라인에선 사후 renaming이 그 등가물이다.
 
-**다음에 결판낼 것**: ① 한 머신에서 WebContainer `npm run build`와 동일 조건 비교 ② 그 다음에 플러그인 호환성·sourcemap·multi-page. 자세한 내용은 `poc/vite-build-intercept/README.md`.
+**다음에 결판낼 것**: ① 한 머신에서 WebContainer `npm run build`와 동일 조건 비교 — 다만 지금 그대로 재면 "빌드 단계만"의 비교라는 점에 주의(미결 1) ② 플러그인 호환성·sourcemap·multi-page. 자세한 내용은 `poc/vite-build-intercept/README.md`.
+
+#### install 없는 인터셉트 — 벽이 생각보다 낮을 수 있다 (2026-08 실측)
+
+warm 실행을 분해하면 인터셉트가 대체하는 조각이 가장 작다는 게 드러난다:
+
+| 단계                          | 실측  | 인터셉트가 대체하나   |
+| ----------------------------- | ----- | --------------------- |
+| WebContainer 부팅             | ~5.4s | ❌                    |
+| `npm install`(OPFS 캐시 히트) | 0.30s | ❌ — 애초에 하지 않음 |
+| 빌드                          | ~1.6s | ✅                    |
+
+그런데 확정 4의 "5단계 lifecycle scripts가 벽"은 **"`npm install`을 충실히 재현한다"** 에 대한 판정이다. **"인터셉트 빌드에 필요한 모듈 그래프를 만든다"** 는 훨씬 작은 문제일 수 있다. React 픽스처로 재봤다:
+
+|                                |                                                                                  |
+| ------------------------------ | -------------------------------------------------------------------------------- |
+| 설치된 패키지                  | **71개**                                                                         |
+| install 훅을 가진 패키지       | **3개** — `csstype`(`prepublish`), `esbuild`(`postinstall`), `rollup`(`prepare`) |
+| 그중 인터셉트 빌드에 걸리는 것 | **0개**                                                                          |
+| 런타임 의존성 클로저           | **5개** — react, react-dom, scheduler, loose-envify, js-tokens                   |
+| 크기: 전체 vs 클로저           | **44MB** vs **5.0MB**                                                            |
+
+`prepublish`·`prepare`는 install에 아예 안 돈다. 유일한 실제 훅인 `esbuild`의 `postinstall`은 **네이티브 바이너리를 받아오는 것**인데 이 파이프라인은 네이티브 esbuild를 쓰지 않는다. 그리고 71개 중 **66개가 devDependency**다(vite·rollup·`@babel`·`caniuse-lite`…) — 인터셉트는 vite를 실행하지 않으므로 설치할 이유가 없다.
+
+그래서 형태는 보인다: **호스트가 Node이므로** lockfile을 읽고 → 레지스트리에서 타르볼을 받아 → **메모리에서 풀어** → `--vfs=memfs`가 이미 채우는 그 볼륨에 직접 넣으면 디스크를 건드리지 않는다. 비어 있는 칸은 **바이트를 `node_modules`가 아니라 레지스트리에서 가져오는 부분 하나**뿐이고, §5의 cacache 타르볼 캐시가 그 절반이다.
+
+**증명된 게 아니다.** 리스크 둘이 그대로다: ① 픽스처 하나에서 "훅이 안 걸린다"를 일반화하는 건 이 탐색이 이미 두 번 저지른 실수다 ② npm의 트리 해석(peer deps·`overrides`·optional/platform deps·workspaces)을 재현하지 못하면 빌드가 **조용히** 깨진다(위 «하이브리드 착지점»의 본체 비용).
+
+#### rolldown 단일화 — rollup 경로를 걷어냈다 (2026-08)
+
+PoC에는 vite 5~7을 반영하는 `@rollup/browser` + `esbuild-wasm` 파이프라인이 함께 있었다. 걷어냈다. 근거를 남겨두는 이유는, 가장 그럴듯한 반론이 성립하지 않기 때문이다 — "우리 사용자는 vite 5를 쓰니 vite 5 파이프라인이 필요하다."
+
+**레지스트리 사실** (2026-08 확인): vite `latest` = **8.2.2**(deps: `rolldown`·`lightningcss`·`postcss`). vite 8.0.0은 **2026-03-12** 출시로 rolldown 기반 첫 메이저다. 반면 `previous` 태그인 **7.3.6**(2026-06-25)은 여전히 `rollup`·`esbuild`에 의존하고, 6·5도 마찬가지다. **즉 필드의 대다수는 아직 rollup 계열이다.** 그러니 "vite 8부터 rolldown이니 rollup은 무의미"라는 논리만으로는 제거가 정당화되지 않는다.
+
+정당화하는 건 다른 사실이다:
+
+> **인터셉트에서는 프로젝트의 vite 버전이 번들러를 고르지 않는다.** 우리는 프로젝트의 vite를 실행하지 않고 그 파이프라인을 **대체**한다.
+
+실측이 이미 있었다 — React 픽스처는 `vite: ^5.4`를 핀하는데 rolldown으로 빌드되고, 네이티브 `vite build`(5.4.21) 출력의 **1% 이내**다(141,063 vs 142,671 B). 그러니 번들러는 하나면 되고, 둘은 대등하지 않다:
+
+|                             | rolldown                          | rollup + esbuild-wasm                             |
+| --------------------------- | --------------------------------- | ------------------------------------------------- |
+| React(CJS 의존성)           | ✅ oxc가 native 처리              | ❌ `@rollup/plugin-commonjs` 필요                 |
+| 파일시스템을 넘겨줄 수 있나 | ✅ `--vfs=memfs`                  | ❌ 플러그인 훅뿐                                  |
+| 해석 정확성                 | rolldown 자체 리졸버, 정확        | 수제 리졸버 고착 → `browser`·`imports` **오해석** |
+| 번들 버스트(바닐라)         | **144 / 153ms**                   | 366 / 511ms                                       |
+| COOP/COEP                   | 필요                              | **불필요**                                        |
+| 다운로드                    | 10MB wasm + 1.5MB JS + 1.2MB 워커 | 작음                                              |
+
+마지막 두 줄이 rollup 경로의 전부였는데, 둘 다 wc-exe에선 값을 못 한다. 서버가 이미 COOP/COEP를 붙이고(WebContainer도 어차피 요구한다), 번들러는 로컬 vendored라 빌드마다 받지 않는다. 남은 건 **React를 못 빌드하고, 의존성을 올바로 해석하는 유일한 VFS 모드를 못 쓰고, `build.js`를 이중화하는** 파이프라인이었다.
+
+**제거 결과**: PoC에서 **118줄**이 빠졌다(`build.js` −85, `run.mjs` −33) — `transform`·`renderChunk`의 `needsEsbuild` 분기, 두 번째 CSS minifier, 두 번째 preload 전략(`renderDynamicImport` + 마커 치환; rolldown은 이 훅을 아예 호출하지 않는다). **픽스처 5개의 출력이 제거 전과 바이트 동일**하다.
+
+**대신 두 가지 주장이 기록으로만 남는다** — 트리에 실증하는 코드가 없어졌으므로:
+
+1. **브라우저 빌드가 COOP/COEP 없이도 가능하다** — rollup 경로가 그걸 보여줬다. WebContainer·container2wasm·rolldown은 전부 요구한다. §7·§9에서 "인터셉트의 개방성" 논거로 쓰던 항목이라, 이제 강도가 한 단계 내려간다.
+2. **minify된 CSS가 네이티브 vite 5와 바이트 동일** — esbuild minifier가 냈던 결과(673 B). lightningcss는 다른 선택을 하므로 이어지지 않는다.
+
+둘 다 "포기해도 되는가"를 따져서 내린 결정이지, 없었던 셈 치는 게 아니다.
+
+### 실증 사례: vrowzer — vite를 진짜로 포팅하면 얼마인가 (2026-08 조사)
+
+[vrowzer](https://github.com/kazupon/vrowzer)(kazupon, MIT)는 **vite dev server를 브라우저에서 돌린다.** 위 PoC가 "vite를 우회한다"를 택한 바로 그 자리에서 **정반대로 vite를 포팅**했으므로, 포팅 비용의 실제 청구서가 된다.
+
+**포크는 진짜다.** `refers/vite`가 vitejs/vite git submodule이고 `TODO.md` 첫 줄이 "Porting status from refers/vite"다. `@vrowzer/vite-dev-server`의 `src` 아래 `.ts` 116개 · **약 39,758줄** — vite의 `src/node` 트리를 옮겨 고친 것이다.
+
+**그런데 빌드는 비어 있다. 그것도 하드코딩된 dev 전용이다.**
+
+- `rolldown.config.ts`: `'process.env.NODE_ENV': JSON.stringify('development')` — 주석에 _"vrowzer always runs in dev mode (resolveConfig uses this for isProduction)"_.
+- 같은 파일에서 공개 엔트리 `src/node/index.ts`가 **주석 처리**돼 있다 — _"this entry isn't used for vrowzer"_. 빌드되는 건 `cli`와 `internal`뿐.
+- `src/node/build.ts`는 764줄로 존재하지만 `resolveBuildPlugins`의 pre/post가 **전부 주석**이다(`TODO(kazupon): implement later`) — `prepareOutDirPlugin`, `buildImportAnalysisPlugin`, `buildEsbuildPlugin`, `terserPlugin`, `manifestPlugin`, `buildReporterPlugin`, `licensePlugin`. `build()` 오케스트레이션 함수 자체가 export 목록에 없다.
+
+다만 **구조는 살아 있다.** `plugins/index.ts`가 `isBuild`/`anyEnvBundled` 분기와 `await import('../build')`를 그대로 유지하고, 빌드 플러그인 자리들이 정확한 위치에 주석으로 남아 있다. `build.ts`의 타입·옵션·경로 계산부(`resolveBuildEnvironmentOptions`, `toOutputFilePathInJS/InCss/InHtml`, `BuildEnvironment`)는 이미 `config.ts`·`asset.ts`·`css.ts`가 쓴다. 재설계가 아니라 **주석 해제 + 플러그인 개별 포팅**이다.
+
+#### npm install은 어떻게 다루나 — 우회가 아니라 이관이다
+
+**vrowzer도 브라우저에서 `npm install`을 하지 않는다.** 대신 **빌드 타임에 Node에서 매니페스트를 만들어** 브라우저에 넘긴다. `schema/vrowzer-manifest.json`이 그 계약이다:
+
+```json
+{
+  "files":       { "/src/main.tsx": "./src/main.tsx", ... },
+  "nodeModules": { "/node_modules/react/package.json": "...", ... },
+  "activeFile":  "/main.tsx"
+}
+```
+
+`packages/vite-plugin/src/manifest-generate.ts`(698줄)가 **로컬 `node_modules`에서** 이걸 만든다. 하는 일은 셋이다:
+
+1. **의존성 클로저만 걷는다**(`collectDependencies`) — 루트에서만 devDependencies를 보고(기본은 `includeDevDependencies: false`), 그 아래로는 `dependencies`만 재귀한다.
+
+   ```ts
+   const deps = isRoot
+     ? [
+         ...Object.keys(pkg.dependencies || {}),
+         ...Object.keys(pkg.devDependencies || {}),
+       ]
+     : Object.keys(pkg.dependencies || {})
+   ```
+
+2. **CJS 패키지를 rolldown으로 ESM 사전 번들**(`bundleCjsPackages`) — `/node_modules/.vrowzer-esm/`에 넣고 **그 패키지의 `package.json`을 재작성**해 `exports`가 번들 결과를 가리키게 한다(`pkgExportsMap.get(pkgName)![subpath] = '../.vrowzer-esm/${entryName}.js'`).
+3. **optimizer를 끈다** — `disableDepsOptimizer: true`. TODO.md 그대로: _"CJS packages (React) are pre-bundled to ESM by `gen:manifest` instead."_
+
+실제 결과(그들의 React e2e 픽스처): 소스 7개 + nodeModules 41개 항목 = **패키지 4개**(`.vrowzer-esm` 26 files, `scheduler` 13, `react` 1, `react-dom` 1). react·react-dom은 원본 파일이 **하나도** 안 들어가고 재작성된 package.json만 들어간다.
+
+**그러니 이건 우회법이 아니라 이관이다.** 매니페스트를 만드는 머신에는 설치가 끝나 있어야 한다. vrowzer에게 문제가 안 되는 이유는 제품 모양이 다르기 때문이다 — 운영자가 환경을 **한 번 준비해** 최종 사용자 브라우저로 보내고, 최종 사용자는 npm을 만날 일이 없다. **wc-exe는 사용자가 개발자 본인이고, 문제가 되는 디스크가 그 사람 디스크다.** "미리 설치해두세요"는 답이 될 수 없다.
+
+**다만 절반은 그대로 쓸 수 있다.** 위 《install 없는 인터셉트》에서 비어 있던 칸과 맞춰보면:
+
+| 조각                   | vrowzer                                  | wc-exe에 필요한 것                                                               |
+| ---------------------- | ---------------------------------------- | -------------------------------------------------------------------------------- |
+| 어느 패키지가 필요한가 | ✅ `collectDependencies`                 | 그대로 차용 가능                                                                 |
+| CJS를 어떻게 다루나    | ✅ rolldown 사전 번들 + `exports` 재작성 | 차용 가능 — 단 memfs 모드에선 rolldown이 CJS를 직접 처리하므로 **불필요할 수도** |
+| 파일을 **어디서** 얻나 | ❌ 로컬 디스크                           | **레지스트리 → 메모리 → 볼륨** ← 새로 써야 할 부분                               |
+| lifecycle scripts      | ❌ 무시                                  | 실측상 인터셉트 빌드엔 거의 무관                                                 |
+
+#### node 빌트인 24개 → 16개, 대신 포크로 지불
+
+vrowzer가 실제로 import하는 node 빌트인은 **16개**다:
+
+```
+45 node:path   28 node:fs   20 node:fs/promises   8 node:url   5 node:module
+ 4 node:perf_hooks   3 node:util   3 node:os   2 node:events   2 node:buffer
+ 1씩: timers/promises, readline, https, http, dns, crypto
+```
+
+`child_process`·`worker_threads`·`net`·`tls`·`inspector`가 **없다.** 하지만 이건 "vite가 그걸 안 쓴다"가 아니라 **포크해서 그 코드 경로를 잘라냈다**는 뜻이고, 남은 16개는 `resolve.alias`로 `@vrowzer/node-polyfill` / `@vrowzer/fs`(memfs) / `pathe`에 넘긴다. **벽은 우리가 생각한 것보다 낮지만, 넘는 값을 포크로 지불한 것**이다.
+
+**빌드 전용이면 더 작다.** 39,758줄 중 dev 서버 전용이:
+
+| 부분                                                                         | 줄 수        |
+| ---------------------------------------------------------------------------- | ------------ |
+| `node/server/` (미들웨어·HMR)                                                | 10,174       |
+| `shared/` (hmr, moduleRunnerTransport)                                       | 1,871        |
+| `client/` (HMR 클라이언트·overlay)                                           | 1,039        |
+| `service-worker.ts`·`web-worker.ts`·`preview.ts`·`watch.ts`·`module-runner/` | 1,799        |
+| **빌드에 불필요 소계**                                                       | **≈ 14,900** |
+
+남는 ≈24,900줄에 빌드 전용 플러그인 3~4k를 더해 **25k~28k줄** 규모다. PoC의 676줄(`browser/build.js`)과 나란히 놓고 볼 숫자다.
+
+#### 그래도 wc-exe에는 포크가 맞지 않는다 — 규모가 아니라 버전 때문
+
+- vrowzer의 vite는 **자기 것**이다. 자기 프리뷰 환경에서 자기가 핀한 vite 하나를 돌린다. 포크가 합리적이다.
+- wc-exe의 vite는 **남의 것**이다. 사용자 프로젝트가 `vite: ^5.4`를 물고 `@vitejs/plugin-vue`·tailwind를 물고 온다. 포크는 vite 버전 **하나**만 준다.
+
+포크를 뜨는 순간 약속이 "임의의 프로젝트를 빌드"에서 "**우리가 포크한 vite 버전에서 동작하는 프로젝트를 빌드**"로 바뀌고, upstream에 영원히 리베이스해야 한다. WebContainer 경로는 **프로젝트가 가져온 vite를 그대로 실행**한다 — 포크가 못 주는 것이 정확히 이것이다. 브라우저에서 도는 `vite build`는 upstream vite가 할 일이고, 그때 공짜로 받는다.
+
+#### 포크와 무관하게 훔칠 것 두 가지
+
+1. ~~**fs-proxy memfs (`@vrowzer/rolldown`)**~~ — **이식 완료(`--vfs=memfs`). 아래 별도 절 참조.**
+2. **OXC 기반 `vite.config.ts` 정적 추출 (`@vrowzer/vite-plugin`)** — `extract.ts`(770줄)가 OXC로 `vite.config.ts`를 파싱해 플러그인 호출·import를 추출·재생성하고, 반환 타입에 `unsupported: string[]`을 둬서 **못 다루는 걸 조용히 넘기지 않고 신고**한다. `prebundle.ts`(270줄)가 그 플러그인들을 rolldown으로 사전 번들한다. **이게 Node에서, 빌드 전에 돈다** — wc-exe는 CLI가 Node라 같은 탈출구를 이미 갖고 있다. PoC의 가장 아픈 경계("`vite.config.ts`를 통째로 무시한다")를 25k줄 포크 없이 좁히는 저비용 수단으로 보인다.
+
+**부수 재고**: `@vrowzer/node-polyfill`은 브라우저 테스트가 붙은 독립 MIT 패키지(16개 모듈). 나중에 node 빌트인 shim이 필요해지면 직접 짜는 대신 쓸 수 있다.
+
+### fs-proxy memfs 이식 결과 (`--vfs=memfs`, 2026-08 구현·실측)
+
+vrowzer의 유일한 이식 후보를 실제로 붙였다. `@rolldown/browser`의 wasi 바인딩이 memfs 볼륨을 만들어 `/`에 preopen하므로, 프로젝트를 그 볼륨에 써넣으면 **rolldown의 네이티브 리졸버가 진짜 디스크처럼 walk한다.** 상세는 `poc/vite-build-intercept/README.md`.
+
+**동작하고, 출력이 바이트 동일하다.** 픽스처 4개 전부 빌드되고, 방출된 파일이 플러그인 경로와 **콘텐츠 해시까지** 같다(React `main-vIIrpq_x.js` 141,063 B). 즉 bare specifier 해석, 조건부 `exports` 맵, 서브패스, CJS→ESM interop을 **rolldown이 대신 해도 결과가 같다**. 손으로 짠 리졸버는 충실한 재구현이었고, 이제 그걸 유지할 필요가 없다.
+
+**대가는 예상대로 지연 VFS다.** 번들러의 fs 호출이 동기라 미리 다 채워야 한다.
+
+| React 픽스처     | 플러그인 VFS | memfs VFS     |
+| ---------------- | ------------ | ------------- |
+| 파일을 앞에 놓기 | 16–17ms      | 307–321ms     |
+| 번들 + generate  | 191–196ms    | 199–214ms     |
+| **총 in-page**   | **355ms**    | **634–653ms** |
+
+**번들 버스트는 그대로다** — rolldown은 바이트가 어디서 왔는지 신경 쓰지 않는다. 차이는 전부 VFS 단계고, 그 안에서 전송:memfs 쓰기가 약 90:10이다(278ms + 28ms). **memfs 문제가 아니라 전송 문제다.** 의존성이 없는 바닐라 픽스처에선 둘이 무승부(299–303ms vs 280–308ms).
+
+**전송량의 2/3는 애초에 모듈이 아니었다.** 필터 없이 보내면 44.5MB인데 그중 **17.9MB가 esbuild 네이티브 바이너리 두 벌**, 약 5MB가 `.map`, 3.6MB가 `.node`다. 모듈일 수 없는 것(`.map`·`.md`·`.flow`·`.node`·`.d.ts`, 그리고 첫 1KB에 NUL이 있는 확장자 없는 파일)을 거르면 **15.2MB**로 줄고 VFS 단계가 482ms → 307–321ms가 된다. 이건 **리졸버가 아니라 콘텐츠 필터**다 — specifier가 어디를 가리키는지는 아무것도 정하지 않으므로, 이 모드가 rolldown에게 돌려준 바로 그 책임을 되가져오지 않는다.
+
+**정작 vrowzer의 대표 패치는 필요 없었다.** fs-proxy 페이로드 상한 10KB → 10MB 확장 말이다. 논리는 빈틈없어 보였다(react-dom 130KB를 10KB 버퍼로 못 받는다). **실측으로는 아니다** — React가 **stock 10KB에서 바이트 동일하게** 빌드되고 1KB에서도 된다. 모듈 내용은 워커 프록시가 아니라 **페이지 자신의 WASI**에서 읽힌다. 이분해보면 프록시를 실제로 건너는 건 256B~1KB 사이 — 경로 문자열과 stat 결과다.
+
+그래서 패치는 구현하되 **기본 비활성**이다. 의존성 소스를 패치해서 얻는 게 없으면 그건 순수 부채다. 플래그(`--fs-payload-bytes=`)로만 남긴 이유는 **넘쳤을 때의 증상**이다:
+
+| 상한         | 결과                                |
+| ------------ | ----------------------------------- |
+| 10KB (stock) | 빌드됨                              |
+| 1KB          | 빌드됨                              |
+| 256B         | **렌더러가 죽음** — "Target closed" |
+| 64B          | **페이지가 멈춤**, 에러 없음        |
+
+`RangeError: payload overflow`는 코드에 있는데 **한 번도 표면에 나오지 않는다.** 언젠가 넘치는 프로젝트가 생기면 여기를 가리키는 것 없이 크래시나 정지로 나타난다 — 상시 패치할 값어치는 없고, 문서화된 탈출구 하나는 있을 값어치가 있다.
+
+**판정: 코드가 줄지 않는다. 성격이 바뀐다.**
+
+|                           | 플러그인 VFS          | memfs VFS                      |
+| ------------------------- | --------------------- | ------------------------------ |
+| 우리가 소유한 해석 의미론 | 109 코드줄            | **0**                          |
+| 우리가 소유한 배관        | 지연 매니페스트+fetch | 71(페이지) + 78(호스트) 코드줄 |
+| 패치한 의존성             | 없음                  | 없음                           |
+| React 총시간              | 355ms                 | 634–653ms                      |
+
+줄 수는 거의 무승부다. 바뀌는 건 **성격**이다: Node의 해석 알고리즘과 맞아야 하는 — 그리고 미결 3의 미검증 생태계 형태가 사는 — 109줄이, 맞거나 눈에 띄게 깨지거나 둘 중 하나인 ~150줄의 전송 코드로 바뀐다. 그 거래가 1.8×만큼의 값을 하는지는 아래 픽스처가 답한다.
+
+#### 두 리졸버를 가르는 픽스처 (`sample-exports-app`)
+
+위 거래는 수제 리졸버가 실제로 틀릴 때만 값을 한다. 그래서 픽스처를 하나 추가했다 — 로컬 패키지 4개가 각각 **`node` 파일과 `browser` 파일에 다른 마커**를 담고, `resolution-expectations.json`이 번들에 무엇이 있어야 하고 무엇이 없어야 하는지를 선언한다. 잘못 고르면 **조용히 성공**하기 때문이다: 빌드는 되고 앱은 뜨는데 잘못된 파일이 실려 나간다.
+
+기준은 네이티브 `vite build`(5.4.21)로 먼저 확정했다 — **넷 다 browser 변형을 고른다.** 그러니 불일치는 취향이 아니라 버그다.
+
+| 형태                                     | 네이티브 vite | 플러그인 VFS(수제)          | memfs VFS(rolldown) |
+| ---------------------------------------- | ------------- | --------------------------- | ------------------- |
+| 레거시 `browser` 필드, 문자열형          | browser       | ❌ **조용히 node**          | ✅ browser          |
+| 레거시 `browser` 필드, 객체 remap        | browser       | ❌ **조용히 node**          | ✅ browser          |
+| `imports` 필드(`#internal`, 조건부 해석) | browser       | ❌ external → 런타임 크래시 | ✅ browser          |
+| `exports` 와일드카드(여러 세그먼트 횡단) | ✅            | ✅                          | ✅                  |
+
+(걷어낸 rollup 경로도 동일하게 실패했다 — 리졸버를 공유했으니까. 그쪽은 `--vfs=memfs`를 쓸 수 없어 이 실패가 **고칠 수 없는 성질**이었고, 그게 제거의 두 번째 근거다.)
+
+**중요한 건 `browser` 필드 두 줄이다.** 실패하지 않고 **틀리게 성공한다.** 번들은 멀쩡하고 앱은 렌더되는데, 의존성의 Node 빌드가 조용히 브라우저 번들에 링크된다. 이 PoC가 계속 잡아내는 바로 그 부류이고(generate() 전 CSS 읽기, 해시 정합성), 픽스처 말고는 막을 방법이 없는 부류다.
+
+**미결 3의 앞 두 항목이 이걸로 정리된다**: 와일드카드는 괜찮았고, `browser` 필드는 애초에 구현조차 안 돼 있었고, `imports`도 마찬가지다. `--vfs=memfs`에서는 셋 다 우리 책임이 아니게 된다.
+
+**들어오면서 버그 두 개를 잡았다.**
+
+1. **의존성 스캔이 `node_modules/**/dist/`를 통째로 버리고 있었다.** `listFiles`가 *프로젝트용* 무시 목록(`dist`·`coverage`포함 — 프로젝트 자기 산출물엔 옳다)을 node_modules에도 적용했다.`dist/`에서 배포하는 패키지가 전부 안 보였고, 빌드는 경고 하나만 남기고 external import를 뱉었다. React는 우연히 안 걸렸고(`cjs/`·`umd/`에서 배포), 새 픽스처는 첫 실행에 걸렸다. **두 VFS 모드 모두 영향**을 받았다. node_modules에 별도 무시 목록을 주어 수정했고, React 볼륨이 1,552 → 1,618 파일로 늘었지만 출력은 바이트 동일하다.
+2. **런타임 검사가 죽으면 static 결과가 안 보였다.** `verifyBuiltAppRuns`가 첫 셀렉터 실패에서 통째로 throw해서, 해석 실패가 `failed to find element matching selector "#counter"`로만 나타났다. 이제 중단을 problem으로 기록하고 static 결과가 살아남는다 — 위 표가 읽히게 된 게 그 덕이다.
 
 ### 하이브리드 착지점 (제안 — 미구현)
 
@@ -501,7 +729,9 @@ emit 형태도 vite와 같다: `__wcPreload(() => import("./featureA-….js"), [
 2. **실행 계층은 WebContainer를 유지한다 — 성능으로 판정됨.** container2wasm은 빌드 버스트에서 **35× 느리다**(1.6s → 56s). CPU 에뮬레이션 세금이 wc-exe가 없애려던 I/O 병목보다 크다(§7).
 3. **WebContainer에서 "얇은 레이어만 떼오기"는 불가능하다.** 공개된 건 껍데기(`webcontainer-core`는 이슈 트래커, `@webcontainer/api`는 폐쇄 런타임의 스텁)이고, 탐내는 fs/런타임 알맹이가 정확히 닫힌 부분이다(§6).
 4. **`node:fs`는 필요조건이지 충분조건이 아니다.** npm install을 분해하면 1~4단계(resolve·다운로드·해제·hoist)는 가상 fs로 도달하지만 **5단계 lifecycle scripts(`child_process`)가 벽**이다. 이건 파일시스템 문제가 아니라 프로세스 모델 문제라, fs를 완벽히 가상화해도 열리지 않는다. almostnode가 이걸 동작하는 코드로 실증한다 — 1~4는 되고 `execSync`/`spawnSync`는 throw한다(§9).
-5. **결합도는 낮춰뒀다.** 러너가 `Runtime`/`SnapshotProvider` 인터페이스 뒤로 격리돼, 백엔드 교체가 구현 하나 추가로 끝난다(§5 중기).
+5. **결합도는 낮춰뒀다 — 단, WebContainer류 백엔드에 한해서.** 러너가 `Runtime`/`SnapshotProvider` 인터페이스 뒤로 격리돼, 백엔드 교체가 구현 하나 추가로 끝난다(§5 중기). 다만 그 인터페이스는 의도적으로 WebContainer 모양이다 — `spawn`이 pty를 반환하고 `fs`·`workdir`·`path`가 있다. **프로세스 모델을 전제한다는 뜻**이라, container2wasm(진짜 `spawn`이 있다)은 맞지만 번들러 인터셉트는 맞지 않는다(아래 «이음새의 고도»).
+6. **인터셉트를 승격한다면 memfs 변형이어야 한다 — 실측으로 갈렸다.** 플러그인 훅으로 VFS를 먹이는 방식(수제 리졸버)은 레거시 `browser` 필드 두 형태에서 **조용히 node 파일을 고르고**, `imports` 필드(`#internal`)에선 external로 흘려 런타임에 깨진다. 네이티브 `vite build`를 기준으로 대조했으니 취향이 아니라 버그다. `--vfs=memfs`(rolldown 자체 리졸버)는 넷 다 통과한다. 대가는 지연 VFS 상실로 React 1.8×다(§9).
+7. **폐쇄성의 비용이 한 번 실제로 청구됐다.** PoC를 돌린 리눅스 샌드박스에서 **WebContainer는 부팅하지 못했고**(런타임 호스트가 차단됨) 인터셉트는 돌았다. 지금까지 이건 "둘을 나란히 비교할 수 없다"는 불편함으로만 기록돼 있었는데, 사실은 **StackBlitz 원격 인프라 의존이 실행 자체를 막은 관측**이다 — §1이 이유로 적어둔 항목이 실제로 일어난 것이다.
 
 ### 탐색 도중 나타난 제3의 길
 
@@ -509,9 +739,11 @@ emit 형태도 vite와 같다: `__wcPreload(() => import("./featureA-….js"), [
 
 > **빌드 도구를 실행하지 말고, 우리가 빌드 도구가 된다.**
 
-번들러 인터셉트(`rollup`→`@rollup/browser`, `esbuild`→esbuild-wasm, vite 8이면 `rolldown`→`@rolldown/browser` + lightningcss-wasm)로 브라우저에서 **동작하는 프로덕션 `dist/`가 나온다.** "Node를 에뮬레이트하는" 문제가 "vite의 파이프라인을 재구현하는" 문제로 바뀌고, 후자가 훨씬 작다 — 그리고 빠르다. vite 5의 `dist/node`가 node 빌트인 24개와 `execSync`를 요구하는데, 인터셉트는 그 24개가 전부 불필요하다.
+번들러 인터셉트(`rolldown`→`@rolldown/browser` + lightningcss-wasm)로 브라우저에서 **동작하는 프로덕션 `dist/`가 나온다.** "Node를 에뮬레이트하는" 문제가 "vite의 파이프라인을 재구현하는" 문제로 바뀌고, 후자가 훨씬 작다 — 그리고 빠르다. vite 5의 `dist/node`가 node 빌트인 24개와 `execSync`를 요구하는데, 인터셉트는 그 24개가 전부 불필요하다.
 
 여기까지 실제로 확인한 것: 프로덕션 빌드 동작(런타임 검증 포함), CSS·lazy 청크가 네이티브 vite와 **바이트 동일**, React(실제 의존성·CJS interop·`exports` 맵) 통과, 동적 청킹, lightningcss, `__wcPreload`로 워터폴 제거(~1.9×), 그리고 그 과정에서 **캐시 오염 버그 발견·수정**.
+
+**단, "React 통과"는 나중에 읽던 것보다 좁은 주장으로 판명됐다.** 전용 픽스처(`sample-exports-app`)를 쓰고 나서야 수제 리졸버가 레거시 `browser` 필드와 `imports` 필드를 아예 구현하지 않았다는 게 드러났다 — React가 그 둘을 안 써서 안 걸렸을 뿐이다. 같은 픽스처가 의존성 스캔이 `node_modules/**/dist/`를 통째로 버리던 버그도 잡았는데, 이것도 React 패키지들이 `cjs/`·`umd/`에서 배포해서 안 걸렸던 것이다. **한 픽스처가 통과한다는 건 그 픽스처가 쓰는 형태만 통과한다는 뜻이다**(확정 6, §9).
 
 ### 그 길의 진짜 경계 (여기가 중요하다)
 
@@ -521,23 +753,62 @@ emit 형태도 vite와 같다: `__wcPreload(() => import("./featureA-….js"), [
 
 wc-exe의 약속은 "**임의의** 프로젝트를 빌드"인데, "임의"가 사는 곳이 바로 플러그인 생태계다 — Vue SFC, Svelte, MDX, tailwind 플러그인, legacy 타겟, `publicDir`, multi-page. 그건 하나도 손대지 않았다. 그래서 인터셉트는 **현재로선 "빠르고 오픈이지만 좁은" 경로**이고, 넓히는 비용이 이 접근의 미래를 좌우한다.
 
+**그리고 경계 이전에 구멍이 하나 있다.** 위 두 경계는 "빌드가 무엇을 못 하나"인데, 그보다 앞서 **인터셉트는 `npm install`을 하지 않는다.** 디스크에 이미 있는 `node_modules`를 읽는다 — 즉 wc-exe가 없애려던 그 작업을 사용자가 먼저 해야 한다. 대체하는 조각도 가장 작다(부팅 5.4s + install 0.30s + 빌드 1.6s 중 빌드만). 다만 실측해보면 그 벽이 낮을 수 있다는 신호가 있다(§9 《install 없는 인터셉트》): React 픽스처 71개 패키지 중 인터셉트 빌드에 걸리는 lifecycle 훅은 **0개**이고, 필요한 런타임 클로저는 **5개·5MB**다.
+
+**경계가 하나 더 있다 — 범위가 아니라 정확성 쪽이다.** 위 경계는 "못 하는 게 있다"는 정직한 한계지만, 수제 리졸버의 문제는 **틀리게 성공한다**는 것이다. `browser` 필드를 쓰는 패키지를 만나면 빌드는 되고 앱은 렌더되는데 의존성의 Node 빌드가 조용히 브라우저 번들에 링크된다(확정 6). 그래서 이제 "인터셉트"라고 말할 때 **두 변형을 구분해야 한다** — 플러그인 VFS는 이 부류를 계속 만들고, memfs VFS는 그 책임을 rolldown에 넘긴다.
+
+### 이음새의 고도 — 저수준으로 가려면 층을 하나 더 얹어야 한다
+
+인터셉트를 "PoC"에서 "선택 가능한 백엔드"로 올리려 할 때 실제로 걸리는 건 성능도 범용성도 아니라 **이음새가 그어진 높이**다.
+
+`src/runner/src/runtime/runtime.types.ts`는 WebContainer 모양으로 그려져 있고 그건 의도된 선택이다 — 남이 이미 아는 모양이 만족시키기 쉽고, 어댑터가 순수 pass-through로 남는다. 그런데 **번들러 인터셉트에는 프로세스가 없다.** `spawn('npm', ['run', 'build'])`를 구현하려면 명령어 문자열을 패턴 매칭해 흉내내야 하는데, 그건 같은 파일이 경고하는 바로 그것이다 — _"the adapter cannot quietly acquire behaviour of its own"_.
+
+그러니 필요한 건 `Runtime`을 넓히는 게 아니라 그 **위에 얇은 층을 하나 더 얹는 것**이다. "명령을 실행한다"가 아니라 "**프로젝트에서 `dist/`를 만든다**":
+
+```
+Builder { build(project, options) → dist }
+  ├─ WebContainerBuilder → Runtime.spawn('npm', ['run', 'build'])
+  └─ InterceptBuilder    → 브라우저에서 rolldown 직접 구동 (spawn 없음)
+```
+
+`Runtime`은 그대로 두고 `Builder`가 그 위에 선다. 이게 없으면 인터셉트는 영원히 PoC로 남는다. 다만 **아래 미결 1의 측정에는 이 층이 필요 없다** — 둘을 그냥 나란히 돌리면 된다. 순서가 뒤바뀌면 안 되는 이유다.
+
 ### 지금의 권고
 
 - **프로덕션 경로는 바꾸지 않는다.** WebContainer + OPFS/타르볼 캐시가 현재 최적이고, 이미 실측으로 실익이 증명됐다.
-- **인터셉트는 PoC로 유지한다.** 성능·개방성(CDN 불필요, rollup 경로는 COOP/COEP도 불필요)은 매력적이지만 범용성이 아직 약속을 못 지킨다. WebContainer 독점 의존이 실제로 발목을 잡거나, 대상 프로젝트군이 "vite + JSX" 정도로 좁게 수렴하면 그때 승격 후보다.
+- **인터셉트는 PoC로 유지한다.** 성능·개방성(CDN 불필요)은 매력적이지만 범용성이 아직 약속을 못 지킨다. WebContainer 독점 의존이 실제로 발목을 잡거나, 대상 프로젝트군이 "vite + JSX" 정도로 좁게 수렴하면 그때 승격 후보다. **승격한다면 `--vfs=memfs` 변형이다**(확정 6).
+- ~~**rollup 경로**~~ — **걷어냈다.** 아래 «rolldown 단일화» 참조.
 - **container2wasm은 성능이 아니라 다른 동인(네이티브 애드온·비-JS 툴체인)이 생길 때만 재검토한다.**
+- **vite를 포크하지 않는다.** vrowzer가 포팅 비용을 실측으로 보여줬다 — 25k~28k줄 + vite 버전 고정 + upstream 영구 추적, 그러고도 프로덕션 `dist/`는 아직 안 나온다(§9). 브라우저에서 도는 `vite build`는 upstream vite가 낼 것이고, 그때 공짜로 받는다.
 
 ### 남은 미결
 
 0. **부팅 상주화(persistent runner)** — 캐시가 install을 0.30s로 줄인 뒤 **부팅 ~5.4s가 지배적 비용**(warm 실행의 ~70%)이 됐다. 엔진 교체보다 훨씬 싸게 남은 가장 큰 덩어리를 건드린다. 설계: `docs/persistent-runner.md`.
-1. **한 머신에서 WebContainer `npm run build` vs 인터셉트 비교** — 유일하게 남은 큰 미측정. 이 저장소의 벤치 수치는 macOS, PoC 수치는 Linux 컨테이너에서 잰 것이라 직접 비교가 불가하고, WebContainer는 샌드박스에서 부팅되지 않는다. **로컬에서 둘을 나란히 돌리면 이 탐색의 마지막 숫자가 채워진다.**
+1. **한 머신에서 WebContainer `npm run build` vs 인터셉트 비교** — 큰 미측정 하나. 이 저장소의 벤치 수치는 macOS, PoC 수치는 Linux 컨테이너에서 잰 것이라 직접 비교가 불가하고, WebContainer는 샌드박스에서 부팅되지 않는다.
+
+   **단, 지금 그대로 재면 사과와 오렌지를 비교하게 된다.** 미결 8이 남아 있는 한 인터셉트는 `npm install`을 하지 않으므로(§9), 측정되는 건 "**설치가 끝난 상태에서의 빌드 시간**"뿐이다. 그건 WebContainer 경로 warm 실행 비용의 약 1/5다(부팅 5.4s + install 0.30s + 빌드 1.6s 중 빌드만). 그러니 둘 중 하나를 해야 한다:
+   - **범위를 명시한다** — "빌드 단계만"이라고 못 박고, 부팅·install은 비교에서 제외한다고 결과에 적는다. 그러면 이 숫자는 "인터셉트를 승격할 가치가 있나"가 아니라 "번들러 자체가 더 빠른가"만 답한다.
+   - **인터셉트 쪽에 install 비용을 얹는다** — 미결 8이 되고 나서 재면 비로소 같은 일을 하는 두 경로의 비교가 된다.
+
+   전자가 지금 가능한 것이고, 후자가 실제로 결정을 내려주는 것이다. **"이 탐색의 마지막 숫자"였던 지위는 미결 8에게 넘어갔다.**
+
 2. 플러그인 호환성 — 위에서 말한 경계. 무엇을 얼마나 지원할지가 곧 범위 결정이다.
-3. 미검증 생태계 형태: `browser` 필드 remap, 깊은 `exports` 와일드카드, worker/wasm import, CSS `@import`/`url()` 애셋 참조, sourcemap, multi-page.
+3. 미검증 생태계 형태 — **일부 해소.** `browser` 필드 remap·`imports` 필드·깊은 `exports` 와일드카드는 `sample-exports-app`으로 검증했고(네이티브 vite 기준 대조), **`--vfs=memfs`만 전부 통과한다**(§9). 남은 것: worker/wasm import, CSS `@import`/`url()` 애셋 참조, sourcemap, multi-page.
 4. 캐시 고도화(§5): cacache blob 무한 증가는 상한으로 막았지만, lockfile diff 기반 부분 무효화(burrow `src/npm`의 stale-lock retry가 원형)는 아직 안 했다.
+5. **`Builder` 이음새** — 인터셉트를 두 번째 백엔드로 올리려면 `Runtime` 위에 "프로젝트 → `dist/`" 층이 필요하다(위 «이음새의 고도»). 1의 측정이 유리하게 나온 **뒤에** 긋는다.
+6. ~~**fs-proxy memfs 이식 실험**~~ — **완료(`--vfs=memfs`).** 동작하고 출력이 바이트 동일하며, 지연 VFS는 예상대로 살아남지 못해 React에서 1.8×를 문다. 미결 3의 해당 형태들은 이 모드에서만 올바로 해석된다(위 3 참조). vrowzer의 10MB 페이로드 패치는 **필요 없었다**. §9 참조.
+7. **OXC `vite.config.ts` 정적 추출**(§9 vrowzer) — 미결 2를 포크 없이 좁히는 저비용 수단. 못 다루는 설정을 `unsupported[]`로 신고하는 부분이 특히 우리 취향이다.
+8. **install 없는 인터셉트** — 인터셉트가 wc-exe의 실제 문제를 풀려면 반드시 필요하다(§9). 순서: ① 픽스처 하나가 아니라 프로젝트 몇 개에서 lifecycle 훅 빈도와 런타임 클로저 크기를 재고 ② 되면 호스트가 lockfile → 타르볼 → 메모리 → 볼륨을 잇는다. **npm 트리 해석을 재현해야 하는 부분이 비용의 본체**라는 «하이브리드 착지점»의 경고가 그대로 적용된다.
 
 ### 이 탐색에서 배운 방법론
 
-수치를 믿기 전에 **교차 측정**하고, 통과를 믿기 전에 **검사가 실패하는지** 확인해야 했다. 실제로 그 과정에서 잡은 것들: 스냅샷 HIT이 빈 디렉터리를 HIT으로 보고하던 기존 버그, 게스트 클럭 스큐, lightningcss가 번들 버스트를 두 배로 만드는 비용, react-dom의 CSS 속성명 목록이 만든 오탐, oxc의 백틱 리터럴, 그리고 해시 정합성 캐시 오염. **문서에 적힌 수치 중 처음 측정에서 그대로 살아남은 게 거의 없다.**
+수치를 믿기 전에 **교차 측정**하고, 통과를 믿기 전에 **검사가 실패하는지** 확인해야 했다. 실제로 그 과정에서 잡은 것들: 스냅샷 HIT이 빈 디렉터리를 HIT으로 보고하던 기존 버그, 게스트 클럭 스큐, lightningcss가 번들 버스트를 두 배로 만드는 비용, react-dom의 CSS 속성명 목록이 만든 오탐, oxc의 백틱 리터럴, 해시 정합성 캐시 오염, 의존성 스캔이 `node_modules/**/dist/`를 통째로 버리던 버그, 그리고 런타임 검사가 죽으면서 static 결과를 통째로 가리던 하네스 결함. **문서에 적힌 수치 중 처음 측정에서 그대로 살아남은 게 거의 없다.**
+
+여기에 두 가지가 더해졌다.
+
+**① 남의 코드에서 베낀 전제도 재야 한다.** vrowzer의 fs-proxy 페이로드 10KB → 10MB 확장은 논리가 빈틈없어 보였고(react-dom 130KB를 10KB 버퍼로 못 받는다) 그대로 이식했는데, 재보니 **stock 10KB에서도, 1KB에서도 빌드된다.** 모듈 내용이 그 경로로 안 다니기 때문이다. 검증 없이 이식했으면 의존성 소스 패치를 영구히 지고 갈 뻔했다.
+
+**② "통과"는 픽스처가 시험하는 형태에 대해서만 참이다.** React 픽스처가 오래 통과하는 동안 수제 리졸버는 `browser` 필드와 `imports` 필드를 아예 구현하지 않은 상태였고, 하네스는 `node_modules/**/dist/`를 통째로 버리고 있었다. 둘 다 **그걸 찾으러 간 픽스처를 쓰고 나서야** 나왔다. 새 형태를 지원한다고 말하기 전에 그 형태만 보는 픽스처를 먼저 쓰고, **기준(native `vite build`)과 대조**해야 한다.
 
 ---
 
@@ -550,6 +821,7 @@ wc-exe의 약속은 "**임의의** 프로젝트를 빌드"인데, "임의"가 �
 - ["Running QEMU Inside Browser" (FOSDEM 2025)](https://archive.fosdem.org/2025/events/attachments/fosdem-2025-6290-running-qemu-inside-browser/slides/238760/slides_1dDtpcS.pdf)
 - [burrow](https://github.com/dhravya/burrow) — 오픈소스(MIT) WebContainer 대안: 네이티브 JS 엔진 + 주변 가상화 (§8)
 - [almostnode](https://github.com/macaly/almostnode) — 오픈소스(MIT) 브라우저 Node: 진짜 npm install + 번들러 인터셉트, dev 중심 (§9)
+- [vrowzer](https://github.com/kazupon/vrowzer) — 오픈소스(MIT) 브라우저 vite dev server: 진짜 vite 포크(~40k줄), dev 전용·빌드 미연결, `@rolldown/browser`에 memfs를 물리는 fs-proxy 구현 (§9)
 - [ZenFS](https://github.com/zen-fs/core) (구 [BrowserFS](https://github.com/jvilk/BrowserFS)) — 플러그블 백엔드 VFS
 - [v86](https://github.com/copy/v86) — x86 브라우저 에뮬레이터
 - [OPFS 설명](https://renderlog.in/blog/origin-private-file-system-opfs/)

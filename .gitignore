@@ -42,6 +42,12 @@ build/Release
 node_modules/
 jspm_packages/
 
+# ...except this fixture's, which is hand-written source, not installed output.
+# The packages exist to exercise dependency-resolution shapes (legacy `browser`
+# field, `imports`, `exports` wildcards) and have to be committed for the
+# fixture to mean anything. See poc/vite-build-intercept/README.md.
+!test/fixtures/sample-exports-app/node_modules/
+
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/
 
@@ -134,3 +140,9 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# Re-include the exports fixture's hand-written packages. This has to come last:
+# `dist` is ignored above as build output, and one of these packages
+# deliberately ships from `dist/` — which is what caught the dependency scan
+# dropping `node_modules/**/dist/`. See poc/vite-build-intercept/README.md.
+!test/fixtures/sample-exports-app/node_modules/**
