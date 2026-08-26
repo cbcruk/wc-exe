@@ -88,6 +88,7 @@ export async function install(options: InstallOptions): Promise<void> {
 
     browser = new WCBrowser({
       verbose: true,
+      link: serverInfo.link,
       userDataDir: cacheStable ? CHROME_PROFILE_DIR : undefined,
     })
     await withSpin({

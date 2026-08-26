@@ -1,5 +1,6 @@
 import { type Browser, type Page } from 'puppeteer-core'
 import { launchChrome } from './chrome.js'
+import type { RunnerLink } from './rpc.js'
 import type {
   CacheResult,
   CommandResult,
@@ -22,6 +23,7 @@ export class WCBrowser {
   private page: Page | null = null
   private verbose: boolean = false
   private userDataDir: string | undefined
+  private link: RunnerLink | undefined
   /** Source of generated command handles; see {@link runCommand}. */
   private handleSequence = 0
   /** Live output listeners, by shell id; see {@link openShell}. */
@@ -47,11 +49,21 @@ export class WCBrowser {
   constructor(options?: {
     verbose?: boolean
     userDataDir?: string
+    /**
+     * Control channel the page attaches to.
+     *
+     * Not used to drive anything yet — the calls below still go through CDP.
+     * It is wired up first so the channel can be confirmed against a real
+     * browser before the calls move onto it, since this repository's sandbox
+     * cannot boot WebContainer to test the switch.
+     */
+    link?: RunnerLink
     browser?: Browser
   }) {
     this.verbose = options?.verbose ?? false
     this.userDataDir = options?.userDataDir
     this.sharedBrowser = options?.browser
+    this.link = options?.link
   }
 
   /**
@@ -97,6 +109,21 @@ export class WCBrowser {
         (window as unknown as { __WC_READY__?: boolean }).__WC_READY__ === true,
       { timeout: 60000 }
     )
+
+    // Confirms the page found its way back over HTTP as well. Nothing depends
+    // on it yet — the calls below still go through CDP — but a channel that is
+    // silently not connecting would otherwise only be discovered when the
+    // calls move onto it.
+    if (this.link && this.verbose) {
+      await this.link
+        .waitForReady(5000)
+        .then(() => console.log('[Browser] control channel attached'))
+        .catch((err: Error) =>
+          console.log(
+            `[Browser] control channel did not attach: ${err.message}`
+          )
+        )
+    }
   }
 
   /**

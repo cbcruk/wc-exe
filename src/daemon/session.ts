@@ -1,6 +1,7 @@
 import path from 'node:path'
 import type { Browser } from 'puppeteer-core'
 import { WCBrowser } from '../core/browser.js'
+import { RunnerLink } from '../core/rpc.js'
 import {
   listProjectFiles,
   readProjectFileBytes,
@@ -60,6 +61,14 @@ export class Session {
   private poisoned: string | null = null
 
   readonly id: string
+  /**
+   * Control channel for this session's page.
+   *
+   * One per session rather than one per daemon: the pages share a server but
+   * not a container, and a call routed to the wrong page would drive the wrong
+   * project's build.
+   */
+  readonly link = new RunnerLink()
   readonly source: string
   private readonly origin: string
   private readonly getBrowser: () => Promise<Browser>
@@ -110,6 +119,7 @@ export class Session {
     this.browser = new WCBrowser({
       verbose,
       browser: await this.getBrowser(),
+      link: this.link,
     })
     await this.browser.launch(`${this.origin}/s/${this.id}/`)
     this.booted = true

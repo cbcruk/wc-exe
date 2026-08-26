@@ -75,7 +75,7 @@ export async function dev(options: DevOptions): Promise<void> {
       failMessage: 'Failed to start server',
     })
 
-    browser = new WCBrowser({ verbose: false })
+    browser = new WCBrowser({ verbose: false, link: serverInfo.link })
     await withSpin({
       spinner,
       message: 'Launching headless browser...',

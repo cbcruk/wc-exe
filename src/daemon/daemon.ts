@@ -10,6 +10,7 @@ import {
   ensureCacheDirs,
 } from '../core/cache.js'
 import { launchChrome } from '../core/chrome.js'
+import { mountRpcRoutes } from '../core/rpc.js'
 import { resolveRunnerDist } from '../core/runner-assets.js'
 import { controlPlaneGuard } from './auth.js'
 import {
@@ -119,6 +120,10 @@ export async function startDaemon(
     c.header('Cross-Origin-Embedder-Policy', 'require-corp')
     c.header('Cross-Origin-Opener-Policy', 'same-origin')
   })
+
+  // The page resolves `api/rpc/*` against its own directory, so a session's
+  // control channel lands here without the runner knowing about sessions.
+  mountRpcRoutes(app, '/s/:id', (c) => sessionFor(c.req.param('id'))?.link)
 
   app.get('/s/:id/api/files', async (c) => {
     const session = sessionFor(c.req.param('id'))

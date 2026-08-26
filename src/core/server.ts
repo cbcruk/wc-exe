@@ -2,6 +2,7 @@ import { Hono } from 'hono'
 import { serve, type ServerType } from '@hono/node-server'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { resolveRunnerDist } from './runner-assets.js'
+import { mountRpcRoutes, RunnerLink } from './rpc.js'
 import type { ServerHandlers } from './types.js'
 
 function toArrayBuffer(view: Uint8Array): ArrayBuffer {
@@ -20,9 +21,13 @@ function toArrayBuffer(view: Uint8Array): ArrayBuffer {
  * WebContainer — requires.
  *
  * @param handlers Host-side filesystem callbacks backing the `/api` routes.
+ * @param link Control channel the page attaches to. Optional only so callers
+ *   that never drive the page (tests) can skip it.
  */
-export function createApp(handlers: ServerHandlers): Hono {
+export function createApp(handlers: ServerHandlers, link?: RunnerLink): Hono {
   const app = new Hono()
+
+  if (link) mountRpcRoutes(app, '', () => link)
 
   app.use('*', async (c, next) => {
     await next()
@@ -72,6 +77,8 @@ export interface ServerInfo {
   port: number
   /** Origin the runner page is served from, e.g. `http://localhost:5199`. */
   url: string
+  /** Control channel the runner page attaches to; hand it to {@link WCBrowser}. */
+  link: RunnerLink
 }
 
 /**
@@ -87,7 +94,8 @@ export function startServer(
 ): Promise<ServerInfo> {
   return new Promise((resolve, reject) => {
     try {
-      const app = createApp(handlers)
+      const link = new RunnerLink()
+      const app = createApp(handlers, link)
       const server = serve(
         {
           fetch: app.fetch,
@@ -110,6 +118,7 @@ export function startServer(
             // own node_modules cache and neither could use the other's. It also
             // avoids `localhost` resolving to ::1 while we listen on IPv4.
             url: `http://127.0.0.1:${info.port}`,
+            link,
           })
         }
       )
