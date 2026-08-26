@@ -55,10 +55,7 @@ export async function build(options: BuildOptions): Promise<void> {
   const cleanup = async (): Promise<void> => {
     spinner.stop()
     await browser?.close()
-    if (serverInfo?.server) {
-      const server = serverInfo.server
-      await new Promise<void>((resolve) => server.close(() => resolve()))
-    }
+    await serverInfo?.shutdown()
   }
 
   process.on('SIGINT', async () => {

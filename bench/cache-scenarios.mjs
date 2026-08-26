@@ -15,6 +15,16 @@
 // The headline comparison is C vs D: identical work, only difference is whether
 // the tarball cache was available.
 //
+// **Five tabs.** wc-exe opens the runner page in your browser rather than
+// launching one, so each scenario opens a tab, plus one to clean up after. They
+// are left open — the host does not own them and cannot close them.
+//
+// The benchmark runs at its own origin (127.0.0.1:5298, override with
+// `WC_EXE_BENCH_PORT`) so its OPFS is separate from the cache your real builds
+// use at 5199. That separation used to come from a Chrome profile directory of
+// our own; there is no profile to own any more, and origin is the other axis
+// OPFS is scoped on.
+//
 // Usage: node bench/cache-scenarios.mjs
 
 import { fileURLToPath } from 'node:url'
@@ -23,7 +33,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import {
   startServer,
-  WCBrowser,
+  RunnerClient,
   listProjectFiles,
   readProjectFileBytes,
 } from '../dist/index.js'
@@ -33,21 +43,17 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(__dirname, '..')
 const FIXTURE = path.join(repoRoot, 'test/fixtures/sample-vite-app')
 
-// Keep the benchmark's OPFS/profile isolated from the user's real ~/.cache/wc-exe.
-const CACHE_ROOT = path.join(os.tmpdir(), 'wc-exe-bench-cache')
-const CHROME_PROFILE_DIR = path.join(CACHE_ROOT, 'chrome-profile')
-// OPFS is origin-scoped, so the runner port must be stable across runs.
-const CACHE_PORT = 5199
+// OPFS is origin-scoped, so the runner port must be stable across runs — and
+// **not the product's 5199**. The benchmark used to keep clear of the user's
+// real cache by owning a Chrome profile directory; with the page in the user's
+// own browser there is no such directory, so isolation moves to the origin. A
+// port of our own is a cache of our own.
+const CACHE_PORT = Number(process.env.WC_EXE_BENCH_PORT ?? 5298)
 
 // A tiny zero-dependency package: adding it changes the cache key (forcing a
 // node_modules MISS) while every pre-existing tarball can still replay from
 // cache. That isolates the tarball cache's contribution.
 const NEW_DEP = { name: 'ms', version: '2.1.3' }
-
-function wipeCaches() {
-  fs.rmSync(CACHE_ROOT, { recursive: true, force: true })
-  fs.mkdirSync(CHROME_PROFILE_DIR, { recursive: true })
-}
 
 function makeProjectCopy(withExtraDep) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wc-exe-bench-proj-'))
@@ -66,7 +72,6 @@ function makeProjectCopy(withExtraDep) {
 }
 
 async function runScenario({ label, wipe, withExtraDep }) {
-  if (wipe) wipeCaches()
   const projectDir = makeProjectCopy(withExtraDep)
 
   const handlers = {
@@ -81,22 +86,46 @@ async function runScenario({ label, wipe, withExtraDep }) {
     )
   }
 
-  const browser = new WCBrowser({ userDataDir: CHROME_PROFILE_DIR })
-  const logs = []
+  const browser = new RunnerClient({ verbose: false, link: serverInfo.link })
 
   try {
     const bootStart = performance.now()
+    console.log(`  waiting for the runner page at ${serverInfo.url} ...`)
     await browser.launch(serverInfo.url)
     const bootMs = Math.round(performance.now() - bootStart)
 
-    // capture the runner's cache decisions from the page console
-    browser.page?.on?.('console', (m) => logs.push(m.text()))
+    // A cold scenario used to be produced by deleting the Chrome profile
+    // directory before the run. Nothing host-side owns that storage now, so
+    // the page clears its own — which is why it happens here, after boot,
+    // rather than before the server starts.
+    //
+    if (wipe) {
+      const cleared = await browser.clearCache()
+      console.log(
+        `  (wiped ${cleared.removed.length} blob(s), ` +
+          `${(cleared.bytes / 1048576).toFixed(1)} MB)`
+      )
+    }
 
     await browser.mountFromServer()
 
     const installStart = performance.now()
     const result = await browser.installWithCache()
     const installMs = Math.round(performance.now() - installStart)
+
+    // The wipe is checked by its consequence rather than by counting blobs.
+    // Counting is the wrong test: scenario A legitimately finds nothing to
+    // delete on a fresh origin, so a count would either be vacuous there or
+    // wrong everywhere else. What every cold scenario actually needs is that
+    // the install MISSED — and a wipe that silently failed would turn A and D
+    // into warm runs, making the headline C-vs-D comparison a measurement of
+    // two warm runs that still look convincingly different.
+    if (wipe && result.cached) {
+      throw new Error(
+        `${label.trim()}: cache was wiped but the install still HIT — ` +
+          `this scenario is not cold, and the comparison it feeds is invalid`
+      )
+    }
 
     const buildStart = performance.now()
     const { exitCode } = await browser.runCommand('npm', ['run', 'build'])
@@ -119,7 +148,40 @@ async function runScenario({ label, wipe, withExtraDep }) {
     return { label, bootMs, installMs, buildMs, producedFiles, ...result }
   } finally {
     await browser.close()
-    await new Promise((r) => serverInfo.server.close(() => r()))
+    await serverInfo.shutdown()
+    fs.rmSync(projectDir, { recursive: true, force: true })
+  }
+}
+
+/**
+ * Leaves the benchmark's origin as it found it.
+ *
+ * D is the last scenario and it installs, so it leaves a snapshot and a
+ * tarball cache behind — roughly 90 MB. That used to disappear with the
+ * benchmark's cache directory; now it is browser storage, and only a page at
+ * this origin can reach it. Cheap next to a run that takes minutes, and the
+ * alternative is silently parking 90 MB in someone's browser.
+ */
+async function clearLeftovers() {
+  const projectDir = makeProjectCopy(false)
+  const serverInfo = await startServer(
+    {
+      listFiles: () => listProjectFiles(projectDir),
+      readFile: (relPath) => readProjectFileBytes(projectDir, relPath),
+    },
+    CACHE_PORT
+  )
+  const browser = new RunnerClient({ verbose: false, link: serverInfo.link })
+  try {
+    await browser.launch(serverInfo.url)
+    const cleared = await browser.clearCache()
+    console.log(
+      `\ncleaned up: ${cleared.removed.length} blob(s), ` +
+        `${(cleared.bytes / 1048576).toFixed(1)} MB`
+    )
+  } finally {
+    await browser.close()
+    await serverInfo.shutdown()
     fs.rmSync(projectDir, { recursive: true, force: true })
   }
 }
@@ -180,7 +242,7 @@ async function main() {
     )
   }
 
-  fs.rmSync(CACHE_ROOT, { recursive: true, force: true })
+  await clearLeftovers()
 }
 
 main().catch((err) => {

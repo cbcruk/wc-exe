@@ -57,6 +57,8 @@ export class RunnerLink {
   /** Listeners for "the page stopped being there"; see {@link onDisconnect}. */
   private disconnectListeners = new Set<() => void>()
   private graceTimer: ReturnType<typeof setTimeout> | null = null
+  /** Ends the open event stream; see {@link close}. */
+  private endStream: (() => void) | null = null
 
   /**
    * How long a dropped stream is given to come back before the page counts as
@@ -168,6 +170,16 @@ export class RunnerLink {
 
   /** Route handler: `GET …/api/rpc/events`. Holds the stream open. */
   events(c: Context): Response | Promise<Response> {
+    // A closed link serves no streams. Ending the open one is not enough:
+    // `EventSource` reconnects, so between {@link close} and the server
+    // actually shutting down the page would attach again and hold the socket
+    // open forever — which is a hang, not a leak.
+    //
+    // **204, deliberately.** The EventSource spec treats any status other than
+    // 200 as fatal and stops reconnecting, so this also tells the tab to give
+    // up rather than retry a host that has gone.
+    if (this.closed) return c.body(null, 204)
+
     return streamSSE(c, async (stream) => {
       // A stream arriving inside the grace window is the same page reconnecting,
       // so the pending calls it left behind are still its own to answer.
@@ -189,8 +201,10 @@ export class RunnerLink {
       for (const message of this.queue.splice(0)) this.push(message)
 
       // The stream stays open for the life of the page; resolving would end it
-      // and the page would reconnect for nothing.
+      // and the page would reconnect for nothing. The one exception is
+      // {@link close} — see there for why the host must be able to end it.
       await new Promise<void>((resolve) => {
+        this.endStream = resolve
         stream.onAbort(() => {
           this.push = null
           if (!this.closed) {
@@ -250,10 +264,16 @@ export class RunnerLink {
   }
 
   /**
-   * Fails every outstanding call.
+   * Fails every outstanding call and lets go of the page.
    *
-   * Without this a host shutting down while a command is in flight would hang
-   * on a promise nothing can settle any more.
+   * Two things have to happen, and the second is easy to miss. Failing the
+   * pending calls stops a host shutting down mid-command from hanging on a
+   * promise nothing can settle. **Ending the event stream stops the host from
+   * hanging on the socket.** An SSE response never completes on its own, so
+   * `server.close()` waits on it forever — and the host cannot ask the page to
+   * let go, because the page is in a browser it does not own. Anything that
+   * shuts a server down while a tab is attached — `wc-exe daemon stop`, a
+   * benchmark between scenarios — depends on this line.
    */
   close(reason = 'Runner link closed'): void {
     this.closed = true
@@ -266,6 +286,8 @@ export class RunnerLink {
     this.pending.clear()
     this.readyReject?.(new Error(reason))
     this.push = null
+    this.endStream?.()
+    this.endStream = null
   }
 }
 

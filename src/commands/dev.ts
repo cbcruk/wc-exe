@@ -49,10 +49,7 @@ export async function dev(options: DevOptions): Promise<void> {
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
 
-    if (serverInfo?.server) {
-      const server = serverInfo.server
-      await new Promise<void>((resolve) => server.close(() => resolve()))
-    }
+    await serverInfo?.shutdown()
   }
 
   process.on('SIGINT', async () => {

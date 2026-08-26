@@ -24,11 +24,9 @@
 
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
-import fs from 'node:fs'
-import os from 'node:os'
 import {
   startServer,
-  WCBrowser,
+  RunnerClient,
   listProjectFiles,
   readProjectFileBytes,
 } from '../dist/index.js'
@@ -38,13 +36,17 @@ import { assertBuildProduced } from './verify.mjs'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(__dirname, '..')
 
-// Kept out of the user's real ~/.cache/wc-exe so a benchmark never disturbs —
-// or is disturbed by — their day-to-day cache.
-const CACHE_ROOT = path.join(os.tmpdir(), 'wc-exe-bench-webcontainer')
-const CHROME_PROFILE_DIR = path.join(CACHE_ROOT, 'chrome-profile')
 // OPFS is scoped per origin (scheme+host+port), so the port must be stable
 // across runs or every run starts with an empty cache.
-const CACHE_PORT = Number(process.env.WC_EXE_CACHE_PORT ?? 5199)
+//
+// **Not 5199.** That is the product's cache port, and the benchmark used to
+// stay clear of the user's day-to-day cache by pointing wc-exe at a Chrome
+// profile directory of its own. There is no profile to point at any more — the
+// page runs in the user's browser — so the isolation moves to the only other
+// axis OPFS is scoped on: a port of our own gives a different origin and
+// therefore a different cache. It also means a running daemon on 5199 no
+// longer blocks the benchmark.
+const CACHE_PORT = Number(process.env.WC_EXE_BENCH_PORT ?? 5299)
 
 function parseArgs(argv) {
   const args = {
@@ -78,7 +80,7 @@ async function timed(label, fn) {
   return { ms, result }
 }
 
-async function runOnce(source, { cache }) {
+async function runOnce(source, { cache, wipeCache = false }) {
   const handlers = {
     listFiles: () => listProjectFiles(source),
     readFile: (relPath) => readProjectFileBytes(source, relPath),
@@ -89,19 +91,31 @@ async function runOnce(source, { cache }) {
     : await startServer(handlers)
 
   if (cache && serverInfo.port !== CACHE_PORT) {
-    await new Promise((r) => serverInfo.server.close(() => r()))
+    await serverInfo.shutdown()
     throw new Error(
       `port ${CACHE_PORT} unavailable (got ${serverInfo.port}); the OPFS cache would not persist`
     )
   }
 
-  const browser = new WCBrowser({
-    verbose: false,
-    userDataDir: cache ? CHROME_PROFILE_DIR : undefined,
-  })
+  const browser = new RunnerClient({ verbose: false, link: serverInfo.link })
 
   try {
+    // The page is opened in the desktop browser, so a run that never starts
+    // looks like a silent hang. The URL is the only actionable thing to show.
+    console.log(`  waiting for the runner page at ${serverInfo.url} ...`)
     const boot = await timed('boot', () => browser.launch(serverInfo.url))
+
+    // Cleared through the page, not by deleting a directory: OPFS belongs to
+    // the browser now. After boot so there is a page to ask, and before the
+    // install so the run it precedes really is cold.
+    if (wipeCache) {
+      const cleared = await browser.clearCache()
+      console.log(
+        `  cleared cache: ${cleared.removed.length} blob(s), ` +
+          `${(cleared.bytes / 1048576).toFixed(1)} MB`
+      )
+    }
+
     const mount = await timed('mount', () => browser.mountFromServer())
 
     let cacheHit = null
@@ -136,7 +150,7 @@ async function runOnce(source, { cache }) {
     }
   } finally {
     await browser.close()
-    await new Promise((resolve) => serverInfo.server.close(() => resolve()))
+    await serverInfo.shutdown()
   }
 }
 
@@ -149,16 +163,25 @@ async function main() {
   console.log(`  runs:    ${runs}`)
   console.log(`  mode:    ${cache ? 'cache (run 1 seeds, 2..N warm)' : 'cold'}`)
   if (cache) {
-    console.log(`  cache:   ${CACHE_ROOT}${keepCache ? ' (kept)' : ' (wiped)'}`)
-    if (!keepCache) fs.rmSync(CACHE_ROOT, { recursive: true, force: true })
-    fs.mkdirSync(CHROME_PROFILE_DIR, { recursive: true })
+    console.log(
+      `  cache:   OPFS at 127.0.0.1:${CACHE_PORT}` +
+        `${keepCache ? ' (kept)' : ' (wiped on run 1)'}`
+    )
   }
   console.log()
 
   const results = []
   for (let i = 1; i <= runs; i++) {
     console.log(`run ${i}/${runs}${cache && i === 1 ? ' (seeding cache)' : ''}`)
-    results.push(await runOnce(source, { cache }))
+    // The wipe happens inside run 1 rather than before the loop, because only
+    // a booted page can reach OPFS. Run 1 is the seeding run either way, so
+    // clearing at its start is the same cold start as before.
+    results.push(
+      await runOnce(source, {
+        cache,
+        wipeCache: cache && !keepCache && i === 1,
+      })
+    )
     console.log()
   }
 

@@ -71,14 +71,51 @@ export function createApp(handlers: ServerHandlers, link?: RunnerLink): Hono {
 
 /** A running local server, as returned by {@link startServer}. */
 export interface ServerInfo {
-  /** Underlying Node server handle. Close it to shut the server down. */
+  /** Underlying Node server handle. Prefer {@link ServerInfo.shutdown}. */
   server: ServerType
   /** Port actually bound — resolved, never `0`. */
   port: number
   /** Origin the runner page is served from, e.g. `http://localhost:5199`. */
   url: string
-  /** Control channel the runner page attaches to; hand it to {@link WCBrowser}. */
+  /** Control channel the runner page attaches to; hand it to `RunnerClient`. */
   link: RunnerLink
+  /**
+   * Closes the link and the server, and resolves once the port is actually
+   * free.
+   *
+   * `server.close()` on its own does not get there. It waits for every live
+   * socket, and a page that has been talking to this server leaves two kinds
+   * behind: the event stream, which by design never ends, and idle keep-alive
+   * sockets from its POSTs. A host that had opened the browser could just kill
+   * it; one that only borrowed a tab cannot, so the sockets have to be dealt
+   * with here.
+   */
+  shutdown: () => Promise<void>
+}
+
+/** Builds {@link ServerInfo.shutdown} for a running server. */
+function shutdownFor(
+  server: ServerType,
+  link: RunnerLink
+): () => Promise<void> {
+  return async () => {
+    // First, so the open stream ends and any later reconnect gets a 204
+    // instead of a fresh stream that would hold the server open again.
+    link.close('Server shutting down')
+
+    // **This is the line that makes shutdown terminate.** Measured: with it
+    // removed, a benchmark that closes its server between scenarios hangs on
+    // the first one. `closeIdleConnections()` is not enough — the page leaves
+    // sockets `close()` will wait on regardless of how they are classified,
+    // and by this point the link has already failed anything in flight, so
+    // there is nothing left worth draining.
+    const closable = server as ServerType & {
+      closeAllConnections?: () => void
+    }
+    closable.closeAllConnections?.()
+
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
 }
 
 /**
@@ -111,6 +148,7 @@ export function startServer(
         (info) => {
           resolve({
             server,
+            shutdown: shutdownFor(server, link),
             port: info.port,
             // 127.0.0.1, not `localhost`. OPFS is keyed by origin as a
             // string, so the two are different stores even though they reach
