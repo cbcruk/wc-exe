@@ -8,7 +8,15 @@
 // Byte comparison, not "looks right": a stale chunk left over from a previous
 // build is exactly the kind of difference a smoke test would wave through.
 //
-// Not part of `vitest run` — needs Chrome and network access to StackBlitz.
+// Not part of `vitest run` — needs network access to StackBlitz, and a desktop
+// session whose default browser runs WebContainer: since wc-exe stopped
+// launching a browser, each session's page arrives as a tab someone's desktop
+// opens. It will not run on a headless CI box.
+//
+// What it cannot see, and why `src/core/project-build.test.ts` exists: this
+// compares two paths' *artifacts*, so a difference in how the two invoke the
+// package manager is invisible while no fixture pins one. That is exactly the
+// bug the shared build sequence was extracted to kill.
 //
 // Usage:
 //   pnpm build && node test/integration/daemon-parity.mjs
