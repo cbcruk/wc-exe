@@ -77,6 +77,9 @@ node poc/vite-build-intercept/run.mjs test/fixtures/sample-exports-app --vfs=mem
 
 # assets: one inlined as a data URI, one emitted with a content hash
 node poc/vite-build-intercept/run.mjs test/fixtures/sample-asset-app --vfs=memfs
+
+# dependencies from the lockfile instead of from disk — no npm install needed
+node poc/vite-build-intercept/run.mjs <project> --vfs=memfs --deps=registry
 ```
 
 Defaults to `test/fixtures/sample-vite-app`. Needs a Chromium (`CHROME_PATH` if
@@ -217,11 +220,15 @@ Also note the size: 10 MB of wasm plus ~1.5 MB of JS for rolldown, plus another
   now covered (`sample-exports-app`) — and only `--vfs=memfs` gets them right.
 - Nothing about `postinstall`, native addons, or anything else needing a real
   process.
-- **It does not install anything.** See below — this is the largest gap, and
-  the one most easily missed because every fixture happens to have a
-  `node_modules` already sitting on disk.
+- ~~**It does not install anything.**~~ — **`--deps=registry` closes this** for
+  npm lockfiles; see below. Without that flag it still reads `node_modules` off
+  the disk.
 
-### The gap that matters most: this does not run `npm install`
+### The gap that mattered most: this did not run `npm install`
+
+> **Closed by `--deps=registry`** (below) for projects with an npm lockfile.
+> The reasoning that got there is kept, because it is what made the remaining
+> work small.
 
 `run.mjs` reads `node_modules` out of the project directory. There is no install
 step anywhere in the PoC — the README's own React instructions say
@@ -654,6 +661,120 @@ strings.
 Still not implemented, and untested: **CSS `url()` references** (the fixture's
 stylesheet has none), vite's `?url` / `?raw` / `?inline` query suffixes (stripped
 and ignored), and `new URL('./x.png', import.meta.url)`.
+
+## Building without `node_modules` (`--deps=registry`)
+
+Everything above still required the user to run the `npm install` wc-exe exists
+to avoid: `run.mjs` read dependency bytes off the disk. This closes that. The
+host reads the lockfile, fetches tarballs, unpacks them in memory, and streams
+packages into the browser's volume. Nothing is written into the project.
+
+```bash
+node poc/vite-build-intercept/run.mjs <project> --vfs=memfs --deps=registry
+```
+
+### Why this is not "reimplement npm"
+
+`docs/virtual-filesystem.md`'s hybrid section names reproducing npm's tree
+resolution — peer deps, overrides, hoisting — as the real cost of this
+direction. It is, if you have to resolve. **A lockfile is already the
+resolution.** `package-lock.json` v2/v3's `packages` map is keyed by install
+path, with the exact version, tarball URL and integrity hash on each entry:
+
+```
+node_modules/react                     18.3.1  …/react-18.3.1.tgz  sha512-…
+node_modules/a/node_modules/b          1.0.0   …                   sha512-…
+```
+
+That is the tree layout. What is left is materialising it.
+
+**Granularity is one package, not one file.** StackBlitz's Turbo fetches
+individual files because they run infrastructure that serves packages unpacked;
+a plain registry — and an internal mirror on a closed network — serves whole
+tarballs, which is also the unit the integrity hash covers. So the flow is:
+
+1. The lockfile gives every package's **install path**, with no network. Those
+   directories are pre-created, because resolution has to be able to walk into
+   them.
+2. Nothing else is known — no one knows a package's file list until its tarball
+   is unpacked — so there is no file manifest to send.
+3. The first miss inside a package pulls **that whole package**: fetch, verify
+   integrity, gunzip, untar, write. One request per package, then the retry
+   finds the file.
+
+`dev` entries are dropped, since an interception build never runs the project's
+vite. On the React fixture that is 113 lockfile entries down to **5**.
+
+### Measured: it builds, byte-identically, with no node_modules
+
+The test is the honest one — a copy of `sample-react-app` with `node_modules`
+deleted:
+
+```
+lockfile: v3, 5 non-dev packages
+[host] node_modules/react@18.3.1:      20 files,  311 KB from an  80 KB tarball
+[host] node_modules/react-dom@18.3.1:  32 files, 4408 KB from a 1063 KB tarball
+[host] node_modules/scheduler@0.23.2:  17 files,   91 KB from a  17 KB tarball
+faulted in 77 files from 3 packages, 4.8 MB
+```
+
+Three of the five packages were fetched — `js-tokens` and `loose-envify` are in
+the lockfile and the graph never reached them. All three emitted files are
+**byte-identical** to the disk-mode build, and the project directory is
+untouched afterwards.
+
+| React fixture     | cold   | warm       |
+| ----------------- | ------ | ---------- |
+| `--deps=registry` | 558 ms | 396–400 ms |
+| `--deps=disk`     | —      | 369–392 ms |
+
+Warm is at parity with reading an installed tree. Cold pays one round trip per
+package.
+
+### The number that matters for wc-exe
+
+|                        | files     | size   |
+| ---------------------- | --------- | ------ |
+| installed node_modules | **2,248** | 44 MB  |
+| tarball cache          | **3**     | 1.2 MB |
+
+Antivirus cost is **per file**. That is the whole argument for caching tarballs
+rather than extracted trees, and it is why this shape fits the problem the
+project exists for.
+
+### An unresolved import is now a hard error
+
+Corrupting one integrity hash in the lockfile exposed a worse bug than the one
+being tested. The fetch failed correctly — but rolldown treats an unresolvable
+bare specifier as a **warning** and leaves it external, so the build
+"succeeded", emitted a bundle importing `"react"`, and died in the browser with
+`Failed to resolve module specifier "react"`.
+
+A browser bundle has no import map; an externalised bare specifier is never
+right. `UNRESOLVED_IMPORT` is now fatal, and the message carries the fetch
+failure that caused it:
+
+```
+Error: 5 import(s) could not be resolved and would have been left external …
+could not fetch:
+  /api/package?path=node_modules%2Freact -> 502 integrity mismatch for …/react-18.3.1.tgz
+    expected sha512-wS+hAAJShR0…
+    got      sha512-wS+hAgJShR0…
+```
+
+### What it does not do
+
+- **npm lockfiles only.** pnpm's format differs and its layout is symlink-based;
+  yarn PnP differs again. v1 lockfiles are refused (`packages` did not exist
+  yet).
+- **No lockfile, no build.** Resolving from `package.json` alone is npm's hard
+  part and is out of scope; the error says so.
+- **`link:`, `git:` and `file:` dependencies are skipped** and reported by name,
+  rather than silently dropped.
+- **Lifecycle scripts are not run.** Measured across ten projects, no runtime
+  dependency has one that matters (`bench/install-shape.mjs`) — but that is
+  evidence, not proof, and a package that generates code at install time would
+  fail here.
 
 ## Verifying projects that are not fixtures
 
