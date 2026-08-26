@@ -10,6 +10,7 @@ import {
   type TerminalSize,
 } from './runtime/runtime.types'
 import { OutputBuffer } from './runtime/output-buffer'
+import { connectControlChannel } from './rpc'
 import {
   detectPackageManager,
   installArgs,
@@ -87,8 +88,11 @@ function apiUrl(path: string): string {
 let runtime: Runtime | null = null
 
 /**
- * Boots the runtime and flags the page ready. Runs automatically on load; the
- * host waits on `window.__WC_READY__` before calling anything else.
+ * Boots the runtime and flags the page ready.
+ *
+ * Runs automatically on load. `window.__WC_READY__` is kept for the Puppeteer
+ * path, which polls it; the control channel is told separately, because a host
+ * that did not launch this page has no way to read a global.
  */
 async function boot(): Promise<void> {
   console.log('[wc-build] Booting runtime...')
@@ -97,6 +101,7 @@ async function boot(): Promise<void> {
   runtime = instance
   console.log('[wc-build] Runtime ready!')
   window.__WC_READY__ = true
+  control?.announceReady()
 }
 
 /**
@@ -308,7 +313,12 @@ async function openShell(
 
   const session = await ShellSession.open(runtime, {
     terminal: { cols: options?.cols ?? 80, rows: options?.rows ?? 24 },
-    onData: (chunk) => window.__wcShellData__?.(id, chunk),
+    onData: (chunk) => {
+      // Both paths, deliberately: CDP still drives everything, and the control
+      // channel has to carry the same thing before the calls can move onto it.
+      window.__wcShellData__?.(id, chunk)
+      control.emit('shellData', { id, chunk })
+    },
   })
 
   shells.set(id, session)
@@ -1080,6 +1090,15 @@ const wcRunner = {
 }
 
 window.wcRunner = wcRunner
+
+/**
+ * Opened before booting, not after: the host may already be waiting, and a call
+ * that arrives early is queued on its side rather than lost.
+ */
+const control = connectControlChannel(
+  wcRunner as unknown as Record<string, (...args: never[]) => unknown>,
+  apiUrl
+)
 
 boot().catch((err) => {
   console.error(`[wc-build] Boot failed: ${err.message}`)

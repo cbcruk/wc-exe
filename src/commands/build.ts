@@ -102,6 +102,7 @@ export async function build(options: BuildOptions): Promise<void> {
 
     browser = new WCBrowser({
       verbose,
+      link: serverInfo.link,
       userDataDir: cacheStable ? CHROME_PROFILE_DIR : undefined,
     })
     await withSpin({
