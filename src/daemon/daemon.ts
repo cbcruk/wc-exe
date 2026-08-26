@@ -3,13 +3,7 @@ import { serve, type ServerType } from '@hono/node-server'
 import { serveStatic } from '@hono/node-server/serve-static'
 import fs from 'node:fs'
 import path from 'node:path'
-import type { Browser } from 'puppeteer-core'
-import {
-  CACHE_PORT,
-  CHROME_PROFILE_DIR,
-  ensureCacheDirs,
-} from '../core/cache.js'
-import { launchChrome } from '../core/chrome.js'
+import { CACHE_PORT, ensureCacheDirs } from '../core/cache.js'
 import { mountRpcRoutes } from '../core/rpc.js'
 import { resolveRunnerDist } from '../core/runner-assets.js'
 import { controlPlaneGuard } from './auth.js'
@@ -72,7 +66,17 @@ function resolveProject(source: unknown): string {
  * machine.
  */
 export async function startDaemon(
-  options: { port?: number; idleMs?: number; verbose?: boolean } = {}
+  options: {
+    port?: number
+    idleMs?: number
+    verbose?: boolean
+    /**
+     * Open each new session's page in the desktop browser. `false` leaves that
+     * to the caller — the daemon then waits for a tab that something else must
+     * produce.
+     */
+    open?: boolean
+  } = {}
 ): Promise<RunningDaemon> {
   ensureCacheDirs()
 
@@ -91,16 +95,6 @@ export async function startDaemon(
   let server: ServerType | undefined
   let closing = false
 
-  // One browser for every session. Chrome allows a single process per profile
-  // directory and aborts rather than risk corrupting it, so a browser per
-  // session made the second project fail before it began. Launched on first use
-  // and memoised, so concurrent sessions await the same launch rather than
-  // racing to start two.
-  let browserPromise: Promise<Browser> | null = null
-  const getBrowser = (): Promise<Browser> => {
-    browserPromise ??= launchChrome({ userDataDir: CHROME_PROFILE_DIR })
-    return browserPromise
-  }
   let lastActivity = Date.now()
   const touch = (): void => {
     lastActivity = Date.now()
@@ -218,10 +212,14 @@ export async function startDaemon(
     }
 
     if (!session) {
+      // Each session opens its own tab. The daemon no longer launches a
+      // browser, so the constraint that forced one shared Chrome — a profile
+      // directory backing only one process — is gone with it, and sessions no
+      // longer have anything to contend over.
       session = new Session(`${nextSessionId++}-${Date.now().toString(36)}`, {
         source,
         origin: `http://127.0.0.1:${port}`,
-        getBrowser,
+        open: options.open ?? true,
       })
       sessions.set(key, session)
     }
@@ -285,14 +283,10 @@ export async function startDaemon(
     clearInterval(idleTimer)
     for (const session of sessions.values()) await session.close()
     sessions.clear()
-    // Sessions only close their own pages, so the shared browser is the
-    // daemon's to shut down.
-    if (browserPromise) {
-      await browserPromise
-        .then((browser) => browser.close())
-        .catch(() => undefined)
-      browserPromise = null
-    }
+    // Nothing to shut down beyond this: the tabs belong to the user's browser,
+    // and closing them is not the daemon's to do. They are left pointing at a
+    // port that stops answering, which is what a stopped daemon looks like from
+    // a page's side.
     clearRecord()
     await new Promise<void>((resolve) => {
       if (!server) return resolve()

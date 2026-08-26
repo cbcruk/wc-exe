@@ -1,6 +1,5 @@
-import { type Browser, type Page } from 'puppeteer-core'
-import { launchChrome } from './chrome.js'
 import type { RunnerLink } from './rpc.js'
+import { openInBrowser } from './open.js'
 import type {
   CacheResult,
   CommandResult,
@@ -11,27 +10,24 @@ import type {
 } from './types.js'
 
 /**
- * Drives the headless Chrome instance that hosts the runner page.
+ * The host's half of the runner API.
  *
- * Every method below is a thin bridge to the corresponding `window.wcRunner`
- * function evaluated inside the page — this class holds no runtime state of its
- * own, only the browser and page handles. Call {@link launch} before anything
- * else, and {@link close} when done.
+ * Every method below is a call on the page's `window.wcRunner`, sent over the
+ * control channel; this class holds no runtime state of its own.
+ *
+ * It used to launch and own a headless Chrome, which is why it was called
+ * `WCBrowser`. It does not any more: the page drives itself over
+ * {@link RunnerLink}, so the host only needs a tab to exist at a URL, not a
+ * browser it controls. What is left is a typed client for a runner that is
+ * somewhere else — which is all the name now claims.
+ *
+ * Call {@link launch} before anything else, and {@link close} when done.
  */
-export class WCBrowser {
-  private browser: Browser | null = null
-  private page: Page | null = null
+export class RunnerClient {
   private verbose: boolean = false
-  private userDataDir: string | undefined
   private readonly link: RunnerLink
 
-  /**
-   * Calls a method on the page's `wcRunner`.
-   *
-   * Every method below is one of these. They used to be `page.evaluate()` with
-   * an inline function serialised into the page — the same call, but only
-   * possible while the host is the process that launched the browser.
-   */
+  /** Calls a method on the page's `wcRunner`. */
   private callRunner<T>(method: string, args: unknown[] = []): Promise<T> {
     return this.link.call<T>(method, args)
   }
@@ -41,78 +37,51 @@ export class WCBrowser {
   private shellListeners = new Map<string, (chunk: string) => void>()
   /** Whether `__wcShellData__` has been bound on the page yet. */
   private shellDataBound = false
-  /** A browser supplied by the caller, shared with other instances. */
-  private sharedBrowser: Browser | undefined
-  /** Whether {@link close} should close the browser or only this page. */
-  private ownsBrowser = true
 
   /**
-   * @param options.verbose Mirror browser console and failed requests to stdout.
-   * @param options.userDataDir Persistent Chrome profile. Required for the OPFS
-   *   cache to survive across runs; omit for a throwaway profile. Ignored when
-   *   `browser` is supplied, since that browser already has a profile.
-   * @param options.browser An already-running browser to open a page on,
-   *   instead of launching one. Required when several instances must coexist:
-   *   Chrome allows only one process per profile directory, so launching one
-   *   browser apiece against a shared profile fails outright. {@link close}
-   *   then closes only this page and leaves the browser to its owner.
+   * @param options.verbose Mirror runner diagnostics to stdout.
+   * @param options.link Control channel the page attaches to; every method
+   *   below goes over it.
    */
-  constructor(options: {
-    verbose?: boolean
-    userDataDir?: string
-    /** Control channel the page attaches to; every method below goes over it. */
-    link: RunnerLink
-    browser?: Browser
-  }) {
+  constructor(options: { verbose?: boolean; link: RunnerLink }) {
     this.verbose = options?.verbose ?? false
-    this.userDataDir = options?.userDataDir
-    this.sharedBrowser = options?.browser
     this.link = options.link
   }
 
   /**
-   * Launches Chrome, opens the runner page and waits for the runtime to boot.
+   * Opens the runner page and waits for the runtime to boot.
    *
    * @param serverUrl Origin the runner is served from, i.e. the local server's
    *   `url`.
-   * @throws If Chrome cannot be located, or the runtime does not signal ready
-   *   within 60s.
+   * @param options.open Hand the URL to the desktop browser. Set `false` when
+   *   the caller has already opened it, or wants to open it by hand — the wait
+   *   below is identical either way, since the host cannot tell which tab it is
+   *   talking to.
+   * @throws If the runtime does not signal ready within 60s.
    */
-  async launch(serverUrl: string): Promise<void> {
-    if (this.sharedBrowser) {
-      this.browser = this.sharedBrowser
-      this.ownsBrowser = false
-    } else {
-      // A persistent profile keeps OPFS (the node_modules cache) across runs.
-      this.browser = await launchChrome({ userDataDir: this.userDataDir })
-      this.ownsBrowser = true
-    }
-
-    this.page = await this.browser.newPage()
-
-    if (this.verbose) {
-      this.page.on('console', (msg) => {
-        console.log('[Browser]', msg.text())
-      })
-
-      this.page.on('response', (response) => {
-        if (!response.ok()) {
-          console.log('[Browser 404]', response.url(), response.status())
-        }
-      })
-    }
-
-    this.page.on('pageerror', (err) => {
-      console.error('[Browser Error]', err.message)
+  async launch(
+    serverUrl: string,
+    options: { open?: boolean } = {}
+  ): Promise<void> {
+    // Registered before the page can exist: a page that fails on load would
+    // otherwise report nothing, and the only symptom would be the ready wait
+    // expiring a minute later with no cause attached.
+    this.link.onEvent('pageError', (payload) => {
+      const { message } = (payload ?? {}) as { message?: string }
+      console.error('[Runner Error]', message ?? 'unknown page error')
     })
 
-    await this.page.goto(serverUrl)
+    if (options.open !== false) {
+      // A failure here is not fatal. The caller shows the URL, and a user
+      // pasting it into a browser produces exactly the same tab.
+      await openInBrowser(serverUrl)
+    }
 
     // The page reports this over the control channel rather than the host
     // polling a global through CDP — which is the point: a page the host did
     // not launch has no global for the host to read.
     await this.link.waitForReady(60_000)
-    if (this.verbose) console.log('[Browser] control channel attached')
+    if (this.verbose) console.log('[Runner] control channel attached')
   }
 
   /**
@@ -130,9 +99,10 @@ export class WCBrowser {
    * snapshot when one matches the lockfile, otherwise installs and snapshots it
    * for next time.
    *
-   * Only useful when the instance was constructed with a persistent
-   * `userDataDir` and the server bound its fixed cache port; otherwise OPFS
-   * starts empty and every run is a miss.
+   * Only useful when the server bound its fixed cache port. OPFS is scoped per
+   * origin, so a random port orphans the previous run's snapshot and every run
+   * is a miss. The browser profile is no longer a variable here — the page runs
+   * in the user's own browser, so its storage persists on its own.
    *
    * @returns `cached` whether the snapshot was reused, `key` the lockfile hash
    *   it is stored under, and on a miss `bytes` the snapshot size plus the
@@ -373,7 +343,7 @@ export class WCBrowser {
    *
    * @param paths Project-root-relative paths. Missing paths are ignored.
    * @returns How many paths were requested.
-   * @throws If the browser has not been launched.
+   * @throws If the runner page is not attached.
    */
   async removePaths(paths: string[]): Promise<number> {
     return this.callRunner('removePaths', [paths])
@@ -393,18 +363,13 @@ export class WCBrowser {
   /**
    * Releases this instance's resources. Safe to call when not launched.
    *
-   * Closes the browser only when this instance launched it. With a shared
-   * browser it closes just the page, because the other sessions on that browser
-   * are still using it.
+   * **The tab is left open.** The host does not own it and has no way to close
+   * it, which is the deliberate trade for not shipping a browser: the user
+   * opened the page and the user closes it. Failing every in-flight call is the
+   * part that does matter, so a host exiting mid-build does not leave promises
+   * nothing can settle.
    */
   async close(): Promise<void> {
-    if (this.ownsBrowser) {
-      await this.browser?.close()
-    } else {
-      this.link.close('Browser closed')
-      await this.page?.close().catch(() => undefined)
-    }
-    this.browser = null
-    this.page = null
+    this.link.close('Runner client closed')
   }
 }

@@ -126,7 +126,7 @@
 - 동작: lockfile(`package-lock.json`→…→`package.json`) 해시를 키로, WebContainer의 `export('node_modules','binary')` 스냅샷을 OPFS에 저장. 다음 실행에서 키가 같으면 `mount(snapshot,{mountPoint:'node_modules'})`로 복원하고 **`npm install`을 통째로 건너뛴다.**
 - **실측(sample-vite-app, macOS)**: cold(캐시 없음) install 11.7s → **warm(캐시 히트) install 0.3s** (install 전체 스킵). lockfile 변경 시 키가 바뀌어 자동 무효화(재설치·재캐시) 확인.
 - ⚠️ **HIT 경로에 잠복 버그가 있었고 실측 중 발견·수정했다**: `mount(snapshot,{mountPoint})`는 **마운트 지점이 미리 존재해야** 한다. 없으면 런타임이 `[FS] invalid mount point`를 **로그만 찍고 resolve**해버려서, `restoreNodeModules`가 빈 디렉터리를 두고 `true`(=HIT)를 반환했다. 결과적으로 install은 건너뛰지만 `node_modules`가 비어 `npm run build`가 `vite: command not found`(exit 127)로 죽는다. 수정: 마운트 전에 `mkdir(recursive)`, 그리고 **복원 후 `readdir`로 실제 내용물을 검증**해 실패를 HIT이 아닌 MISS로 강등. (`Runtime` 인터페이스에 `mkdir` 추가)
-- 제약(정직하게): OPFS는 **origin 스코프**라 러너 포트를 고정(`5199`)해야 하고, 브라우저 프로파일이 유지돼야 해 **puppeteer userDataDir를 영속 디렉터리**(`~/.cache/wc-exe/chrome-profile`)로 둔다. 즉 "호스트 디스크에 아무것도 안 쓴다"가 완벽히 지켜지는 건 아니고, **프로젝트 dir엔 여전히 아무것도 안 쓰되** node_modules는 크롬 프로파일 안 불투명 blob(대용량 순차 쓰기, 수만 개 소파일 아님)으로만 남는다. 백신 I/O 관점에선 여전히 큰 이득.
+- 제약(정직하게): OPFS는 **origin 스코프**라 러너 포트를 고정(`5199`)해야 한다. 프로파일 쪽 제약은 없어졌다 — puppeteer를 걷어내면서 페이지가 **사용자 자기 브라우저**에서 돌게 됐고, 캐시도 그 브라우저 저장소에 남는다(`docs/persistent-runner.md` §19). 즉 우리가 관리하는 프로파일 디렉터리는 이제 없고, 프로젝트 dir엔 여전히 아무것도 안 쓴다. 대신 사용자가 사이트 데이터를 지우면 캐시도 같이 사라진다. 백신 I/O 관점의 이득은 그대로다.
 - **WebContainer는 그대로 두고 그 아래 저장 계층만 우리가 소유** — 이 문서의 핵심 전략을 최소 비용으로 실현.
 - 참조: burrow의 `src/vfs`(IndexedDB debounced 스냅샷, `snapshot.ts`/`persistence.ts`)가 같은 "추출된 트리를 통째 영속화" 발상. 단 burrow는 **타르볼 캐시가 없다**(§8, 아래 단기+에서 정정).
 
@@ -173,7 +173,7 @@
 
 - **무엇을**: `build`/`install`에 `--cache-max-snapshots <size>`, `--cache-max-tarballs <size>` 추가 (`512MB`/`2GB` 같은 사람이 읽는 크기 문자열 파싱). 기본값은 현재 상수와 동일하게.
 - **왜**: 프로젝트 규모별로 적정 상한이 크게 다르다. 모노레포는 스냅샷 하나가 수백 MB라 512MB로는 한 개도 못 담고, 반대로 디스크가 빠듯하면 더 낮춰야 한다. 지금은 어느 쪽도 대응이 불가능하다.
-- **어디를**: `src/cli.ts`(옵션 정의, 기존 `--cache` 옆) → `src/types.ts`(`BuildOptions`/`InstallOptions`) → `src/commands/*.ts` → `WCBrowser.installWithCache()` 인자 → 러너 `installWithCache`가 상수 대신 인자를 사용. 러너는 페이지 안이라 env를 못 읽으므로 **호스트가 값을 넘겨주는 경로**가 필요하다.
+- **어디를**: `src/cli.ts`(옵션 정의, 기존 `--cache` 옆) → `src/types.ts`(`BuildOptions`/`InstallOptions`) → `src/commands/*.ts` → `RunnerClient.installWithCache()` 인자 → 러너 `installWithCache`가 상수 대신 인자를 사용. 러너는 페이지 안이라 env를 못 읽으므로 **호스트가 값을 넘겨주는 경로**가 필요하다.
 - **덤**: 인자로 주입 가능해지면 축출 검증을 소스 수정 없이 할 수 있어, `bench/cache-scenarios.mjs`에 축출 시나리오를 정식 추가할 수 있다.
 - **주의**: 상한을 0이나 아주 작게 주면 방금 쓴 항목만 남고 매번 전부 축출된다(현재 구현은 이번 실행 항목을 보호하므로 동작은 안전하되 캐시가 무의미해짐). 하한 검증이나 경고가 필요할지 판단할 것.
 

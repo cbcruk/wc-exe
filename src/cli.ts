@@ -29,6 +29,10 @@ program
   )
   .option('--verbose', 'Show detailed logs')
   .option(
+    '--no-open',
+    'Do not open the runner page; print its URL and wait for you to open it'
+  )
+  .option(
     '--daemon',
     'Build through a background daemon that keeps the runtime booted'
   )
@@ -60,6 +64,7 @@ program
         noInstall: !options.install,
         cache: options.cache,
         verbose: options.verbose,
+        open: options.open,
       })
     } catch (error) {
       console.error('\nBuild failed:', (error as Error).message)
@@ -71,7 +76,10 @@ program
   .command('dev')
   .description('Start development server in WebContainer')
   .option('-p, --port <number>', 'Preview port', '5173')
-  .option('--open', 'Open browser automatically')
+  .option(
+    '--no-open',
+    'Do not open the runner page; print its URL and wait for you to open it'
+  )
   .action(async (options) => {
     try {
       await dev({
@@ -88,10 +96,15 @@ program
   .command('install')
   .description('Install dependencies only')
   .option('--cache', 'Use cached node_modules')
+  .option(
+    '--no-open',
+    'Do not open the runner page; print its URL and wait for you to open it'
+  )
   .action(async (options) => {
     try {
       await install({
         cache: options.cache,
+        open: options.open,
       })
     } catch (error) {
       console.error('\nInstall failed:', (error as Error).message)

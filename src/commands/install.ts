@@ -5,13 +5,9 @@ import {
   startServerWithFallback,
   type ServerInfo,
 } from '../core/server.js'
-import { WCBrowser } from '../core/browser.js'
+import { RunnerClient } from '../core/runner-client.js'
 import { listProjectFiles, readProjectFileBytes } from '../core/file-sync.js'
-import {
-  CACHE_PORT,
-  CHROME_PROFILE_DIR,
-  ensureCacheDirs,
-} from '../core/cache.js'
+import { CACHE_PORT, ensureCacheDirs } from '../core/cache.js'
 import { withSpin } from '../utils/spinner.js'
 import { commandFailure } from '../core/command-error.js'
 import type { ServerHandlers } from '../core/types.js'
@@ -26,12 +22,13 @@ import type { InstallOptions } from '../types.js'
  * the runtime.
  *
  * @param options See {@link InstallOptions}.
- * @throws If any step fails. The server and browser are always torn down first.
+ * @throws If any step fails. The server and the link are always torn down
+ *   first; the tab is the user's to close.
  * @remarks Calls `process.exit(0)` on success, so it never resolves — this is
  *   the CLI entry point, not a reusable library call.
  */
 export async function install(options: InstallOptions): Promise<void> {
-  const { cache = false } = options
+  const { cache = false, open = true } = options
 
   console.log(chalk.cyan('\n  wc-exe install - Dependency Installation\n'))
 
@@ -39,7 +36,7 @@ export async function install(options: InstallOptions): Promise<void> {
 
   const spinner = ora()
   let serverInfo: ServerInfo | undefined
-  let browser: WCBrowser | null = null
+  let browser: RunnerClient | null = null
 
   const handlers: ServerHandlers = {
     listFiles: () => listProjectFiles('.'),
@@ -86,17 +83,13 @@ export async function install(options: InstallOptions): Promise<void> {
 
     const cacheStable = cache && serverInfo.port === CACHE_PORT
 
-    browser = new WCBrowser({
-      verbose: true,
-      link: serverInfo.link,
-      userDataDir: cacheStable ? CHROME_PROFILE_DIR : undefined,
-    })
+    browser = new RunnerClient({ verbose: true, link: serverInfo.link })
     await withSpin({
       spinner,
-      message: 'Launching headless browser...',
-      fn: () => browser!.launch(serverInfo!.url),
+      message: `Waiting for the runner page at ${serverInfo.url} ...`,
+      fn: () => browser!.launch(serverInfo!.url, { open }),
       successMessage: 'WebContainer booted',
-      failMessage: 'Failed to launch browser',
+      failMessage: 'The runner page never reported ready',
     })
 
     await withSpin({

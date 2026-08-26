@@ -11,24 +11,22 @@ export const CACHE_ROOT = process.env.WC_EXE_CACHE_DIR
   : path.join(os.homedir(), '.cache', 'wc-exe')
 
 /**
- * Persistent Chrome profile directory. Passing it to the browser is what keeps
- * OPFS — and with it the `node_modules` cache — alive between runs.
- */
-export const CHROME_PROFILE_DIR = path.join(CACHE_ROOT, 'chrome-profile')
-
-/**
  * Port the runner is served on when caching is enabled. Override with
  * `WC_EXE_CACHE_PORT`; defaults to `5199`.
  *
  * Fixed so the runner page keeps a stable origin: OPFS is scoped per origin
  * (scheme+host+port), so a random port would orphan the cache every run.
+ *
+ * This is now the *only* thing that determines whether the cache survives.
+ * wc-exe used to also pass a dedicated Chrome profile directory it owned, which
+ * made the cache ours to place. The page runs in the user's own browser now, so
+ * the snapshot lives in that browser's storage for this origin — it persists
+ * like any site's data, and it goes away if they clear site data or open the
+ * page in a different browser.
  */
 export const CACHE_PORT = Number(process.env.WC_EXE_CACHE_PORT ?? 5199)
 
-/**
- * Creates the cache directories if missing. Call before launching a browser
- * with {@link CHROME_PROFILE_DIR}.
- */
+/** Creates {@link CACHE_ROOT} if missing. */
 export function ensureCacheDirs(): void {
-  fs.mkdirSync(CHROME_PROFILE_DIR, { recursive: true })
+  fs.mkdirSync(CACHE_ROOT, { recursive: true })
 }

@@ -1101,6 +1101,24 @@ const control = connectControlChannel(
   apiUrl
 )
 
+/**
+ * Report page-level failures to the host.
+ *
+ * The host no longer opens this page, so it cannot attach to its console the
+ * way it did over CDP. Without this, an error during boot is visible only in a
+ * DevTools window nobody has open, and all the host ever sees is the ready wait
+ * expiring sixty seconds later with no cause attached.
+ */
+window.addEventListener('error', (event) => {
+  control.emit('pageError', { message: event.message })
+})
+window.addEventListener('unhandledrejection', (event) => {
+  control.emit('pageError', {
+    message: `Unhandled rejection: ${String(event.reason)}`,
+  })
+})
+
 boot().catch((err) => {
   console.error(`[wc-build] Boot failed: ${err.message}`)
+  control.emit('pageError', { message: `Boot failed: ${err.message}` })
 })
