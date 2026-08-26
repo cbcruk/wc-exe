@@ -5,7 +5,9 @@
 // the process, or a kill actually killing can be proven without booting the
 // thing. This is that proof.
 //
-// Not part of `vitest run`: it needs a Chrome binary and outbound network
+// Not part of `vitest run`: it needs a desktop session whose default browser
+// runs WebContainer — wc-exe opens a tab rather than launching one — and
+// outbound network
 // access to StackBlitz's runtime hosts, so it stays an explicit local step.
 //
 // Usage:

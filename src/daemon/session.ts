@@ -9,8 +9,8 @@ import {
   writeDistFile,
   type Manifest,
 } from '../core/file-sync.js'
-import { commandFailure } from '../core/command-error.js'
-import type { CommandResult, ServerHandlers } from '../core/types.js'
+import { runProjectBuild } from '../core/project-build.js'
+import type { ServerHandlers } from '../core/types.js'
 
 /** How a session reports what it did, for the CLI to print. */
 export interface SessionBuildResult {
@@ -193,49 +193,41 @@ export class Session {
       const reused = await this.ensureBooted(options.verbose)
       log(reused ? 'Reusing booted container' : 'Booted container')
 
-      const { upserted, removed } = await this.sync()
-      log(`Synced project (${upserted} written, ${removed} removed)`)
-
-      // Re-resolved every build: a project can gain or change a lockfile
-      // between runs, and a long-lived session must not keep installing with
-      // the manager it happened to see first.
-      const { manager, reason } = await this.runner!.packageManager()
-      log(`Package manager: ${manager} (${reason})`)
-
-      if (!options.noInstall) {
-        const result = await this.runner!.installWithCache()
-        log(
-          result.cached
-            ? `Dependencies restored from cache (${result.key.slice(0, 12)})`
-            : 'Dependencies installed'
-        )
-      }
-
-      // Previous artifacts must not survive into this build's output: the
-      // runtime keeps whatever the last build produced, so a file this build no
-      // longer emits would be uploaded as if it were fresh.
-      //
-      // UNVERIFIED. Removing this line does not fail the parity test, because
-      // vite empties its own outDir and hides the difference. It is kept for
-      // build tools that do not, but nothing here demonstrates it works — do
-      // not read the passing test as covering it.
-      await this.runner!.removePaths([options.distDir.replace(/^\//, '')])
-      log('Cleared previous build output')
-
-      const build: CommandResult = await this.runner!.runCommand(
-        manager,
-        ['run', 'build'],
-        { timeout: options.timeout }
-      )
-      if (build.exitCode !== 0)
-        throw commandFailure(`${manager} run build`, build)
-      log('Build completed')
-
-      this.currentOutput = options.output
       try {
-        const written = await this.runner!.uploadDist(options.distDir)
-        log(`Wrote ${written} files`)
-        return { reused, upserted, removed, written }
+        const result = await runProjectBuild(this.runner!, {
+          distDir: options.distDir,
+          noInstall: options.noInstall,
+          // Always, unlike the one-shot path: a session exists to be reused, so
+          // the origin is stable by construction and the snapshot will be found.
+          cache: true,
+          timeout: options.timeout,
+          // Previous artifacts must not survive into this build's output: a
+          // reused runtime keeps whatever the last build produced, so a file
+          // this build no longer emits would be uploaded as if it were fresh.
+          //
+          // UNVERIFIED. Removing this does not fail the parity test, because
+          // vite empties its own outDir and hides the difference. It is kept
+          // for build tools that do not, but nothing here demonstrates it
+          // works — do not read the passing test as covering it.
+          clearDist: true,
+          mount: () => this.sync(),
+          // Not emptying a directory here — the CLI already did that before it
+          // asked, because deleting a caller-supplied path is the caller's
+          // business. What this readies is the write target, and it runs at the
+          // same moment for the same reason: a build that failed never arms it.
+          prepareOutput: async () => {
+            this.currentOutput = options.output
+          },
+          onProgress: ({ phase, message }) => {
+            if (phase === 'done') log(message)
+          },
+        })
+        return {
+          reused,
+          upserted: result.upserted,
+          removed: result.removed,
+          written: result.written,
+        }
       } finally {
         this.currentOutput = null
       }

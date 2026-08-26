@@ -79,6 +79,7 @@ describe('the core boundary', () => {
     for (const expected of [
       'RunnerClient',
       'RunnerLink',
+      'runProjectBuild',
       'startServer',
       'listProjectFiles',
       'openInBrowser',

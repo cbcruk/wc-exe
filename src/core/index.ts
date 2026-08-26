@@ -15,6 +15,14 @@
  */
 
 export { RunnerClient } from './runner-client.js'
+export {
+  runProjectBuild,
+  type BuildRunner,
+  type BuildStep,
+  type BuildProgress,
+  type ProjectBuildOptions,
+  type ProjectBuildResult,
+} from './project-build.js'
 export { RunnerLink, mountRpcRoutes } from './rpc.js'
 export { openInBrowser } from './open.js'
 export {
