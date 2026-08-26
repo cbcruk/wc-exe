@@ -314,8 +314,9 @@ async function openShell(
   const session = await ShellSession.open(runtime, {
     terminal: { cols: options?.cols ?? 80, rows: options?.rows ?? 24 },
     onData: (chunk) => {
-      // Both paths, deliberately: CDP still drives everything, and the control
-      // channel has to carry the same thing before the calls can move onto it.
+      // `__wcShellData__` is vestigial — the host no longer binds it — but it
+      // is left in place until Puppeteer goes, so a mismatched pair of halves
+      // during that change is a missing event rather than a crash.
       window.__wcShellData__?.(id, chunk)
       control.emit('shellData', { id, chunk })
     },

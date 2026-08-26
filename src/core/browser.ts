@@ -23,7 +23,18 @@ export class WCBrowser {
   private page: Page | null = null
   private verbose: boolean = false
   private userDataDir: string | undefined
-  private link: RunnerLink | undefined
+  private readonly link: RunnerLink
+
+  /**
+   * Calls a method on the page's `wcRunner`.
+   *
+   * Every method below is one of these. They used to be `page.evaluate()` with
+   * an inline function serialised into the page — the same call, but only
+   * possible while the host is the process that launched the browser.
+   */
+  private callRunner<T>(method: string, args: unknown[] = []): Promise<T> {
+    return this.link.call<T>(method, args)
+  }
   /** Source of generated command handles; see {@link runCommand}. */
   private handleSequence = 0
   /** Live output listeners, by shell id; see {@link openShell}. */
@@ -46,24 +57,17 @@ export class WCBrowser {
    *   browser apiece against a shared profile fails outright. {@link close}
    *   then closes only this page and leaves the browser to its owner.
    */
-  constructor(options?: {
+  constructor(options: {
     verbose?: boolean
     userDataDir?: string
-    /**
-     * Control channel the page attaches to.
-     *
-     * Not used to drive anything yet — the calls below still go through CDP.
-     * It is wired up first so the channel can be confirmed against a real
-     * browser before the calls move onto it, since this repository's sandbox
-     * cannot boot WebContainer to test the switch.
-     */
-    link?: RunnerLink
+    /** Control channel the page attaches to; every method below goes over it. */
+    link: RunnerLink
     browser?: Browser
   }) {
     this.verbose = options?.verbose ?? false
     this.userDataDir = options?.userDataDir
     this.sharedBrowser = options?.browser
-    this.link = options?.link
+    this.link = options.link
   }
 
   /**
@@ -104,26 +108,11 @@ export class WCBrowser {
 
     await this.page.goto(serverUrl)
 
-    await this.page.waitForFunction(
-      () =>
-        (window as unknown as { __WC_READY__?: boolean }).__WC_READY__ === true,
-      { timeout: 60000 }
-    )
-
-    // Confirms the page found its way back over HTTP as well. Nothing depends
-    // on it yet — the calls below still go through CDP — but a channel that is
-    // silently not connecting would otherwise only be discovered when the
-    // calls move onto it.
-    if (this.link && this.verbose) {
-      await this.link
-        .waitForReady(5000)
-        .then(() => console.log('[Browser] control channel attached'))
-        .catch((err: Error) =>
-          console.log(
-            `[Browser] control channel did not attach: ${err.message}`
-          )
-        )
-    }
+    // The page reports this over the control channel rather than the host
+    // polling a global through CDP — which is the point: a page the host did
+    // not launch has no global for the host to read.
+    await this.link.waitForReady(60_000)
+    if (this.verbose) console.log('[Browser] control channel attached')
   }
 
   /**
@@ -133,15 +122,7 @@ export class WCBrowser {
    * @returns Number of files mounted.
    */
   async mountFromServer(): Promise<number> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    return await this.page.evaluate(async () => {
-      return await (
-        window as unknown as {
-          wcRunner: { mountFromServer: () => Promise<number> }
-        }
-      ).wcRunner.mountFromServer()
-    })
+    return this.callRunner('mountFromServer')
   }
 
   /**
@@ -159,15 +140,7 @@ export class WCBrowser {
    * @throws If the install fails.
    */
   async installWithCache(): Promise<CacheResult> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    return await this.page.evaluate(async () => {
-      return await (
-        window as unknown as {
-          wcRunner: { installWithCache: () => Promise<CacheResult> }
-        }
-      ).wcRunner.installWithCache()
-    })
+    return this.callRunner('installWithCache')
   }
 
   /**
@@ -178,15 +151,7 @@ export class WCBrowser {
    * directories on `PATH` are invisible to it.
    */
   async describeRuntime(): Promise<{ workdir: string; path: string }> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    return await this.page.evaluate(async () => {
-      return (
-        window as unknown as {
-          wcRunner: { describeRuntime: () => { workdir: string; path: string } }
-        }
-      ).wcRunner.describeRuntime()
-    })
+    return this.callRunner('describeRuntime')
   }
 
   /**
@@ -196,17 +161,7 @@ export class WCBrowser {
    * comes from exactly the tree that will be installed and built.
    */
   async packageManager(): Promise<PackageManagerChoice> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    return await this.page.evaluate(async () => {
-      return await (
-        window as unknown as {
-          wcRunner: {
-            resolvePackageManager: () => Promise<PackageManagerChoice>
-          }
-        }
-      ).wcRunner.resolvePackageManager()
-    })
+    return this.callRunner('resolvePackageManager')
   }
 
   /**
@@ -225,36 +180,17 @@ export class WCBrowser {
     args: string[],
     options?: RunCommandOptions
   ): Promise<CommandResult> {
-    if (!this.page) throw new Error('Browser not launched')
-
     const { timeout, handle: explicitHandle, ...spawnOptions } = options ?? {}
     // A timeout needs something to cancel, so give the command a name even when
     // the caller did not ask for one.
     const handle =
       explicitHandle ?? (timeout ? `wc-${++this.handleSequence}` : undefined)
 
-    const commandPromise = this.page.evaluate(
-      async (
-        cmdArg: string,
-        argsArg: string[],
-        optionsArg: Record<string, unknown>
-      ) => {
-        return await (
-          window as unknown as {
-            wcRunner: {
-              runCommand: (
-                c: string,
-                a: string[],
-                o?: Record<string, unknown>
-              ) => Promise<CommandResult>
-            }
-          }
-        ).wcRunner.runCommand(cmdArg, argsArg, optionsArg)
-      },
+    const commandPromise = this.callRunner<CommandResult>('runCommand', [
       cmd,
       args,
-      { ...spawnOptions, ...(handle ? { handle } : {}) }
-    )
+      { ...spawnOptions, ...(handle ? { handle } : {}) },
+    ])
 
     if (!timeout) {
       return commandPromise
@@ -299,38 +235,23 @@ export class WCBrowser {
     id: string,
     options?: { cols?: number; rows?: number; onData?: (chunk: string) => void }
   ): Promise<void> {
-    if (!this.page) throw new Error('Browser not launched')
-
     if (options?.onData && !this.shellDataBound) {
-      // exposeFunction can only bind a name once per page, so the single bound
-      // callback fans out to whichever shells are open.
-      await this.page.exposeFunction(
-        '__wcShellData__',
-        (shellId: string, chunk: string) => {
-          this.shellListeners.get(shellId)?.(chunk)
-        }
-      )
+      // One subscription fans out to whichever shells are open, the same way
+      // the exposed function used to — the page emits one event stream and the
+      // shell id picks the listener.
+      this.link?.onEvent('shellData', (payload) => {
+        const { id: shellId, chunk } = payload as { id: string; chunk: string }
+        this.shellListeners.get(shellId)?.(chunk)
+      })
       this.shellDataBound = true
     }
 
     if (options?.onData) this.shellListeners.set(id, options.onData)
 
-    await this.page.evaluate(
-      async (idArg: string, optionsArg: { cols?: number; rows?: number }) => {
-        await (
-          window as unknown as {
-            wcRunner: {
-              openShell: (
-                i: string,
-                o?: { cols?: number; rows?: number }
-              ) => Promise<void>
-            }
-          }
-        ).wcRunner.openShell(idArg, optionsArg)
-      },
+    await this.callRunner('openShell', [
       id,
-      { cols: options?.cols, rows: options?.rows }
-    )
+      { cols: options?.cols, rows: options?.rows },
+    ])
   }
 
   /**
@@ -339,21 +260,7 @@ export class WCBrowser {
    * @returns The command's output and exit status.
    */
   async shellExec(id: string, command: string): Promise<ShellExecResult> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    return await this.page.evaluate(
-      async (idArg: string, commandArg: string) => {
-        return await (
-          window as unknown as {
-            wcRunner: {
-              shellExec: (i: string, c: string) => Promise<ShellExecResult>
-            }
-          }
-        ).wcRunner.shellExec(idArg, commandArg)
-      },
-      id,
-      command
-    )
+    return this.callRunner('shellExec', [id, command])
   }
 
   /**
@@ -363,32 +270,12 @@ export class WCBrowser {
    *   died and the session should be discarded, not retried.
    */
   async shellInterrupt(id: string): Promise<void> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    await this.page.evaluate(async (idArg: string) => {
-      await (
-        window as unknown as {
-          wcRunner: { shellInterrupt: (i: string) => Promise<void> }
-        }
-      ).wcRunner.shellInterrupt(idArg)
-    }, id)
+    return this.callRunner('shellInterrupt', [id])
   }
 
   /** Tells an open shell its terminal was resized. */
   async shellResize(id: string, dimensions: TerminalSize): Promise<void> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    await this.page.evaluate(
-      async (idArg: string, dimensionsArg: TerminalSize) => {
-        ;(
-          window as unknown as {
-            wcRunner: { shellResize: (i: string, d: TerminalSize) => void }
-          }
-        ).wcRunner.shellResize(idArg, dimensionsArg)
-      },
-      id,
-      dimensions
-    )
+    return this.callRunner('shellResize', [id, dimensions])
   }
 
   /**
@@ -398,15 +285,7 @@ export class WCBrowser {
    * keeps running commands and printing output, so nothing else reveals it.
    */
   async shellBrokenReason(id: string): Promise<string | null> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    return await this.page.evaluate(async (idArg: string) => {
-      return (
-        window as unknown as {
-          wcRunner: { shellBrokenReason: (i: string) => string | null }
-        }
-      ).wcRunner.shellBrokenReason(idArg)
-    }, id)
+    return this.callRunner('shellBrokenReason', [id])
   }
 
   /**
@@ -422,28 +301,12 @@ export class WCBrowser {
    * @returns `true` if job control works. `false` marks the shell broken.
    */
   async shellVerifyJobControl(id: string): Promise<boolean> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    return await this.page.evaluate(async (idArg: string) => {
-      return await (
-        window as unknown as {
-          wcRunner: { shellVerifyJobControl: (i: string) => Promise<boolean> }
-        }
-      ).wcRunner.shellVerifyJobControl(idArg)
-    }, id)
+    return this.callRunner('shellVerifyJobControl', [id])
   }
 
   /** Closes an open shell. Unknown ids are ignored. */
   async closeShell(id: string): Promise<void> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    this.shellListeners.delete(id)
-
-    await this.page.evaluate(async (idArg: string) => {
-      ;(
-        window as unknown as { wcRunner: { closeShell: (i: string) => void } }
-      ).wcRunner.closeShell(idArg)
-    }, id)
+    return this.callRunner('closeShell', [id])
   }
 
   /**
@@ -453,15 +316,7 @@ export class WCBrowser {
    *   exited — a normal race, not an error.
    */
   async killCommand(handle: string): Promise<boolean> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    return await this.page.evaluate(async (handleArg: string) => {
-      return (
-        window as unknown as {
-          wcRunner: { killCommand: (h: string) => boolean }
-        }
-      ).wcRunner.killCommand(handleArg)
-    }, handle)
+    return this.callRunner('killCommand', [handle])
   }
 
   /**
@@ -473,21 +328,7 @@ export class WCBrowser {
     handle: string,
     dimensions: TerminalSize
   ): Promise<boolean> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    return await this.page.evaluate(
-      async (handleArg: string, dimensionsArg: TerminalSize) => {
-        return (
-          window as unknown as {
-            wcRunner: {
-              resizeCommand: (h: string, d: TerminalSize) => boolean
-            }
-          }
-        ).wcRunner.resizeCommand(handleArg, dimensionsArg)
-      },
-      handle,
-      dimensions
-    )
+    return this.callRunner('resizeCommand', [handle, dimensions])
   }
 
   /**
@@ -498,15 +339,7 @@ export class WCBrowser {
    * @returns Number of files uploaded.
    */
   async uploadDist(distPath: string = '/dist'): Promise<number> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    return await this.page.evaluate(async (pathArg: string) => {
-      return await (
-        window as unknown as {
-          wcRunner: { uploadDist: (p: string) => Promise<number> }
-        }
-      ).wcRunner.uploadDist(pathArg)
-    }, distPath)
+    return this.callRunner('uploadDist', [distPath])
   }
 
   /**
@@ -517,21 +350,7 @@ export class WCBrowser {
    * surfaces in the page console, not here.
    */
   async spawnCommand(cmd: string, args: string[]): Promise<void> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    await this.page.evaluate(
-      (cmdArg: string, argsArg: string[]) => {
-        ;(
-          window as unknown as {
-            wcRunner: {
-              spawnCommand: (c: string, a: string[]) => void
-            }
-          }
-        ).wcRunner.spawnCommand(cmdArg, argsArg)
-      },
-      cmd,
-      args
-    )
+    return this.callRunner('spawnCommand', [cmd, args])
   }
 
   /**
@@ -542,17 +361,7 @@ export class WCBrowser {
    *   to. Never rejects on its own — it waits indefinitely if no server starts.
    */
   async waitForServerReady(): Promise<{ port: number; url: string }> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    return await this.page.evaluate(async () => {
-      return await (
-        window as unknown as {
-          wcRunner: {
-            getServerUrl: () => Promise<{ port: number; url: string }>
-          }
-        }
-      ).wcRunner.getServerUrl()
-    })
+    return this.callRunner('getServerUrl')
   }
 
   /**
@@ -567,15 +376,7 @@ export class WCBrowser {
    * @throws If the browser has not been launched.
    */
   async removePaths(paths: string[]): Promise<number> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    return await this.page.evaluate(async (pathsArg: string[]) => {
-      return await (
-        window as unknown as {
-          wcRunner: { removePaths: (p: string[]) => Promise<number> }
-        }
-      ).wcRunner.removePaths(pathsArg)
-    }, paths)
+    return this.callRunner('removePaths', [paths])
   }
 
   /**
@@ -586,21 +387,7 @@ export class WCBrowser {
    * @param content UTF-8 text. Binary files are not supported here.
    */
   async writeFile(path: string, content: string): Promise<void> {
-    if (!this.page) throw new Error('Browser not launched')
-
-    await this.page.evaluate(
-      async (pathArg: string, contentArg: string) => {
-        await (
-          window as unknown as {
-            wcRunner: {
-              writeFile: (p: string, c: string) => Promise<void>
-            }
-          }
-        ).wcRunner.writeFile(pathArg, contentArg)
-      },
-      path,
-      content
-    )
+    return this.callRunner('writeFile', [path, content])
   }
 
   /**
@@ -614,6 +401,7 @@ export class WCBrowser {
     if (this.ownsBrowser) {
       await this.browser?.close()
     } else {
+      this.link.close('Browser closed')
       await this.page?.close().catch(() => undefined)
     }
     this.browser = null
