@@ -7,7 +7,9 @@ Security software real-time file scanning causes extreme I/O delays during `npm 
 ## Requirements
 
 - Node.js 18.0.0 or higher
-- Chrome or Chromium browser (for Puppeteer)
+- A browser that runs WebContainer — Chrome, Edge or Firefox. wc-exe opens a
+  tab in whatever your desktop treats as the default browser; if that is not one
+  of those, pass `--no-open` and open the printed URL in one that is.
 
 ## Installation
 
@@ -94,8 +96,8 @@ wc-exe install
 │  1. Hono Server (dynamic port)                         │
 │     └─ COEP/COOP headers for WebContainer              │
 │                                                         │
-│  2. Puppeteer (Headless Chrome)                        │
-│     └─ Runs WebContainer in browser                    │
+│  2. A tab in your own browser                          │
+│     └─ Opened by the CLI, drives itself over SSE       │
 │                                                         │
 │  3. WebContainer (in browser memory)                   │
 │     ├─ Mount source files                              │
@@ -146,20 +148,26 @@ install entirely; changing the lockfile invalidates the cache automatically.
 Measured on a sample Vite app: cold ~17.5s → warm ~2.7s (install skipped).
 
 To keep OPFS across runs, the cache mode pins the runner to a fixed port
-(`5199`, so the origin is stable) and uses a persistent Chrome profile under
-`~/.cache/wc-exe/`. Your project directory is never written to; the cache lives
-as an opaque blob inside that profile.
+(`5199`) so the origin stays the same — OPFS is scoped per origin, and a random
+port would orphan the previous snapshot every run. The snapshot lives in your
+browser's storage for that origin, so it persists like any site's data and goes
+away if you clear site data. Your project directory is never written to.
 
 ## Environment Variables
 
 | Variable            | Description                                                    |
 | ------------------- | -------------------------------------------------------------- |
-| `CHROME_PATH`       | Custom path to Chrome/Chromium executable                      |
 | `WC_EXE_CACHE_DIR`  | Override the cache directory (default: `~/.cache/wc-exe`)      |
 | `WC_EXE_CACHE_PORT` | Override the fixed runner port for `--cache` (default: `5199`) |
 
 Example:
 
 ```bash
-CHROME_PATH=/usr/bin/chromium wc-exe build --cache
+WC_EXE_CACHE_PORT=6000 wc-exe build --cache
 ```
+
+### Opening the runner page
+
+By default the CLI hands the runner's URL to your desktop browser. `--no-open`
+skips that and prints the URL instead, for when you want to pick the browser, or
+watch the page's console, or run against a tab you already have open.

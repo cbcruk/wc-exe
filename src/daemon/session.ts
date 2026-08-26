@@ -1,6 +1,5 @@
 import path from 'node:path'
-import type { Browser } from 'puppeteer-core'
-import { WCBrowser } from '../core/browser.js'
+import { RunnerClient } from '../core/runner-client.js'
 import { RunnerLink } from '../core/rpc.js'
 import {
   listProjectFiles,
@@ -32,20 +31,17 @@ export interface SessionOptions {
   /** Origin the daemon serves from, e.g. `http://127.0.0.1:5199`. */
   origin: string
   /**
-   * Supplies the browser every session opens its page on.
+   * Hand this session's URL to the desktop browser when it needs a page.
    *
-   * Shared rather than one-per-session because Chrome permits a single process
-   * per profile directory and aborts otherwise — with a browser apiece, opening
-   * a second project failed before it started.
-   *
-   * A function so the browser is launched on first use rather than at daemon
-   * startup, and so all sessions await the same launch.
+   * `false` prints nothing and opens nothing — the caller is expected to open
+   * the URL itself. Useful for tests, and for a daemon running somewhere no
+   * one is watching.
    */
-  getBrowser: () => Promise<Browser>
+  open?: boolean
 }
 
 /**
- * One project held open inside the daemon: a page, a booted container, and the
+ * One project held open inside the daemon: a tab, a booted container, and the
  * `node_modules` that make reuse worth anything.
  *
  * A session is deliberately **not** a cache of build results. It caches the
@@ -54,7 +50,7 @@ export interface SessionOptions {
  * the failure this trades against is not a slow build but a wrong one.
  */
 export class Session {
-  private browser: WCBrowser | null = null
+  private runner: RunnerClient | null = null
   private manifest: Manifest = new Map()
   private booted = false
   /** Set when something goes wrong badly enough that reuse is unsafe. */
@@ -71,7 +67,7 @@ export class Session {
   readonly link = new RunnerLink()
   readonly source: string
   private readonly origin: string
-  private readonly getBrowser: () => Promise<Browser>
+  private readonly open: boolean
   private lastUsed = Date.now()
   /** Output directory of the build in flight, for the dist upload route. */
   private currentOutput: string | null = null
@@ -80,7 +76,19 @@ export class Session {
     this.id = id
     this.source = options.source
     this.origin = options.origin
-    this.getBrowser = options.getBrowser
+    this.open = options.open ?? true
+
+    // A closed tab takes the container with it, so the session must forget
+    // everything it believed about the runtime's contents. This is a better
+    // signal than the idle timer it supplements: the timer guesses that nobody
+    // is using a session, whereas this is the runtime actually being gone. Not
+    // poisoned, though — nothing was left half-written, so the next build can
+    // simply open a fresh tab.
+    this.link.onDisconnect(() => {
+      this.runner = null
+      this.booted = false
+      this.manifest = new Map()
+    })
   }
 
   /** When this session was last used, for idle eviction. */
@@ -112,16 +120,20 @@ export class Session {
     }
   }
 
-  /** Boots the page and container if they are not up yet. */
+  /** Opens a tab for this session and boots its container, if not up yet. */
   private async ensureBooted(verbose: boolean): Promise<boolean> {
-    if (this.booted && this.browser) return true
+    if (this.booted && this.runner) return true
 
-    this.browser = new WCBrowser({
-      verbose,
-      browser: await this.getBrowser(),
-      link: this.link,
-    })
-    await this.browser.launch(`${this.origin}/s/${this.id}/`)
+    const url = `${this.origin}/s/${this.id}/`
+    // Printed only when the daemon is not opening it, because then nothing
+    // else knows the URL: the id is minted here and the caller sees it nowhere
+    // else. It reaches a terminal only under `--daemon --verbose`, which is
+    // the only case where anyone is reading the daemon's output.
+    if (!this.open)
+      console.log(`Session ${this.id} needs a runner page: ${url}`)
+
+    this.runner = new RunnerClient({ verbose, link: this.link })
+    await this.runner.launch(url, { open: this.open })
     this.booted = true
     // A fresh container holds nothing, so the next sync must push everything.
     this.manifest = new Map()
@@ -142,13 +154,13 @@ export class Session {
     const plan = diffManifests(this.manifest, next)
 
     if (plan.remove.length) {
-      await this.browser!.removePaths(plan.remove)
+      await this.runner!.removePaths(plan.remove)
     }
 
     // The runner pulls the whole project through the server. On a first sync
     // that is everything; afterwards it re-reads files the host says changed.
     if (plan.upsert.length) {
-      await this.browser!.mountFromServer()
+      await this.runner!.mountFromServer()
     }
 
     this.manifest = next
@@ -187,11 +199,11 @@ export class Session {
       // Re-resolved every build: a project can gain or change a lockfile
       // between runs, and a long-lived session must not keep installing with
       // the manager it happened to see first.
-      const { manager, reason } = await this.browser!.packageManager()
+      const { manager, reason } = await this.runner!.packageManager()
       log(`Package manager: ${manager} (${reason})`)
 
       if (!options.noInstall) {
-        const result = await this.browser!.installWithCache()
+        const result = await this.runner!.installWithCache()
         log(
           result.cached
             ? `Dependencies restored from cache (${result.key.slice(0, 12)})`
@@ -207,10 +219,10 @@ export class Session {
       // vite empties its own outDir and hides the difference. It is kept for
       // build tools that do not, but nothing here demonstrates it works — do
       // not read the passing test as covering it.
-      await this.browser!.removePaths([options.distDir.replace(/^\//, '')])
+      await this.runner!.removePaths([options.distDir.replace(/^\//, '')])
       log('Cleared previous build output')
 
-      const build: CommandResult = await this.browser!.runCommand(
+      const build: CommandResult = await this.runner!.runCommand(
         manager,
         ['run', 'build'],
         { timeout: options.timeout }
@@ -221,7 +233,7 @@ export class Session {
 
       this.currentOutput = options.output
       try {
-        const written = await this.browser!.uploadDist(options.distDir)
+        const written = await this.runner!.uploadDist(options.distDir)
         log(`Wrote ${written} files`)
         return { reused, upserted, removed, written }
       } finally {
@@ -238,10 +250,17 @@ export class Session {
     }
   }
 
-  /** Tears down the page and container. Safe to call more than once. */
+  /**
+   * Drops this session's half of the link. Safe to call more than once.
+   *
+   * The tab is left open — the daemon did not open the browser and cannot close
+   * it. It becomes a page talking to a session that no longer exists, which its
+   * `EventSource` will retry against and get a 404 for. Harmless, but it is why
+   * the daemon cannot promise to clean up after itself here.
+   */
   async close(): Promise<void> {
-    await this.browser?.close()
-    this.browser = null
+    await this.runner?.close()
+    this.runner = null
     this.booted = false
     this.manifest = new Map()
   }

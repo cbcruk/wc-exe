@@ -22,6 +22,16 @@ import type { Context } from 'hono'
  * shape does not have to change.
  */
 
+/**
+ * Reconnection delay handed to the page's `EventSource`, in milliseconds.
+ *
+ * Must stay comfortably under {@link RunnerLink}'s grace window, which is what
+ * decides how long a dropped stream has to come back before the page counts as
+ * gone. Left to the browser's default the two numbers are both about three
+ * seconds and the ordering is luck.
+ */
+const RECONNECT_MS = 1_000
+
 interface Pending {
   resolve: (value: unknown) => void
   reject: (error: Error) => void
@@ -41,13 +51,65 @@ export class RunnerLink {
   private push: ((message: Invocation) => void) | null = null
   private listeners = new Map<string, (payload: unknown) => void>()
   private readyResolve: (() => void) | null = null
-  private readyPromise: Promise<void>
+  private readyReject: ((error: Error) => void) | null = null
+  private readyPromise!: Promise<void>
   private closed = false
+  /** Listeners for "the page stopped being there"; see {@link onDisconnect}. */
+  private disconnectListeners = new Set<() => void>()
+  private graceTimer: ReturnType<typeof setTimeout> | null = null
 
-  constructor() {
-    this.readyPromise = new Promise<void>((resolve) => {
+  /**
+   * How long a dropped stream is given to come back before the page counts as
+   * gone.
+   *
+   * `EventSource` reconnects on its own, so an abort is not by itself a closed
+   * tab — it is also what a laptop waking up looks like. Treating the first
+   * abort as a closed tab would tear down a session that is about to be fine.
+   *
+   * Three seconds against the {@link RECONNECT_MS} the page is told to use.
+   */
+  private readonly graceMs: number
+
+  /**
+   * @param options.graceMs Override the reconnect grace window. Exists so tests
+   *   can exercise the window in milliseconds instead of seconds; three seconds
+   *   is the number that matters in practice.
+   */
+  constructor(options: { graceMs?: number } = {}) {
+    this.graceMs = options.graceMs ?? 3_000
+    this.armReady()
+  }
+
+  /**
+   * Points {@link waitForReady} at a fresh promise.
+   *
+   * Re-armed rather than resolved once for all time, because the link outlives
+   * any one page: when a tab closes and the next one opens on the same session,
+   * the host has to wait for *that* page's boot, not remember the last one's.
+   */
+  private armReady(): void {
+    this.readyPromise = new Promise<void>((resolve, reject) => {
       this.readyResolve = resolve
+      this.readyReject = reject
     })
+    // The promise is only awaited if someone calls waitForReady. Without this,
+    // a rejection with no waiter is an unhandled rejection.
+    this.readyPromise.catch(() => undefined)
+  }
+
+  /**
+   * Registers interest in the page going away.
+   *
+   * The daemon uses this: a closed tab is a far better signal that a session is
+   * over than an idle timer guessing at it.
+   */
+  onDisconnect(listener: () => void): void {
+    this.disconnectListeners.add(listener)
+  }
+
+  /** Whether a page currently holds the event stream open. */
+  get isConnected(): boolean {
+    return this.push !== null
   }
 
   /**
@@ -57,22 +119,26 @@ export class RunnerLink {
    * so itself, which is the only way it can work when the host did not open it.
    */
   waitForReady(timeoutMs = 60_000): Promise<void> {
-    return Promise.race([
-      this.readyPromise,
-      new Promise<never>((_, reject) =>
-        setTimeout(
-          () =>
-            reject(
-              new Error(
-                `Runner did not report ready within ${timeoutMs}ms. ` +
-                  'Is the page open, and does this browser support ' +
-                  'SharedArrayBuffer under cross-origin isolation?'
-              )
-            ),
-          timeoutMs
-        )
-      ),
-    ])
+    let timer: ReturnType<typeof setTimeout>
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(
+            new Error(
+              `Runner did not report ready within ${timeoutMs}ms. ` +
+                'Is the page open, and does this browser support ' +
+                'SharedArrayBuffer under cross-origin isolation?'
+            )
+          ),
+        timeoutMs
+      )
+    })
+    // Cleared rather than left to fire: the daemon holds a link for as long as
+    // the session lives, and an uncleared timer per boot keeps the process
+    // awake and accumulates.
+    return Promise.race([this.readyPromise, deadline]).finally(() =>
+      clearTimeout(timer)
+    )
   }
 
   /** Calls a method on the page's `wcRunner` and waits for its result. */
@@ -103,6 +169,20 @@ export class RunnerLink {
   /** Route handler: `GET …/api/rpc/events`. Holds the stream open. */
   events(c: Context): Response | Promise<Response> {
     return streamSSE(c, async (stream) => {
+      // A stream arriving inside the grace window is the same page reconnecting,
+      // so the pending calls it left behind are still its own to answer.
+      if (this.graceTimer) {
+        clearTimeout(this.graceTimer)
+        this.graceTimer = null
+      }
+
+      // Pin the browser's reconnection delay rather than take its default.
+      // Chrome's is about three seconds — the same as the grace window below —
+      // so the two would race, and a transient drop would be a coin flip
+      // between "it came back" and "the tab is gone". A named event so the
+      // page's `onmessage`, which expects an invocation, never sees it.
+      await stream.writeSSE({ event: 'hello', data: '', retry: RECONNECT_MS })
+
       this.push = (message) => {
         void stream.writeSSE({ data: JSON.stringify(message) })
       }
@@ -113,10 +193,36 @@ export class RunnerLink {
       await new Promise<void>((resolve) => {
         stream.onAbort(() => {
           this.push = null
+          if (!this.closed) {
+            this.graceTimer = setTimeout(() => this.handleGone(), this.graceMs)
+            this.graceTimer.unref?.()
+          }
           resolve()
         })
       })
     })
+  }
+
+  /**
+   * The page did not come back: give up on it.
+   *
+   * Outstanding calls are failed rather than left pending. Under Puppeteer a
+   * dead page surfaced as a protocol error; here nothing surfaces at all, so a
+   * build whose tab was closed mid-run would simply never return.
+   */
+  private handleGone(): void {
+    this.graceTimer = null
+    const error = new Error(
+      'The runner page went away (tab closed, navigated, or reloaded).'
+    )
+    for (const pending of this.pending.values()) pending.reject(error)
+    this.pending.clear()
+    // Rejecting a ready promise that already resolved is a no-op; rejecting one
+    // that had not is what turns "closed the tab during boot" into an error
+    // instead of a sixty-second wait.
+    this.readyReject?.(error)
+    this.armReady()
+    for (const listener of this.disconnectListeners) listener()
   }
 
   /** Route handler: `POST …/api/rpc/result`. */
@@ -151,9 +257,14 @@ export class RunnerLink {
    */
   close(reason = 'Runner link closed'): void {
     this.closed = true
+    if (this.graceTimer) {
+      clearTimeout(this.graceTimer)
+      this.graceTimer = null
+    }
     for (const pending of this.pending.values())
       pending.reject(new Error(reason))
     this.pending.clear()
+    this.readyReject?.(new Error(reason))
     this.push = null
   }
 }

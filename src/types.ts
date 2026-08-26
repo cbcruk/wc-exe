@@ -19,10 +19,15 @@ export interface BuildOptions {
   noInstall?: boolean
   /** Reuse an OPFS-cached `node_modules` when the lockfile is unchanged. */
   cache?: boolean
-  /** Forward browser console output to the terminal. */
+  /** Forward runner diagnostics to the terminal. */
   verbose?: boolean
   /** Per-command timeout in milliseconds. Omit to wait indefinitely. */
   timeout?: number
+  /**
+   * Open the runner page in the desktop browser. Defaults to `true`; `false`
+   * prints the URL and waits for a tab the user opens themselves.
+   */
+  open?: boolean
 }
 
 /**
@@ -31,7 +36,7 @@ export interface BuildOptions {
 export interface DevOptions {
   /** Local port the dev server is proxied to. Defaults to `5173`. */
   port: number
-  /** Reserved: open the proxied URL in a browser once ready. */
+  /** Open the runner page in the desktop browser. Defaults to `true`. */
   open?: boolean
 }
 
@@ -41,4 +46,6 @@ export interface DevOptions {
 export interface InstallOptions {
   /** Reuse an OPFS-cached `node_modules` when the lockfile is unchanged. */
   cache?: boolean
+  /** Open the runner page in the desktop browser. Defaults to `true`. */
+  open?: boolean
 }

@@ -6,7 +6,7 @@ import fs from 'node:fs/promises'
 import http from 'node:http'
 import httpProxy from 'http-proxy'
 import { startServer, type ServerInfo } from '../core/server.js'
-import { WCBrowser } from '../core/browser.js'
+import { RunnerClient } from '../core/runner-client.js'
 import { listProjectFiles, readProjectFileBytes } from '../core/file-sync.js'
 import { withSpin } from '../utils/spinner.js'
 import { commandFailure } from '../core/command-error.js'
@@ -22,12 +22,12 @@ import type { DevOptions } from '../types.js'
  * host edits back in so HMR works against real files on disk.
  *
  * @param options See {@link DevOptions}.
- * @throws If any startup step fails. The watcher, proxy and browser are torn
- *   down first.
+ * @throws If any startup step fails. The watcher, proxy and link are torn down
+ *   first; the runner tab is the user's to close.
  * @remarks Never resolves — it runs until interrupted (SIGINT).
  */
 export async function dev(options: DevOptions): Promise<void> {
-  const { port = 5173 } = options
+  const { port = 5173, open = true } = options
 
   console.log(chalk.cyan('\n  wc-exe dev - Development Server\n'))
 
@@ -35,7 +35,7 @@ export async function dev(options: DevOptions): Promise<void> {
 
   let serverInfo: ServerInfo | undefined
   let proxyServer: http.Server | undefined
-  let browser: WCBrowser | null = null
+  let browser: RunnerClient | null = null
   let watcher: chokidar.FSWatcher | null = null
 
   const cleanup = async (): Promise<void> => {
@@ -75,13 +75,13 @@ export async function dev(options: DevOptions): Promise<void> {
       failMessage: 'Failed to start server',
     })
 
-    browser = new WCBrowser({ verbose: false, link: serverInfo.link })
+    browser = new RunnerClient({ verbose: false, link: serverInfo.link })
     await withSpin({
       spinner,
-      message: 'Launching headless browser...',
-      fn: () => browser!.launch(serverInfo!.url),
+      message: `Waiting for the runner page at ${serverInfo.url} ...`,
+      fn: () => browser!.launch(serverInfo!.url, { open }),
       successMessage: 'WebContainer booted',
-      failMessage: 'Failed to launch browser',
+      failMessage: 'The runner page never reported ready',
     })
 
     await withSpin({

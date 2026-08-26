@@ -25,7 +25,10 @@ async function openStream(app: Hono) {
   return {
     async next(): Promise<{ id: number; method: string; args: unknown[] }> {
       for (;;) {
-        const match = buffer.match(/data: (.*)\n/)
+        // `.+`, not `.*`: the stream opens with a named `hello` whose data
+        // line is empty, to pin the reconnect delay. A real `EventSource`
+        // routes named events away from `onmessage`; this reader skips it.
+        const match = buffer.match(/data: (.+)\n/)
         if (match) {
           buffer = buffer.slice(match.index! + match[0].length)
           return JSON.parse(match[1])

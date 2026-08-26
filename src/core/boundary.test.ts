@@ -77,10 +77,11 @@ describe('the core boundary', () => {
     const index = fs.readFileSync(path.join(coreDir, 'index.ts'), 'utf8')
 
     for (const expected of [
-      'WCBrowser',
+      'RunnerClient',
+      'RunnerLink',
       'startServer',
       'listProjectFiles',
-      'launchChrome',
+      'openInBrowser',
     ]) {
       expect(index).toContain(expected)
     }

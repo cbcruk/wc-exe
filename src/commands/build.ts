@@ -5,18 +5,14 @@ import {
   startServerWithFallback,
   type ServerInfo,
 } from '../core/server.js'
-import { WCBrowser } from '../core/browser.js'
+import { RunnerClient } from '../core/runner-client.js'
 import {
   listProjectFiles,
   readProjectFileBytes,
   prepareOutputDir,
   writeDistFile,
 } from '../core/file-sync.js'
-import {
-  CACHE_PORT,
-  CHROME_PROFILE_DIR,
-  ensureCacheDirs,
-} from '../core/cache.js'
+import { CACHE_PORT, ensureCacheDirs } from '../core/cache.js'
 import { withSpin } from '../utils/spinner.js'
 import { commandFailure } from '../core/command-error.js'
 import type { ServerHandlers } from '../core/types.js'
@@ -25,12 +21,13 @@ import type { BuildOptions } from '../types.js'
 /**
  * Builds a project inside the browser runtime and writes the output to disk.
  *
- * Serves the project over a local server, boots the runtime in headless Chrome,
- * mounts the files, installs dependencies, runs `npm run build`, then copies the
- * artifacts back out.
+ * Serves the project over a local server, opens the runner page in the desktop
+ * browser, mounts the files, installs dependencies, runs `npm run build`, then
+ * copies the artifacts back out.
  *
  * @param options See {@link BuildOptions}.
- * @throws If any step fails. The server and browser are always torn down first.
+ * @throws If any step fails. The server and the link are always torn down
+ *   first; the tab is the user's to close.
  * @remarks Calls `process.exit(0)` on success, so it never resolves — this is
  *   the CLI entry point, not a reusable library call.
  */
@@ -42,6 +39,7 @@ export async function build(options: BuildOptions): Promise<void> {
     noInstall = false,
     cache = false,
     verbose = false,
+    open = true,
     timeout,
   } = options
 
@@ -52,7 +50,7 @@ export async function build(options: BuildOptions): Promise<void> {
   const spinner = ora()
 
   let serverInfo: ServerInfo | undefined
-  let browser: WCBrowser | null = null
+  let browser: RunnerClient | null = null
 
   const cleanup = async (): Promise<void> => {
     spinner.stop()
@@ -100,17 +98,17 @@ export async function build(options: BuildOptions): Promise<void> {
 
     const cacheStable = cache && serverInfo.port === CACHE_PORT
 
-    browser = new WCBrowser({
-      verbose,
-      link: serverInfo.link,
-      userDataDir: cacheStable ? CHROME_PROFILE_DIR : undefined,
-    })
+    browser = new RunnerClient({ verbose, link: serverInfo.link })
     await withSpin({
       spinner,
-      message: 'Launching headless browser...',
-      fn: () => browser!.launch(serverInfo!.url),
+      // The URL is in the message rather than only in a failure, because it is
+      // the fallback: if the desktop opener does not work, or the default
+      // browser cannot run a WebContainer, the user needs to see where to point
+      // one *while* the wait is happening, not after it times out.
+      message: `Waiting for the runner page at ${serverInfo.url} ...`,
+      fn: () => browser!.launch(serverInfo!.url, { open }),
       successMessage: 'WebContainer booted',
-      failMessage: 'Failed to launch browser',
+      failMessage: 'The runner page never reported ready',
     })
 
     await withSpin({
