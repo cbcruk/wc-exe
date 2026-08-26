@@ -227,3 +227,60 @@ describe('a runner page that goes away', () => {
     )
   })
 })
+
+describe('letting go of a page', () => {
+  let server: ServerType | undefined
+
+  afterEach(async () => {
+    await Promise.all(
+      openStreams.splice(0).map((drop) => drop().catch(() => {}))
+    )
+    if (server) {
+      const s = server
+      ;(s as { closeAllConnections?: () => void }).closeAllConnections?.()
+      await new Promise<void>((resolve) => s.close(() => resolve()))
+      server = undefined
+    }
+  })
+
+  it('ends the open event stream when the link closes', async () => {
+    // The host cannot ask the page to let go — the page is in a browser it does
+    // not own. So closing has to end the response from this side, or the
+    // session's socket outlives the session that justified it.
+    const socket = await linkOnSocket(50)
+    server = socket.server
+
+    const response = await fetch(`${socket.url}/api/rpc/events`)
+    const reader = response.body!.getReader()
+    void reader.read()
+
+    socket.link.close('done')
+
+    // Resolves only if the response actually ended; an SSE stream that is
+    // merely abandoned leaves this pending forever.
+    const ended = await Promise.race([
+      (async () => {
+        for (;;) {
+          const { done } = await reader.read()
+          if (done) return 'ended'
+        }
+      })(),
+      new Promise((resolve) => setTimeout(() => resolve('still open'), 2000)),
+    ])
+    expect(ended).toBe('ended')
+  })
+
+  it('refuses a stream on a closed link instead of holding one open', async () => {
+    // `EventSource` reconnects on its own, so ending the stream is not the end
+    // of it: a tab whose session the daemon evicted would attach again and hold
+    // a socket for a session that no longer exists. 204 is the status the spec
+    // treats as fatal, so the tab stops retrying rather than doing it forever.
+    const socket = await linkOnSocket(50)
+    server = socket.server
+
+    socket.link.close('done')
+    const response = await fetch(`${socket.url}/api/rpc/events`)
+
+    expect(response.status).toBe(204)
+  })
+})

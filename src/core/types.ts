@@ -134,6 +134,19 @@ export interface CacheResult {
 }
 
 /**
+ * What clearing the OPFS cache removed.
+ *
+ * Mirrors the runner's own `ClearCacheResult`, for the same reason as
+ * {@link CacheResult}.
+ */
+export interface ClearCacheResult {
+  /** Blob names deleted. */
+  removed: string[]
+  /** Their combined size, in bytes. */
+  bytes: number
+}
+
+/**
  * Host-side callbacks the local server exposes to the in-browser runner.
  * Each maps to one `/api` route in {@link createApp}.
  */

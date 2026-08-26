@@ -289,7 +289,14 @@ export async function startDaemon(
     // a page's side.
     clearRecord()
     await new Promise<void>((resolve) => {
-      if (!server) return resolve()
+      if (!server)
+        return resolve()
+        // Same reason as `ServerInfo.shutdown`: every session's tab leaves
+        // sockets behind, and `close()` waits on all of them. `wc-exe daemon
+        // stop` would sit there until they timed out.
+      ;(
+        server as typeof server & { closeAllConnections?: () => void }
+      ).closeAllConnections?.()
       server.close(() => resolve())
     })
   }

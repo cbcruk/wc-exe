@@ -667,6 +667,55 @@ async function evictCache(protect: string): Promise<void> {
   await writeCacheIndex(index)
 }
 
+/** What {@link clearCache} removed. */
+interface ClearCacheResult {
+  /** Blob names deleted. */
+  removed: string[]
+  /** Their combined size, in bytes. */
+  bytes: number
+}
+
+/**
+ * Deletes every wc-exe cache blob at this origin, and the LRU index with them.
+ *
+ * This exists because **the host lost the ability to do it.** While wc-exe
+ * launched its own Chrome, a cold cache was a matter of deleting the profile
+ * directory the host owned — which is exactly how `bench/cache-scenarios.mjs`
+ * produced its A and D scenarios. The page now runs in the user's browser, so
+ * nobody host-side owns that storage any more; the only thing that can clear
+ * OPFS is the page whose origin it belongs to.
+ *
+ * Scoped to our own blobs rather than wiping the directory: the origin is a
+ * real one the user may have other data at, and a benchmark is not a reason to
+ * take it.
+ *
+ * @returns What was removed, so a caller can assert it actually started cold
+ *   rather than assume it.
+ */
+async function clearCache(): Promise<ClearCacheResult> {
+  const root = await opfsRoot()
+  const blobs = await listCacheBlobs()
+
+  const removed: string[] = []
+  let bytes = 0
+  for (const blob of blobs) {
+    await root.removeEntry(blob.name)
+    removed.push(blob.name)
+    bytes += blob.size
+  }
+
+  // Without this the index would keep naming blobs that no longer exist, and
+  // the next eviction pass would prune them — harmless, but it means the state
+  // after a "clear" depends on when eviction next runs.
+  await root.removeEntry(CACHE_INDEX).catch(() => undefined)
+
+  console.log(
+    `[wc-build] cleared ${removed.length} cache blob(s), ` +
+      `${(bytes / 1048576).toFixed(1)} MB`
+  )
+  return { removed, bytes }
+}
+
 /**
  * Mounts a snapshot into `dir`, creating the mount point first and verifying
  * the result.
@@ -1064,8 +1113,8 @@ async function getServerUrl(): Promise<{ port: number; url: string }> {
 
 /**
  * The page's API, exposed on `window` and driven by the host over Puppeteer.
- * Its shape is the contract mirrored by `WCBrowser` on the Node side — changing
- * a signature here means changing it there too.
+ * Its shape is the contract mirrored by `RunnerClient` on the Node side —
+ * changing a signature here means changing it there too.
  */
 const wcRunner = {
   boot,
@@ -1083,6 +1132,7 @@ const wcRunner = {
   shellVerifyJobControl,
   closeShell,
   installWithCache,
+  clearCache,
   spawnCommand,
   writeFile,
   removePaths,

@@ -1,14 +1,14 @@
 // End-to-end check for the bridge against a real WebContainer.
 //
 // Unit tests cover the pure pieces (output buffering, error formatting), but
-// nothing about `page.evaluate` round-trips, spawn options actually reaching
+// nothing about control-channel round-trips, spawn options actually reaching
 // the process, or a kill actually killing can be proven without booting the
 // thing. This is that proof.
 //
 // Not part of `vitest run`: it needs a desktop session whose default browser
 // runs WebContainer — wc-exe opens a tab rather than launching one — and
-// outbound network
-// access to StackBlitz's runtime hosts, so it stays an explicit local step.
+// outbound network access to StackBlitz's runtime hosts, so it stays an
+// explicit local step.
 //
 // Usage:
 //   pnpm build && node test/integration/bridge.mjs
@@ -16,7 +16,7 @@
 import path from 'node:path'
 import {
   startServer,
-  WCBrowser,
+  RunnerClient,
   listProjectFiles,
   readProjectFileBytes,
 } from '../../dist/index.js'
@@ -29,7 +29,10 @@ const handlers = {
 }
 
 const info = await startServer(handlers)
-const browser = new WCBrowser({ verbose: false })
+// `link` is not optional: it is how the page is driven at all. Omitting it
+// left this script constructing a client that could not make a single call —
+// which is how it sat broken from the moment the control channel landed.
+const browser = new RunnerClient({ verbose: false, link: info.link })
 let failures = 0
 
 const check = (name, ok, detail) => {
@@ -40,6 +43,11 @@ const check = (name, ok, detail) => {
 }
 
 try {
+  // Printed before the wait, not after it fails: wc-exe hands the URL to the
+  // desktop browser, and if that does not work — no desktop session, a default
+  // browser that cannot run WebContainer — the only symptom is sixty silent
+  // seconds. Seeing the URL turns that into something you can act on.
+  console.log(`waiting for the runner page at ${info.url} ...`)
   await browser.launch(info.url)
   await browser.mountFromServer()
 
@@ -333,7 +341,7 @@ try {
   )
 } finally {
   await browser.close()
-  await new Promise((r) => info.server.close(() => r()))
+  await info.shutdown()
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nall checks passed')

@@ -1000,13 +1000,13 @@ Builder { build(project, options) → dist }
 
 **번호는 고정이다.** 이 문서와 `persistent-runner.md`가 곳곳에서 번호로 참조하므로, 닫힌 항목도 번호를 들고 아래로 내려갈 뿐 재사용하지 않는다.
 
-> **먼저 — 미결 1·9의 계측기가 지금 고장나 있다.**
+> **미결 1·9의 계측기는 고쳤다** (`persistent-runner.md` §21).
 >
-> puppeteer를 걷어내고 `WCBrowser`를 `RunnerClient`로 개명하면서(`persistent-runner.md` §19) `bench/webcontainer.mjs`·`bench/cache-scenarios.mjs`·`test/integration/bridge.mjs`가 **import에서 죽는다.** `poc/*/run.mjs`는 더 조용하다 — 락파일에서 사라진 `puppeteer-core`를 `.pnpm` 스토어에 남은 잔재로 해석하고 있어서, **이 작업 트리에서만 돈다.**
+> puppeteer를 걷어내면서 `bench/webcontainer.mjs`·`bench/cache-scenarios.mjs`·`test/integration/bridge.mjs`가 import에서 죽고, PoC 둘은 락파일에 없는 `puppeteer-core`를 스토어 잔재로 해석하고 있었다. 넷 다 이제 돈다.
 >
-> `cache-scenarios`는 개명 문제가 아니다. cold OPFS를 만드는 수단이 **크롬 프로파일 디렉터리 삭제**였는데, 그 디렉터리를 이제 아무도 소유하지 않는다. OPFS가 페이지 것이 됐으니 **페이지가 자기 캐시를 지우는 수단**(러너에 `clearCache()`)이 올바른 대체다. 곁가지로, 그 스크립트가 모으는 `logs` 배열은 읽는 곳이 없는 죽은 코드라 콘솔 캡처 상실 비용은 0이다 — 보고는 이미 `installWithCache`의 구조화된 반환값을 쓴다.
+> `cache-scenarios`의 cold 시나리오는 크롬 프로파일 디렉터리 삭제에 기대고 있었는데, 그 디렉터리가 없어졌다. **OPFS가 페이지 것이 됐으니 페이지가 지운다** — 러너에 `clearCache()`가 생겼고, 벤치는 자기 origin(`127.0.0.1:5298`)을 써서 사용자의 실제 캐시와 분리된다. 프로파일로 하던 격리를 origin으로 옮긴 것이다.
 >
-> **고치기 전까지 미결 1·9는 "안 쟀다"가 아니라 "못 잰다"이고, 그건 방법론 ④가 경계한 바로 그 상태다.** 계측기가 고장난 채로 항목을 열어두면, 재볼 수 없다는 사실이 우선순위 논의에서 조용히 사라진다.
+> **두 항목은 이제 "안 쟀다"다.** 실제 기계에서 `node bench/cache-scenarios.mjs`를 돌리면 미결 9가 닫힌다.
 
 #### 살아있는 것
 
@@ -1028,7 +1028,7 @@ Builder { build(project, options) → dist }
 
 - **9. 캐시 수치 재측정** — §5의 B(0.30s)는 OPFS 복원이 실행 권한을 잃던 시절에 잰 값이다(§5 경고, `persistent-runner.md` §12.1). `chmod` 수정 이후로 다시 재지 않았다. **확정 1의 헤드라인 수치가 여기 걸려 있다.**
 
-  닫는 수단은 `node bench/cache-scenarios.mjs`인데, **그 스크립트가 지금 돌지 않는다**(위 경고). 계측기 복구가 이 항목의 선행 조건이다.
+  닫는 수단은 `node bench/cache-scenarios.mjs`다. 한동안 그 스크립트가 돌지 않아 이 항목이 "잴 수 없는" 상태였는데, 고쳤다(`persistent-runner.md` §21). 이제 실제 기계 하나만 있으면 된다.
 
 #### 닫힌 것 (번호는 유지)
 

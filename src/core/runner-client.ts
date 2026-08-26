@@ -2,6 +2,7 @@ import type { RunnerLink } from './rpc.js'
 import { openInBrowser } from './open.js'
 import type {
   CacheResult,
+  ClearCacheResult,
   CommandResult,
   PackageManagerChoice,
   RunCommandOptions,
@@ -122,6 +123,21 @@ export class RunnerClient {
    */
   async describeRuntime(): Promise<{ workdir: string; path: string }> {
     return this.callRunner('describeRuntime')
+  }
+
+  /**
+   * Deletes every wc-exe cache blob in the page's OPFS.
+   *
+   * The host used to do this by deleting the Chrome profile directory it owned;
+   * with the page in the user's own browser there is no such directory, and the
+   * page's origin is the only thing that can reach that storage. Benchmarks
+   * that need a genuinely cold cache go through here.
+   *
+   * @returns Which blobs went and how big they were, so a caller can assert it
+   *   really started cold instead of assuming it.
+   */
+  async clearCache(): Promise<ClearCacheResult> {
+    return this.callRunner('clearCache')
   }
 
   /**

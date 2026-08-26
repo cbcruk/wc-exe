@@ -46,10 +46,7 @@ export async function install(options: InstallOptions): Promise<void> {
   const cleanup = async (): Promise<void> => {
     spinner.stop()
     await browser?.close()
-    if (serverInfo?.server) {
-      const server = serverInfo.server
-      await new Promise<void>((resolve) => server.close(() => resolve()))
-    }
+    await serverInfo?.shutdown()
   }
 
   process.on('SIGINT', async () => {
