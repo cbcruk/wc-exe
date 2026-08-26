@@ -517,6 +517,52 @@ warm 실행을 분해하면 인터셉트가 대체하는 조각이 가장 작다
 
 **증명된 게 아니다.** 리스크 둘이 그대로다: ① 픽스처 하나에서 "훅이 안 걸린다"를 일반화하는 건 이 탐색이 이미 두 번 저지른 실수다 ② npm의 트리 해석(peer deps·`overrides`·optional/platform deps·workspaces)을 재현하지 못하면 빌드가 **조용히** 깨진다(위 «하이브리드 착지점»의 본체 비용).
 
+#### ②단계 완료 — `node_modules` 없이 빌드된다 (`--deps=registry`, 2026-08)
+
+호스트가 lockfile을 읽고 타르볼을 받아 메모리에서 풀어 볼륨으로 스트림한다. **프로젝트 디렉터리에는 아무것도 쓰지 않는다.**
+
+**왜 "npm 재구현"이 아닌가.** «하이브리드 착지점»이 본체 비용으로 지목한 게 npm의 트리 해석 재현인데, **lockfile이 이미 그 해석 결과다.** `package-lock.json` v2/v3의 `packages` 맵이 설치 경로를 키로 갖고 각 항목에 정확한 버전·타르볼 URL·integrity를 담는다 — 트리 레이아웃 그 자체다. 남는 일은 materialize뿐이고, peer deps·overrides·hoisting은 하나도 재현하지 않는다.
+
+**granularity는 파일이 아니라 패키지다.** StackBlitz의 Turbo가 파일 단위로 가져올 수 있는 건 패키지를 풀어서 서빙하는 자체 인프라가 있어서다. 평범한 레지스트리(그리고 폐쇄망의 내부 미러)는 **타르볼만** 주고, 그게 integrity 해시가 덮는 단위이기도 하다. 그래서 흐름은:
+
+1. lockfile이 **설치 경로**를 준다(네트워크 0). 그 디렉터리들만 미리 만든다 — 해석이 걸어 들어갈 수 있어야 하니까.
+2. 그 이상은 모른다. **타르볼을 풀기 전에는 패키지 안에 무슨 파일이 있는지 아무도 모른다.** 그래서 보낼 파일 매니페스트가 없다.
+3. 패키지 안쪽 첫 miss가 **그 패키지 전체**를 끌어온다 — fetch → integrity 검증 → gunzip → untar → write. 패키지당 요청 하나.
+
+`dev` 항목은 버린다(인터셉트는 프로젝트의 vite를 실행하지 않는다). React 픽스처에서 lockfile 113개 → **5개**.
+
+**실측 — `node_modules`를 지운 복사본으로.**
+
+```
+lockfile: v3, 5 non-dev packages
+[host] node_modules/react@18.3.1:      20 files,  311 KB from an  80 KB tarball
+[host] node_modules/react-dom@18.3.1:  32 files, 4408 KB from a 1063 KB tarball
+[host] node_modules/scheduler@0.23.2:  17 files,   91 KB from a  17 KB tarball
+faulted in 77 files from 3 packages, 4.8 MB
+```
+
+5개 중 **3개만 받았다** — `js-tokens`·`loose-envify`는 lockfile에 있지만 그래프가 안 닿았다. 방출 파일 3개 전부 디스크 모드 빌드와 **바이트 동일**하고, 끝난 뒤 프로젝트 디렉터리는 그대로다.
+
+| React 픽스처      | cold  | warm      |
+| ----------------- | ----- | --------- |
+| `--deps=registry` | 558ms | 396–400ms |
+| `--deps=disk`     | —     | 369–392ms |
+
+**warm이 설치된 트리를 읽는 것과 대등하다.**
+
+**그리고 wc-exe에 진짜 중요한 숫자는 이것이다:**
+
+|                     | 파일 수   | 크기  |
+| ------------------- | --------- | ----- |
+| 설치된 node_modules | **2,248** | 44MB  |
+| 타르볼 캐시         | **3**     | 1.2MB |
+
+**백신 비용은 파일 개수당**이다. §5가 "타르볼을 캐싱하는 게 옳은 모양"이라고 적어둔 이유가 이 표다.
+
+**부수로 더 나쁜 버그를 잡았다.** integrity 해시 한 글자를 고의로 망가뜨려 검사가 무는지 봤는데, fetch는 제대로 실패했지만 **rolldown이 미해결 bare specifier를 경고만 하고 external로 넘겼다.** 빌드가 "성공"하고, `"react"`를 import하는 번들이 나오고, 브라우저에서 `Failed to resolve module specifier "react"`로 죽었다. 브라우저 번들에는 import map이 없으므로 external bare specifier는 **절대** 옳지 않다. 이제 `UNRESOLVED_IMPORT`가 **치명적 오류**이고, 메시지가 원인이 된 fetch 실패까지 함께 싣는다.
+
+**안 되는 것**: npm lockfile만(pnpm은 형식도 레이아웃도 다르고 yarn PnP는 또 다름), lockfile 없으면 빌드 불가(해석이 npm의 어려운 부분이라 범위 밖 — 에러가 그렇게 말한다), `link:`/`git:`/`file:` 의존성은 **이름을 대며 건너뛴다**, lifecycle scripts는 돌리지 않는다(10개 프로젝트 실측상 런타임 클로저에 걸리는 게 0개지만 **증거이지 증명이 아니다**).
+
 #### 임의 프로젝트 첫 실측 — 하네스의 픽스처 종속성을 걷어내고 (2026-08)
 
 검사가 이 저장소 픽스처의 문자열을 하드코딩하고 있었다(`#213547`·`count is`·`Sample … App`). 픽스처만 빌드되던 동안엔 문제가 없었지만, 스톡 `npm create vite` 템플릿이 빌드되기 시작하자 **외부 프로젝트마다 가짜 실패 3개**를 만들고 진짜 문제를 덮었다.
@@ -916,9 +962,9 @@ Builder { build(project, options) → dist }
 5. **`Builder` 이음새** — 인터셉트를 두 번째 백엔드로 올리려면 `Runtime` 위에 "프로젝트 → `dist/`" 층이 필요하다(위 «이음새의 고도»). 1의 측정이 유리하게 나온 **뒤에** 긋는다.
 6. ~~**fs-proxy memfs 이식 실험**~~ — **완료(`--vfs=memfs`).** 동작하고 출력이 바이트 동일하며, 지연 VFS도 **되찾았다**(동기 XHR fault-in) — 대가가 1.8×에서 약 9%로 내려갔고 규모가 큰 앱에선 eager 대비 4×다. 미결 3의 해당 형태들은 이 모드에서만 올바로 해석된다(위 3 참조). vrowzer의 10MB 페이로드 패치는 **필요 없었다**. §9 참조.
 7. **OXC `vite.config.ts` 정적 추출**(§9 vrowzer) — 미결 2를 포크 없이 좁히는 저비용 수단. 못 다루는 설정을 `unsupported[]`로 신고하는 부분이 특히 우리 취향이다.
-8. **install 없는 인터셉트** — 인터셉트가 wc-exe의 실제 문제를 풀려면 반드시 필요하다(§9). **①단계 완료: 10개 프로젝트 실측에서 런타임 클로저의 lifecycle 훅은 0개다**(`bench/install-shape.mjs`). 전송량 우려도 lazy fault-in이 대부분 없앴다 — 그래프가 실제로 읽는 건 클로저의 1~2%다. 남은 것: ② 호스트가 lockfile → 타르볼 → 메모리 → 볼륨을 잇는다. **타르볼 단위 지연 페치**가 자연스러운 모양이다.
+8. ~~**install 없는 인터셉트**~~ — **완료(`--deps=registry`).** ①단계로 lifecycle 훅이 런타임 클로저에서 0개임을 재고(`bench/install-shape.mjs`), ②단계로 호스트가 lockfile → 타르볼 → 메모리 → 볼륨을 이었다. `node_modules`를 지운 React 픽스처가 **바이트 동일하게** 빌드되고 warm이 디스크 모드와 대등하다(§9). **인터셉트 경로가 이제 처음부터 끝까지 디스크 설치 없이 돈다.** 남은 경계는 npm lockfile 전용이라는 것과 lifecycle scripts를 안 돌린다는 것.
 
-   여기서 «하이브리드 착지점»이 본체 비용으로 지목한 "npm 트리 해석 재현"에 단서가 하나 붙는다: **lockfile이 곧 해석 결과다.** `package-lock.json` v2/v3의 `packages` 맵은 설치 경로를 키로 갖고(`node_modules/foo`, `node_modules/foo/node_modules/bar`) 각 항목에 정확한 버전과 `integrity`가 붙는다 — 트리 레이아웃 그 자체다. 그러면 남는 일은 재현이 아니라 **구현(materialize)**이고, 훨씬 작다. 단서도 그대로다: **lockfile이 없으면** 진짜 해석이 필요하고, pnpm(형식이 다르고 심링크 레이아웃)·yarn PnP·workspaces·git/`file:` deps는 전부 미검증이다.
+   («하이브리드 착지점»이 본체 비용으로 지목한 "npm 트리 해석 재현"에 붙은 단서 — 이게 ②단계를 작게 만든 관찰이다: **lockfile이 곧 해석 결과다.** `package-lock.json` v2/v3의 `packages` 맵은 설치 경로를 키로 갖고(`node_modules/foo`, `node_modules/foo/node_modules/bar`) 각 항목에 정확한 버전과 `integrity`가 붙는다 — 트리 레이아웃 그 자체다. 그러면 남는 일은 재현이 아니라 **구현(materialize)**이고, 훨씬 작다. 단서도 그대로다: **lockfile이 없으면** 진짜 해석이 필요하고, pnpm(형식이 다르고 심링크 레이아웃)·yarn PnP·workspaces·git/`file:` deps는 전부 미지원이다.)
 
 9. **캐시 수치 재측정** — §5의 B(0.30s)는 OPFS 복원이 실행 권한을 잃던 시절에 잰 값이다(§5 경고, `persistent-runner.md` §12.1). `chmod` 수정 이후로 다시 재지 않았고, 이 샌드박스에선 WebContainer가 부팅되지 않아 잴 수 없다. **로컬에서 `node bench/cache-scenarios.mjs`.** 확정 1의 헤드라인 수치가 여기 걸려 있다.
 

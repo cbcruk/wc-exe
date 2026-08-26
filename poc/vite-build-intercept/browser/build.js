@@ -635,33 +635,109 @@ async function populateVolume(volume) {
  * the manifest, because a missing directory has to report ENOENT truthfully for
  * resolution to work — only files are deferred.
  */
-function installFaultIn(volume, fsObject, knownFiles, stats) {
-  const load = (abs) => {
-    if (typeof abs !== 'string' || !abs.startsWith(`${MEMFS_ROOT}/`))
-      return false
-    const rel = abs.slice(MEMFS_ROOT.length + 1)
-    if (!knownFiles.has(rel) || stats.loaded.has(rel)) return false
+function installFaultIn(volume, fsObject, knownFiles, packageRoots, stats) {
+  /** Write a `u32 pathLen | path | u32 bodyLen | body` stream into the volume. */
+  const writeStream = (bytes) => {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    const decoder = new TextDecoder()
+    let off = 0
+    while (off < bytes.length) {
+      const pathLen = view.getUint32(off)
+      off += 4
+      const rel = decoder.decode(bytes.subarray(off, off + pathLen))
+      off += pathLen
+      const bodyLen = view.getUint32(off)
+      off += 4
+      const body = bytes.subarray(off, off + bodyLen)
+      off += bodyLen
 
-    const t0 = performance.now()
+      const full = `${MEMFS_ROOT}/${rel}`
+      volume.mkdirSync(full.slice(0, full.lastIndexOf('/')), {
+        recursive: true,
+      })
+      volume.writeFileSync(full, body.slice())
+      volumePaths.add(rel)
+      stats.loaded.add(rel)
+      stats.files++
+      stats.bytes += bodyLen
+    }
+  }
+
+  /** Synchronous GET, binary-safe. See the note on `load` below. */
+  const getBytes = (url) => {
     const req = new XMLHttpRequest()
-    req.open('GET', `/api/files/raw?path=${encodeURIComponent(rel)}`, false)
+    req.open('GET', url, false)
     // `responseType = 'arraybuffer'` is illegal on a synchronous main-thread
     // XHR. This is the standard way out: the charset makes every byte survive
     // as a code unit, and the low byte is the byte.
     req.overrideMimeType('text/plain; charset=x-user-defined')
     req.send(null)
-    if (req.status !== 200) return false
-
+    if (req.status !== 200) {
+      // Kept rather than dropped: a package that could not be fetched shows up
+      // downstream as "could not resolve react", which says nothing about why.
+      stats.errors.push(`${url} -> ${req.status} ${req.responseText.trim()}`)
+      return null
+    }
     const text = req.responseText
-    const bytes = new Uint8Array(text.length)
-    for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i) & 0xff
-    volume.writeFileSync(abs, bytes)
+    const out = new Uint8Array(text.length)
+    for (let i = 0; i < text.length; i++) out[i] = text.charCodeAt(i) & 0xff
+    return out
+  }
 
-    stats.loaded.add(rel)
-    stats.files++
-    stats.bytes += bytes.length
+  /**
+   * The package that owns `rel`, by longest matching install path. Longest
+   * wins because the lockfile nests — `node_modules/a/node_modules/b` has to
+   * beat `node_modules/a` for a file inside b.
+   */
+  const owningPackage = (rel) => {
+    let best = null
+    for (const root of packageRoots) {
+      if (!rel.startsWith(`${root}/`)) continue
+      if (!best || root.length > best.length) best = root
+    }
+    return best
+  }
+
+  /**
+   * A miss inside a package the lockfile knows about pulls the **whole
+   * package** — one request per package, not per file, because a registry
+   * serves tarballs. Marked either way, so a genuinely absent path (resolution
+   * probing `./x.ts`, `./x.tsx`, …) reports ENOENT instead of refetching.
+   */
+  const materialisePackage = (rel) => {
+    const root = owningPackage(rel)
+    if (!root || stats.packages.has(root)) return false
+    stats.packages.add(root)
+    const t0 = performance.now()
+    const bytes = getBytes(`/api/package?path=${encodeURIComponent(root)}`)
     stats.ms += performance.now() - t0
+    if (!bytes) return false
+    writeStream(bytes)
     return true
+  }
+
+  const load = (abs) => {
+    if (typeof abs !== 'string' || !abs.startsWith(`${MEMFS_ROOT}/`))
+      return false
+    const rel = abs.slice(MEMFS_ROOT.length + 1)
+    if (stats.loaded.has(rel)) return false
+
+    // Disk mode: the manifest already said this file exists, so fetch just it.
+    if (knownFiles.has(rel)) {
+      const t0 = performance.now()
+      const bytes = getBytes(`/api/files/raw?path=${encodeURIComponent(rel)}`)
+      stats.ms += performance.now() - t0
+      if (!bytes) return false
+      volume.writeFileSync(abs, bytes)
+      stats.loaded.add(rel)
+      stats.files++
+      stats.bytes += bytes.length
+      return true
+    }
+
+    // Registry mode: nothing knows a package's contents until its tarball is
+    // unpacked, so pull the package and let the retry find the file.
+    return materialisePackage(rel)
   }
 
   // `readFileSync` is in the list because the build reads some files directly
@@ -693,14 +769,18 @@ function installFaultIn(volume, fsObject, knownFiles, stats) {
  */
 async function populateVolumeLazy(volume) {
   const t0 = performance.now()
-  const [srcRes, depRes] = await Promise.all([
+  const [srcRes, depRes, pkgRes] = await Promise.all([
     fetch('/api/files'),
     fetch('/api/dep-files'),
+    fetch('/api/packages'),
   ])
   if (!srcRes.ok) throw new Error(`manifest failed: ${srcRes.status}`)
   if (!depRes.ok) throw new Error(`dep manifest failed: ${depRes.status}`)
+  if (!pkgRes.ok) throw new Error(`package list failed: ${pkgRes.status}`)
   const sourcePaths = await srcRes.json()
   const depPaths = await depRes.json()
+  // Install paths from the lockfile — non-empty only in registry mode.
+  const packageRoots = await pkgRes.json()
 
   const known = new Set([...sourcePaths, ...depPaths])
   for (const rel of known) volumePaths.add(rel)
@@ -709,10 +789,20 @@ async function populateVolumeLazy(volume) {
     const full = `${MEMFS_ROOT}/${rel}`
     dirs.add(full.slice(0, full.lastIndexOf('/')))
   }
+  // A package's own directory has to exist before resolution walks into it,
+  // and the lockfile gives that without any network.
+  for (const root of packageRoots) dirs.add(`${MEMFS_ROOT}/${root}`)
   for (const dir of dirs) volume.mkdirSync(dir, { recursive: true })
 
-  const stats = { files: 0, bytes: 0, ms: 0, loaded: new Set() }
-  installFaultIn(volume, rolldownModule.memfs.fs, known, stats)
+  const stats = {
+    files: 0,
+    bytes: 0,
+    ms: 0,
+    loaded: new Set(),
+    packages: new Set(),
+    errors: [],
+  }
+  installFaultIn(volume, rolldownModule.memfs.fs, known, packageRoots, stats)
 
   // Sources eagerly, in parallel — the fault-in path is serial by construction.
   await Promise.all(
@@ -731,6 +821,7 @@ async function populateVolumeLazy(volume) {
     stats,
     manifestMs: Math.round(performance.now() - t0),
     knownPaths: known.size,
+    packageRoots: packageRoots.length,
     sourceCount: sourcePaths.length,
   }
 }
@@ -891,8 +982,11 @@ async function runBuild(cssMinify, preload, vfsMode, lazy) {
     sourceCount = lazyInfo.sourceCount
     html = volume.readFileSync(`${MEMFS_ROOT}/index.html`, 'utf8')
     log(
-      `volume: ${lazyInfo.knownPaths} paths known, ` +
-        `${lazyInfo.sourceCount} source files loaded up front`
+      `volume: ${lazyInfo.knownPaths} paths known` +
+        (lazyInfo.packageRoots
+          ? `, ${lazyInfo.packageRoots} packages from the lockfile`
+          : '') +
+        `, ${lazyInfo.sourceCount} source files loaded up front`
     )
   } else if (memfsMode) {
     populated = await populateVolume(volume)
@@ -934,12 +1028,22 @@ async function runBuild(cssMinify, preload, vfsMode, lazy) {
   const tBuild = performance.now()
   const css = []
   const assets = []
+  const unresolved = []
   const bundle = await bundleWith({
     input: memfsMode ? `${MEMFS_ROOT}/${entry}` : entry,
     plugins: memfsMode
       ? [memfsPlugin(css, assets, rolldownModule.memfs.fs, preload)]
       : [vfsPlugin(css, preload)],
-    onwarn: (w) => log('bundler warn:', w.message ?? w),
+    onwarn: (w) => {
+      log('bundler warn:', w.message ?? w)
+      // rolldown treats an unresolvable bare specifier as external and carries
+      // on. For a browser bundle with no import map that is never right: the
+      // build "succeeds" and the page dies on `Failed to resolve module
+      // specifier`. Collected here and thrown after generate, so the message
+      // lists every one rather than only the first.
+      if (w.code === 'UNRESOLVED_IMPORT')
+        unresolved.push(w.message ?? String(w))
+    },
     ...(memfsMode
       ? {
           cwd: MEMFS_ROOT,
@@ -974,6 +1078,19 @@ async function runBuild(cssMinify, preload, vfsMode, lazy) {
   if (cssJoined.trim()) {
     cssSource = lightningcss ? minifyCssWithLightning(cssJoined) : cssJoined
   }
+  if (unresolved.length) {
+    // Fetch failures are the usual cause in registry mode, and they explain
+    // *why* far better than the resolution message does.
+    const why = populated?.errors?.length
+      ? `\n\ncould not fetch:\n  ${populated.errors.join('\n  ')}`
+      : ''
+    throw new Error(
+      `${unresolved.length} import(s) could not be resolved and would have ` +
+        `been left external — a browser bundle has no import map, so that is ` +
+        `a build that fails at runtime:\n  ${unresolved.slice(0, 5).join('\n  ')}${why}`
+    )
+  }
+
   timings.bundleMs = Math.round(performance.now() - tBuild)
 
   if (memfsMode && lazy) {
@@ -981,8 +1098,11 @@ async function runBuild(cssMinify, preload, vfsMode, lazy) {
     // mattered. That gap is the whole argument for this mode.
     timings.faultInMs = Math.round(populated.ms)
     log(
-      `faulted in ${populated.files} files, ` +
-        `${(populated.bytes / 1048576).toFixed(1)} MB ` +
+      `faulted in ${populated.files} files` +
+        (populated.packages.size
+          ? ` from ${populated.packages.size} packages`
+          : '') +
+        `, ${(populated.bytes / 1048576).toFixed(1)} MB ` +
         `(${timings.faultInMs}ms of blocking XHR)`
     )
   }

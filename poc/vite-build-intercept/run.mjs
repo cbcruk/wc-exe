@@ -20,6 +20,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import crypto from 'node:crypto'
+import { readLockfile, materialise } from './registry.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(HERE, '../..')
@@ -61,6 +62,11 @@ function parseArgs(argv) {
     //   memfs            — written into rolldown's own filesystem, so its
     //                      native resolver does the work
     vfs: rest.includes('--vfs=memfs') ? 'memfs' : 'plugin',
+    // Where dependency bytes come from.
+    //   disk (default) — the project's installed node_modules
+    //   registry       — the lockfile, fetched as tarballs and unpacked in
+    //                    memory, so nothing has to be installed first
+    deps: rest.includes('--deps=registry') ? 'registry' : 'disk',
     // memfs only. The default fills the volume lazily — manifest and
     // directories up front, file contents faulted in through synchronous XHR
     // when the bundler opens one. `--eager` restores the whole-tree transfer,
@@ -177,7 +183,7 @@ async function worthSending(full, rel) {
   return true
 }
 
-function createApp({ projectDir, outDir, vendor, bulkFilter }) {
+function createApp({ projectDir, outDir, vendor, bulkFilter, lockfile }) {
   const app = new Hono()
 
   // Mandatory: rolldown's wasi binding posts a SharedArrayBuffer to a worker,
@@ -235,9 +241,59 @@ function createApp({ projectDir, outDir, vendor, bulkFilter }) {
 
   app.get('/api/files', async (c) => c.json(await listFiles(projectDir)))
 
+  // --- dependencies from the registry (`--deps=registry`) -------------------
+  //
+  // The page cannot be handed a file manifest here, because nobody knows what
+  // is inside a package until its tarball is unpacked. What the lockfile does
+  // give, without touching the network, is every package's **install path** —
+  // so the page pre-creates those directories and faults a whole package in on
+  // the first miss underneath one. One request per package, not per file.
+
+  app.get('/api/packages', (c) =>
+    c.json(lockfile ? [...lockfile.packages.keys()] : [])
+  )
+
+  app.get('/api/package', async (c) => {
+    const installPath = c.req.query('path')
+    if (!lockfile) return c.text('not in registry mode', 400)
+    const entry = lockfile.packages.get(installPath)
+    if (!entry) return c.text(`not in lockfile: ${installPath}`, 404)
+
+    let materialised
+    try {
+      materialised = await materialise(entry)
+    } catch (err) {
+      // Reaches the page as text, so the browser-side failure names the real
+      // cause instead of a bare 500.
+      console.error(`  [host] ${installPath}: ${err.message}`)
+      return c.text(`${installPath}: ${err.message}`, 502)
+    }
+    const { files, bytes, tarballBytes, cacheHit } = materialised
+    const parts = []
+    for (const [rel, body] of files) {
+      const name = Buffer.from(`${installPath}/${rel}`, 'utf8')
+      const header = Buffer.alloc(4)
+      header.writeUInt32BE(name.length, 0)
+      const size = Buffer.alloc(4)
+      size.writeUInt32BE(body.length, 0)
+      parts.push(header, name, size, Buffer.from(body))
+    }
+    console.log(
+      `  [host] ${installPath}@${entry.version}: ${files.size} files, ` +
+        `${(bytes / 1024).toFixed(0)} KB from a ${(tarballBytes / 1024).toFixed(0)} KB tarball` +
+        `${cacheHit ? ' (cached)' : ''}`
+    )
+    return new Response(Buffer.concat(parts), {
+      headers: { 'content-type': 'application/octet-stream' },
+    })
+  })
+
   // Paths inside node_modules, so the page can resolve bare specifiers without
   // downloading thousands of files it will never read.
   app.get('/api/dep-files', async (c) => {
+    // In registry mode there is no node_modules to list; packages arrive whole
+    // through /api/package instead.
+    if (lockfile) return c.json([])
     const root = path.join(projectDir, 'node_modules')
     try {
       await fs.access(root)
@@ -787,9 +843,20 @@ async function main() {
     preload,
     vfs,
     lazy,
+    deps,
     bulkFilter,
     chunkDelayMs,
   } = parseArgs(process.argv)
+
+  if (deps === 'registry' && !(vfs === 'memfs' && lazy)) {
+    console.error(
+      '\n--deps=registry needs the lazy memfs fill (the default for ' +
+        '--vfs=memfs). A package is faulted in when the bundler first reaches ' +
+        'inside it; there is nothing to send eagerly, because the lockfile ' +
+        'says which packages exist and not which files they contain.\n'
+    )
+    process.exit(1)
+  }
 
   if (!lazy && vfs !== 'memfs') {
     console.error('\n--eager applies to --vfs=memfs only.\n')
@@ -799,6 +866,14 @@ async function main() {
   const projectDir = path.resolve(REPO_ROOT, project)
   const outDir = path.join(HERE, 'out')
   const expect = await loadExpectations(projectDir)
+  const lockfile = deps === 'registry' ? await readLockfile(projectDir) : null
+  if (lockfile) {
+    console.log(
+      `\n  lockfile: v${lockfile.lockfileVersion}, ${lockfile.packages.size} ` +
+        `non-dev packages${lockfile.skipped.length ? `, ${lockfile.skipped.length} skipped` : ''}`
+    )
+    for (const s of lockfile.skipped) console.log(`    skipped: ${s}`)
+  }
 
   const vendor = {
     rolldown: path.join(HERE, 'vendor/rolldown'),
@@ -840,6 +915,9 @@ async function main() {
         : 'plugin (resolveId/load, with our resolver)'
     }`
   )
+  console.log(
+    `  deps:    ${deps === 'registry' ? 'registry (lockfile -> tarballs, nothing installed)' : "disk (the project's node_modules)"}`
+  )
   console.log(`  project: ${projectDir}`)
   console.log(`  output:  ${outDir}`)
   console.log(
@@ -855,6 +933,7 @@ async function main() {
     outDir,
     vendor,
     bulkFilter,
+    lockfile,
   })
   const server = await new Promise((resolve, reject) => {
     const s = serve({ fetch: app.fetch, port: 0 }, (info) =>
