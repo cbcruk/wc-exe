@@ -776,6 +776,91 @@ could not fetch:
   evidence, not proof, and a package that generates code at install time would
   fail here.
 
+## Framework components: Vue SFCs
+
+Open item 2 — the plugin boundary. A `.vue` file is not JavaScript, so a stock
+`npm create vite --template vue-ts` app did not build at all: the bundler had
+nothing to do with it.
+
+**The compiler is the project's own, read out of the volume.** Vue ships
+`compiler-sfc.esm-browser.js` — one self-contained ESM file built for exactly
+this — and `@vue/compiler-sfc` is a _runtime_ dependency of `vue`, so
+`--deps=registry` fetches it without any special case. It reaches the page as a
+blob URL, which is the only way to `import()` something that exists only in
+memory. Nothing is vendored, so the SFC is compiled by the version the lockfile
+pins.
+
+The compile follows what Vue's own playground does: `<script setup>` takes the
+`inlineTemplate` path, which folds the render function into the setup closure;
+anything else gets script and template compiled separately. Each `<style>`
+block goes through `compileStyle` into the same emitted stylesheet, and a
+`scoped` block gets its scope id threaded through both the template compile and
+onto the component as `__scopeId`.
+
+One thing cost a debugging round and is worth naming: `rewriteDefault`
+re-parses with babel and **defaults to a plain-JS grammar**. A
+`lang="ts"` block still carries its types at that point, so without passing the
+`typescript` parser plugin it fails on the first annotation — and reports it as
+a syntax error in the user's component, pointing at a line that is perfectly
+valid.
+
+### `test/fixtures/sample-vue-app` — a build from nothing but a lockfile
+
+The fixture ships `package.json`, `package-lock.json` and sources, and **no
+`node_modules`**. It exercises the framework compiler and `--deps=registry`
+together:
+
+```bash
+node poc/vite-build-intercept/run.mjs test/fixtures/sample-vue-app \
+  --vfs=memfs --deps=registry
+```
+
+```
+lockfile: v3, 23 non-dev packages
+[host] node_modules/vue@3.5.41:               37 files, 2468 KB from a 648 KB tarball
+[host] node_modules/@vue/compiler-sfc@3.5.41:  6 files, 2580 KB from a 571 KB tarball
+[host] node_modules/@vue/runtime-dom@3.5.41:  12 files, 1232 KB from a 319 KB tarball
+… 6 of 23 packages fetched, 91 files, 7.4 MB
+→ assets/main-HZ2GCBA7.js  62,376 B   ✓ static  ✓ runtime
+```
+
+The runtime check clicks the counter and sees `count is 0` → `count is 1`, so
+Vue's reactivity is genuinely running in the built output, and the emitted CSS
+carries `.container[data-v-5df6b59e]` against a component stamped with the same
+id.
+
+Against native `vite build` on the scaffolded `vue-ts` template: **63.46 kB
+(vite) vs 65.41 kB (this)**, +3%, with `hero.png` and `vite.svg` byte-identical.
+
+### Where the seven stock templates stand now
+
+| template   | build | verify | what stops it                                              |
+| ---------- | ----- | ------ | ---------------------------------------------------------- |
+| vanilla-ts | ✅    | ✅     | —                                                          |
+| react-ts   | ✅    | ✅     | —                                                          |
+| preact-ts  | ✅    | ✅     | —                                                          |
+| lit-ts     | ✅    | ✅     | —                                                          |
+| **vue-ts** | ✅    | ✅     | — _(was: `.vue` needs the Vue compiler)_                   |
+| svelte-ts  | ❌    | —      | `.svelte` needs the Svelte compiler                        |
+| solid-ts   | ✅    | ❌     | Solid's JSX transform; builds, then `Unexpected token '<'` |
+
+**Five of seven.** The two that remain need more than Vue did, and it is worth
+saying why rather than filing them as "more of the same":
+
+- **Svelte** ships no browser build of its compiler — `svelte/compiler` is
+  source with sixteen dependencies — so it would have to be bundled first,
+  plausibly by running rolldown against the volume before the real build. And
+  `svelte` is a _devDependency_, so `--deps=registry` would not fetch it under
+  the current dev-entry cut.
+- **Solid** needs `babel-preset-solid`; its JSX compiles to fine-grained
+  reactive DOM calls, not the `jsx()` calls rolldown infers. That means running
+  Babel in the page, and Babel is neither small nor a single file. Also a
+  devDependency.
+
+Both point at the same two missing pieces: a way to run a compiler that is not
+shipped browser-ready, and a rule for fetching the devDependencies a build
+genuinely needs.
+
 ## Verifying projects that are not fixtures
 
 The checks used to hardcode this repo's fixtures: `#213547` from their
@@ -818,7 +903,7 @@ file:
 | react-ts   | ✅    | ✅     | —                                                                      |
 | preact-ts  | ✅    | ✅     | —                                                                      |
 | lit-ts     | ✅    | ✅     | —                                                                      |
-| vue-ts     | ❌    | —      | `.vue` needs the Vue compiler                                          |
+| vue-ts     | ✅    | ✅     | — _(fixed; see the Vue section above)_                                 |
 | svelte-ts  | ❌    | —      | `.svelte` needs the Svelte compiler                                    |
 | solid-ts   | ✅    | ❌     | Solid's JSX transform — builds, then `Unexpected token '<'` at runtime |
 
@@ -827,6 +912,9 @@ plugin this pipeline does not run. That is open item 2 exactly, now with a
 number against it instead of a prediction. The solid-ts row is the instructive
 one — it builds cleanly and breaks in the browser, which is why the runtime
 check is not optional.
+
+_This was the state before Vue SFCs were implemented. It is **five of
+seven** now; the two rows that remain are analysed in the Vue section above._
 
 ### Two harness bugs the sweep found immediately
 

@@ -517,6 +517,32 @@ warm 실행을 분해하면 인터셉트가 대체하는 조각이 가장 작다
 
 **증명된 게 아니다.** 리스크 둘이 그대로다: ① 픽스처 하나에서 "훅이 안 걸린다"를 일반화하는 건 이 탐색이 이미 두 번 저지른 실수다 ② npm의 트리 해석(peer deps·`overrides`·optional/platform deps·workspaces)을 재현하지 못하면 빌드가 **조용히** 깨진다(위 «하이브리드 착지점»의 본체 비용).
 
+#### 프레임워크 컴포넌트 — Vue SFC (2026-08)
+
+미결 2의 경계를 처음으로 밀었다. `.vue`는 JavaScript가 아니라서 스톡 `vue-ts` 템플릿이 **아예 빌드되지 않았다.**
+
+**컴파일러를 벤더링하지 않고 볼륨에서 읽는다.** Vue가 `compiler-sfc.esm-browser.js`(자립형 ESM 한 파일)를 배포하고, `@vue/compiler-sfc`가 `vue`의 **런타임 의존성**이라 `--deps=registry`가 특별 취급 없이 가져온다. 페이지에는 **blob URL**로 들어간다 — 메모리에만 있는 것을 `import()`하는 유일한 방법이다. 그래서 SFC는 **lockfile이 핀한 버전**으로 컴파일된다.
+
+컴파일은 Vue 자체 playground와 같은 길을 간다: `<script setup>`은 `inlineTemplate`(렌더 함수를 setup 클로저에 접어 넣음), 그 외는 script와 template을 따로. `<style>`은 `compileStyle`로 같은 방출 스타일시트에 들어가고, `scoped`면 scope id가 템플릿 컴파일과 컴포넌트 `__scopeId` 양쪽에 실린다.
+
+**한 번 데인 지점**: `rewriteDefault`가 babel로 재파싱하는데 **기본이 순수 JS 문법**이다. `lang="ts"` 블록은 그 시점에 아직 타입을 달고 있어서, `typescript` 파서 플러그인을 안 주면 첫 타입 주석에서 실패하고 — **사용자 컴포넌트의 멀쩡한 줄을 문법 오류로 지목한다.**
+
+**`test/fixtures/sample-vue-app` — lockfile만으로 빌드된다.** 픽스처에 `node_modules`가 없다. 프레임워크 컴파일러와 `--deps=registry`를 함께 시험한다:
+
+```
+lockfile: v3, 23 non-dev packages   →  6개만 페치, 91 files, 7.4 MB
+→ assets/main-HZ2GCBA7.js  62,376 B   ✓ static  ✓ runtime
+```
+
+런타임 검사가 카운터를 눌러 `count is 0` → `count is 1`을 확인하므로 **Vue의 반응성이 산출물에서 실제로 돈다.** 방출 CSS에 `.container[data-v-5df6b59e]`가 있고 컴포넌트에 같은 id가 찍혀 있다. 네이티브 `vite build` 대조: **63.46 kB vs 65.41 kB(+3%)**, `hero.png`·`vite.svg`는 바이트 동일.
+
+**7개 중 5개**가 됐고, 남은 둘은 Vue보다 더 필요하다:
+
+- **Svelte**는 컴파일러의 브라우저 빌드를 배포하지 않는다 — `svelte/compiler`가 의존성 16개짜리 소스라, 진짜 빌드 전에 볼륨에 대고 rolldown을 한 번 돌려 번들해야 한다. 게다가 `svelte`는 **devDependency**라 지금의 dev 컷에서는 `--deps=registry`가 안 가져온다.
+- **Solid**은 `babel-preset-solid`가 필요하다. JSX가 `jsx()` 호출이 아니라 세밀 반응형 DOM 호출로 컴파일되는데, rolldown은 전자를 추론한다. 즉 **페이지에서 Babel을 돌려야** 하고 Babel은 작지도 단일 파일도 아니다. 역시 devDependency다.
+
+둘 다 같은 두 조각을 가리킨다 — **브라우저용으로 배포되지 않은 컴파일러를 돌리는 방법**, 그리고 **빌드가 실제로 필요로 하는 devDependency를 가져오는 규칙**.
+
 #### ②단계 완료 — `node_modules` 없이 빌드된다 (`--deps=registry`, 2026-08)
 
 호스트가 lockfile을 읽고 타르볼을 받아 메모리에서 풀어 볼륨으로 스트림한다. **프로젝트 디렉터리에는 아무것도 쓰지 않는다.**
@@ -956,7 +982,7 @@ Builder { build(project, options) → dist }
 
    전자가 지금 가능한 것이고, 후자가 실제로 결정을 내려주는 것이다. **"이 탐색의 마지막 숫자"였던 지위는 미결 8에게 넘어갔다.**
 
-2. 플러그인 호환성 — 위에서 말한 경계. 무엇을 얼마나 지원할지가 곧 범위 결정이다. **첫 실측이 나왔다(§9 «임의 프로젝트 첫 실측»): `npm create vite` 템플릿 7개 중 4개 통과, 실패 3개는 전부 프레임워크 플러그인이 원인이다.**
+2. 플러그인 호환성 — 위에서 말한 경계. 무엇을 얼마나 지원할지가 곧 범위 결정이다. **실측: `npm create vite` 템플릿 7개 중 5개 통과**(§9). Vue SFC를 붙여 4→5가 됐고, 남은 둘(svelte·solid)은 «Vue SFC» 절이 분석한 대로 **컴파일러가 브라우저용으로 배포되지 않는다**는 같은 문제와 **컴파일러가 devDependency**라는 문제를 함께 갖는다.
 3. 미검증 생태계 형태 — **상당 부분 해소.** `browser` 필드 remap·`imports` 필드·깊은 `exports` 와일드카드는 `sample-exports-app`으로, **애셋 import와 `public/`는 `sample-asset-app`으로** 검증했다(둘 다 네이티브 vite 기준 대조). 양쪽 다 **`--vfs=memfs`만 통과한다**(§9). 남은 것: CSS `url()` 참조, `?url`/`?raw` 쿼리, `new URL(…, import.meta.url)`, worker/wasm import, sourcemap, multi-page.
 4. 캐시 고도화(§5): cacache blob 무한 증가는 상한으로 막았지만, lockfile diff 기반 부분 무효화(burrow `src/npm`의 stale-lock retry가 원형)는 아직 안 했다.
 5. **`Builder` 이음새** — 인터셉트를 두 번째 백엔드로 올리려면 `Runtime` 위에 "프로젝트 → `dist/`" 층이 필요하다(위 «이음새의 고도»). 1의 측정이 유리하게 나온 **뒤에** 긋는다.
