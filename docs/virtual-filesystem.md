@@ -225,6 +225,31 @@ StackBlitz 조직의 `webcontainer-*` 리포를 실제로 까보면:
 
 핵심: **실행 엔진을 "얇게, 오픈으로" 떼올 방법은 존재하지 않는다.** 그래서 WebContainer가 닫아 사업화했고 container2wasm은 커널째 에뮬레이트하느라 무겁다. 얇게 떼올 수 있는 건 VFS 저장 층(ZenFS/memfs)까지고, 그 위 실행은 "WebContainer(닫힘·가벼움) vs container2wasm(열림·무거움)"의 양자택일이다.
 
+### 커널을 다시 만들고 싶어질 때 — 읽고 시작할 것
+
+이 절을 열었다는 건 "그럼 우리가 만들면 되지 않나"가 다시 떠올랐다는 뜻일 것이다. 답은 **아니오**이고, 근거는 추측이 아니라 이 문서 안에 이미 있다.
+
+**① 무엇을 만들게 되는지부터.** WebContainer는 Node를 wasm으로 컴파일한 게 아니다. 공식 문서가 "Chromium 계열이 아닌 브라우저에서는 동작이 미세하게 다를 수 있다"고 적는데, 자체 엔진을 실어 보냈다면 그런 차이가 있을 수 없다 — **JS는 브라우저의 엔진에서 그대로 돈다.** 그들이 만든 건 그 밑의 **커널**이다. `Atomic Waltz` 포스트가 스스로 "the kernel"이라 부르며 shared linear memory·WASM threads·`i32.atomic.rmw.xchg`에 의존한다고 쓴다. 나머지(memfs 모양의 fs, ServiceWorker에 매핑한 TCP, wasm으로 개별 포팅한 네이티브 애드온)는 공개 조각으로 조립 가능하고 실제로 남들이 조립한다. **아무도 재현 못 한 건 그 커널 하나다.**
+
+**② 값은 2년이다.** Syntax 인터뷰 기준, 공개 전 "basement mode 2년". 자금 있는 팀이.
+
+**③ 그런데 그게 우리한테 제일 안 필요한 부분이다.** 커널이 필요한 지점은 프로세스 모델, 즉 lifecycle scripts인데 — `bench/install-shape.mjs`가 10개 프로젝트에서 잰 런타임 클로저의 훅은 **0개**다.
+
+**④ 대체 경로가 이미 돈다.** lockfile만으로 `npm install` 없이 스톡 vite 템플릿 **5/7**을 프로덕션 빌드하고, 출력이 디스크 빌드와 바이트 동일하다(§9). 커널 경로가 2년이라면 이 경로는 그보다 훨씬 쌌다.
+
+**⑤ 플랫폼 제약도 물려받는다.** WebContainer는 `credentialless`를 요구하고 그건 Chromium 전용이다. 벗어나려던 종속을 형태만 바꿔 다시 지는 셈이다.
+
+**그리고 결정타 — 미결 11이 어느 쪽으로 나와도 커널을 만들 이유가 없다.**
+
+| 대상 폐쇄망에서 WebContainer가 | 결론                                           |
+| ------------------------------ | ---------------------------------------------- |
+| **뜬다**                       | 현행 프로덕션 경로가 유효 → 만들 이유 없음     |
+| **안 뜬다**                    | 인터셉트가 **이미** 커널 없이 돎 → 여전히 없음 |
+
+두 갈래가 같은 답으로 수렴한다. 그러니 정말 착수하고 싶다면 **먼저 미결 11을 재라** — 대상 망에서 `wc-exe build` 한 번이면 된다. 그걸 재기 전에 시작하는 건 근거 없이 2년을 거는 것이다.
+
+**트립와이어.** 이 탐색에서 통한 규율은 하나였다 — **시작하기 전에 "무엇을 재면 이게 불필요하다고 인정할 것인가"를 먼저 적는다.** container2wasm이 35×로 판정났을 때도, vrowzer 포팅 비용이 25k줄로 나왔을 때도, vrowzer의 10MB 패치가 필요 없다고 나왔을 때도 전부 그 순서였다. 반대로 방법론 ③(스스로 세운 제약)이 오래 살아남은 건 그걸 안 적었기 때문이다. 커널도 같은 규칙을 적용받아야 한다.
+
 ---
 
 ## 7. 성능은 실제로 문제인가 — 레퍼런스와 실측 계획
@@ -1037,6 +1062,7 @@ Builder { build(project, options) → dist }
 - ["Running QEMU Inside Browser" (FOSDEM 2025)](https://archive.fosdem.org/2025/events/attachments/fosdem-2025-6290-running-qemu-inside-browser/slides/238760/slides_1dDtpcS.pdf)
 - [burrow](https://github.com/dhravya/burrow) — 오픈소스(MIT) WebContainer 대안: 네이티브 JS 엔진 + 주변 가상화 (§8)
 - [almostnode](https://github.com/macaly/almostnode) — 오픈소스(MIT) 브라우저 Node: 진짜 npm install + 번들러 인터셉트, dev 중심 (§9)
+- [WebContainer 내부에 대한 1차 소스](https://blog.stackblitz.com/posts/the-atomic-waltz/) — 자기들 것을 "the kernel"이라 부르며 shared linear memory·WASM threads 의존을 밝힌 글. [브라우저 지원 문서](https://developer.stackblitz.com/platform/webcontainers/browser-support)는 브라우저마다 동작이 다를 수 있다고 적어 **자체 엔진을 싣지 않는다는 것**을 드러낸다 (§6)
 - [vrowzer](https://github.com/kazupon/vrowzer) — 오픈소스(MIT) 브라우저 vite dev server: 진짜 vite 포크(~40k줄), dev 전용·빌드 미연결, `@rolldown/browser`에 memfs를 물리는 fs-proxy 구현 (§9)
 - [ZenFS](https://github.com/zen-fs/core) (구 [BrowserFS](https://github.com/jvilk/BrowserFS)) — 플러그블 백엔드 VFS
 - [v86](https://github.com/copy/v86) — x86 브라우저 에뮬레이터
