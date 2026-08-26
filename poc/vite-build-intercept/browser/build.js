@@ -826,6 +826,120 @@ async function populateVolumeLazy(volume) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Vue single-file components
+// ---------------------------------------------------------------------------
+//
+// Open item 2 — the framework-plugin boundary. A stock `npm create vite`
+// vue-ts app does not build at all without this: `.vue` is not JavaScript and
+// the bundler has nothing to do with it.
+//
+// The compiler is the project's own, read **out of the volume** rather than
+// vendored, so the SFC is compiled by the version the lockfile pins. Vue ships
+// `compiler-sfc.esm-browser.js` — one self-contained ESM file, built for
+// exactly this — and `@vue/compiler-sfc` is a runtime dependency of `vue`, so
+// `--deps=registry` fetches it without special-casing. It reaches the page as a
+// blob URL, which is the one way to `import()` something that exists only in
+// memory.
+
+const VUE_COMPILER_PATH =
+  'node_modules/@vue/compiler-sfc/dist/compiler-sfc.esm-browser.js'
+const VUE_VIRTUAL_PREFIX = 'virtual:wc-vue:'
+// `.ts` because a `<script setup lang="ts">` block comes out of the compiler
+// still typed — rolldown picks the module type off the id's suffix, so this is
+// what gets the types stripped.
+const VUE_VIRTUAL_SUFFIX = '.ts'
+
+let vueCompiler = null
+
+async function loadVueCompiler(vfsFs) {
+  if (vueCompiler) return vueCompiler
+  const code = vfsFs.readFileSync(`${MEMFS_ROOT}/${VUE_COMPILER_PATH}`, 'utf8')
+  const url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }))
+  try {
+    vueCompiler = await import(/* webpackIgnore: true */ url)
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+  return vueCompiler
+}
+
+/**
+ * Compile one SFC to a module.
+ *
+ * `<script setup>` takes the `inlineTemplate` path, which folds the render
+ * function into the setup closure — that is what Vue's own playground does and
+ * it avoids having to thread binding metadata into a separate template
+ * compile. Anything else gets script and template compiled separately.
+ */
+async function compileVue(compiler, filename, source, collectedCss) {
+  const { descriptor, errors } = compiler.parse(source, { filename })
+  if (errors.length) {
+    throw new Error(`${filename}: ${errors.map((e) => e.message).join('; ')}`)
+  }
+
+  const id = await sha8(filename)
+  const scopeId = `data-v-${id}`
+  const scoped = descriptor.styles.some((style) => style.scoped)
+  const pieces = []
+
+  if (descriptor.scriptSetup || descriptor.script) {
+    const script = compiler.compileScript(descriptor, {
+      id,
+      inlineTemplate: Boolean(descriptor.scriptSetup),
+      templateOptions: scoped ? { scoped, compilerOptions: { scopeId } } : {},
+    })
+    // `rewriteDefault` re-parses with babel, and defaults to a plain-JS
+    // grammar. A `lang="ts"` block still carries its types at this point, so
+    // without saying so it fails on the first annotation — which reads as a
+    // syntax error in the user's component rather than a missing plugin.
+    const lang = (descriptor.scriptSetup ?? descriptor.script).lang
+    const parserPlugins = []
+    if (lang === 'ts' || lang === 'tsx') parserPlugins.push('typescript')
+    if (lang === 'jsx' || lang === 'tsx') parserPlugins.push('jsx')
+    pieces.push(
+      compiler.rewriteDefault(script.content, '__sfc__', parserPlugins)
+    )
+  } else {
+    pieces.push('const __sfc__ = {}')
+  }
+
+  if (descriptor.template && !descriptor.scriptSetup) {
+    const template = compiler.compileTemplate({
+      source: descriptor.template.content,
+      filename,
+      id,
+      scoped,
+      compilerOptions: scoped ? { scopeId } : {},
+    })
+    if (template.errors.length) {
+      throw new Error(
+        `${filename} template: ${template.errors.map(String).join('; ')}`
+      )
+    }
+    pieces.push(template.code, '__sfc__.render = render')
+  }
+
+  for (const style of descriptor.styles) {
+    const compiled = compiler.compileStyle({
+      source: style.content,
+      filename,
+      id: scopeId,
+      scoped: style.scoped,
+    })
+    if (compiled.errors.length) {
+      throw new Error(
+        `${filename} style: ${compiled.errors.map(String).join('; ')}`
+      )
+    }
+    collectedCss.push(`/* ${filename} */\n${compiled.code}`)
+  }
+
+  if (scoped) pieces.push(`__sfc__.__scopeId = ${JSON.stringify(scopeId)}`)
+  pieces.push('export default __sfc__')
+  return pieces.join('\n')
+}
+
 /**
  * The only plugin this mode needs.
  *
@@ -836,10 +950,25 @@ async function populateVolumeLazy(volume) {
  * job here, which is the whole point of the mode.
  */
 function memfsPlugin(collectedCss, collectedAssets, vfsFs, preload) {
+  // An importer can itself be a virtual id — `./Foo.vue` imported from an
+  // already-compiled SFC — so unwrap before taking its directory, or every
+  // relative path inside a component resolves against `virtual:…`.
+  const realPath = (id) => {
+    if (id?.startsWith(VUE_VIRTUAL_PREFIX)) {
+      return id.slice(
+        VUE_VIRTUAL_PREFIX.length,
+        id.length - VUE_VIRTUAL_SUFFIX.length
+      )
+    }
+    return id
+  }
   const absolutize = (source, importer) =>
     source.startsWith('/')
       ? source
-      : joinAbs(dirnameOf(importer ?? `${MEMFS_ROOT}/index.html`), source)
+      : joinAbs(
+          dirnameOf(realPath(importer) ?? `${MEMFS_ROOT}/index.html`),
+          source
+        )
 
   return {
     name: 'wc-exe-memfs-css-assets',
@@ -848,6 +977,11 @@ function memfsPlugin(collectedCss, collectedAssets, vfsFs, preload) {
       if (source.endsWith('.css')) {
         return (
           CSS_VIRTUAL_PREFIX + absolutize(source, importer) + CSS_VIRTUAL_SUFFIX
+        )
+      }
+      if (source.endsWith('.vue')) {
+        return (
+          VUE_VIRTUAL_PREFIX + absolutize(source, importer) + VUE_VIRTUAL_SUFFIX
         )
       }
       if (isAssetPath(source)) {
@@ -867,6 +1001,17 @@ function memfsPlugin(collectedCss, collectedAssets, vfsFs, preload) {
         )
         collectedCss.push(`/* ${key} */\n${vfsFs.readFileSync(key, 'utf8')}`)
         return 'export default ""'
+      }
+
+      if (id.startsWith(VUE_VIRTUAL_PREFIX)) {
+        const file = realPath(id)
+        const compiler = await loadVueCompiler(vfsFs)
+        return compileVue(
+          compiler,
+          file,
+          vfsFs.readFileSync(file, 'utf8'),
+          collectedCss
+        )
       }
 
       if (id.startsWith(ASSET_VIRTUAL_PREFIX)) {
