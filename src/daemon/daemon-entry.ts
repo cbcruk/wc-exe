@@ -5,6 +5,11 @@
  * `startDaemon` without any risk of starting one as an import side effect.
  */
 import { startDaemon } from './daemon.js'
+import { reportUnhandled } from '../utils/interrupt.js'
+
+// A daemon holds other people's sessions, so it must not die on one stray
+// rejection the way a one-shot CLI should — but it must not hide one either.
+reportUnhandled({ label: 'wc-exe daemon', exitOnRejection: false })
 
 const idleMs = process.env.WC_EXE_DAEMON_IDLE_MS
   ? Number(process.env.WC_EXE_DAEMON_IDLE_MS)

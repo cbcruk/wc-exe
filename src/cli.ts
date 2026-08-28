@@ -4,6 +4,13 @@ import { dev } from './commands/dev.js'
 import { install } from './commands/install.js'
 import { daemonBuild } from './commands/daemon-build.js'
 import { daemonStatus, stopDaemon } from './daemon/client.js'
+import { reportUnhandled } from './utils/interrupt.js'
+
+// The last resort for an async failure no caller is waiting for. The typed
+// errors in `core/errors.ts` only reach failures that reach a `catch`; this is
+// what stands behind the ones that do not, so they are reported instead of
+// changing what the process does in silence.
+reportUnhandled({ label: 'wc-exe', exitOnRejection: true })
 
 const program = new Command()
 

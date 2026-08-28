@@ -15,6 +15,7 @@ import {
 import { CACHE_PORT, ensureCacheDirs } from '../core/cache.js'
 import { runProjectBuild } from '../core/project-build.js'
 import { withSpin } from '../utils/spinner.js'
+import { onInterrupt } from '../utils/interrupt.js'
 import type { ServerHandlers } from '../core/types.js'
 import type { BuildOptions } from '../types.js'
 
@@ -58,10 +59,10 @@ export async function build(options: BuildOptions): Promise<void> {
     await serverInfo?.shutdown()
   }
 
-  process.on('SIGINT', async () => {
-    console.log(chalk.yellow('\n\n  Build cancelled.\n'))
-    await cleanup()
-    process.exit(130)
+  onInterrupt({
+    message: chalk.yellow('\n\n  Build cancelled.\n'),
+    cleanup,
+    exitCode: 130,
   })
 
   const handlers: ServerHandlers = {

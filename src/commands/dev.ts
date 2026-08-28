@@ -9,7 +9,8 @@ import { startServer, type ServerInfo } from '../core/server.js'
 import { RunnerClient } from '../core/runner-client.js'
 import { listProjectFiles, readProjectFileBytes } from '../core/file-sync.js'
 import { withSpin } from '../utils/spinner.js'
-import { commandFailure } from '../core/command-error.js'
+import { onInterrupt } from '../utils/interrupt.js'
+import { commandFailure } from '../core/errors.js'
 import type { ServerHandlers } from '../core/types.js'
 import type { DevOptions } from '../types.js'
 
@@ -52,10 +53,10 @@ export async function dev(options: DevOptions): Promise<void> {
     await serverInfo?.shutdown()
   }
 
-  process.on('SIGINT', async () => {
-    console.log(chalk.yellow('\n\n  Shutting down...\n'))
-    await cleanup()
-    process.exit(0)
+  onInterrupt({
+    message: chalk.yellow('\n\n  Shutting down...\n'),
+    cleanup,
+    exitCode: 0,
   })
 
   const handlers: ServerHandlers = {
@@ -106,8 +107,23 @@ export async function dev(options: DevOptions): Promise<void> {
       spinner,
       message: 'Starting dev server...',
       fn: async () => {
-        browser!.spawnCommand('npm', ['run', 'dev'])
-        const { url } = await browser!.waitForServerReady()
+        // `waitForServerReady` waits for an event, and a dev server that never
+        // started never emits one — it does not reject, it waits forever. The
+        // spawn call is the only thing that can report that failure, and its
+        // promise used to be dropped on the floor, so `npm run dev` failing to
+        // start showed as a spinner that spun until the user gave up.
+        //
+        // On success `spawnCommand` resolves immediately (the runner returns as
+        // soon as the process is spawned), so it must not win the race — hence
+        // the promise that never settles behind it.
+        const spawnFailed = browser!
+          .spawnCommand('npm', ['run', 'dev'])
+          .then(() => new Promise<never>(() => {}))
+
+        const { url } = await Promise.race([
+          browser!.waitForServerReady(),
+          spawnFailed,
+        ])
         return url
       },
       successMessage: (url) => `Dev server ready at ${url}`,
@@ -149,17 +165,26 @@ export async function dev(options: DevOptions): Promise<void> {
           ignoreInitial: true,
         })
 
-        watcher.on('change', async (filePath) => {
+        // chokidar does not await its listeners, so every handler below has
+        // to be complete on its own: whatever it does not catch, nobody does.
+        // They are named functions registered with `void` rather than `async`
+        // arrows passed straight to `on`, so that contract is visible at the
+        // call site instead of being something a reader has to know about
+        // chokidar.
+        const syncToRuntime = async (
+          filePath: string,
+          label: string
+        ): Promise<void> => {
           try {
             const content = await fs.readFile(filePath, 'utf-8')
             const wcPath =
               '/' + path.relative('.', filePath).replace(/\\/g, '/')
             await browser!.writeFile(wcPath, content)
-            console.log(chalk.gray(`  [HMR] ${filePath}`))
+            console.log(chalk.gray(`  [${label}] ${filePath}`))
           } catch {
             console.error(chalk.red(`  [Error] Failed to sync: ${filePath}`))
           }
-        })
+        }
 
         // mount/writeFile only add and overwrite, so a deletion has to be
         // pushed explicitly — otherwise the dev server keeps resolving a file
@@ -177,22 +202,16 @@ export async function dev(options: DevOptions): Promise<void> {
           }
         }
 
-        watcher.on('unlink', (filePath) => removeFromRuntime(filePath, 'Del'))
-        watcher.on('unlinkDir', (dirPath) =>
-          removeFromRuntime(dirPath, 'DelDir')
+        watcher.on('change', (filePath) => void syncToRuntime(filePath, 'HMR'))
+        watcher.on('add', (filePath) => void syncToRuntime(filePath, 'Add'))
+        watcher.on(
+          'unlink',
+          (filePath) => void removeFromRuntime(filePath, 'Del')
         )
-
-        watcher.on('add', async (filePath) => {
-          try {
-            const content = await fs.readFile(filePath, 'utf-8')
-            const wcPath =
-              '/' + path.relative('.', filePath).replace(/\\/g, '/')
-            await browser!.writeFile(wcPath, content)
-            console.log(chalk.gray(`  [Add] ${filePath}`))
-          } catch {
-            console.error(chalk.red(`  [Error] Failed to add: ${filePath}`))
-          }
-        })
+        watcher.on(
+          'unlinkDir',
+          (dirPath) => void removeFromRuntime(dirPath, 'DelDir')
+        )
       },
       successMessage: 'File watcher ready',
       failMessage: 'Failed to setup file watcher',

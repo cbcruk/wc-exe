@@ -228,15 +228,26 @@ async function runCommand(
 
   if (handle) running.set(handle, process)
 
-  process.output.pipeTo(
-    new WritableStream({
-      write(chunk) {
-        buffer.push(chunk)
-        const filtered = filterOutput(chunk)
-        if (filtered) console.log(filtered)
-      },
+  // Not awaited — the pipe runs for the life of the process and the caller is
+  // waiting on the exit code, not on this. But its rejection is reported rather
+  // than dropped: a stream that errors mid-command means the output the caller
+  // is about to be handed is incomplete, and silence there reads as "the
+  // command printed nothing".
+  void process.output
+    .pipeTo(
+      new WritableStream({
+        write(chunk) {
+          buffer.push(chunk)
+          const filtered = filterOutput(chunk)
+          if (filtered) console.log(filtered)
+        },
+      })
+    )
+    .catch((error: unknown) => {
+      console.error(
+        `[wc-build] Output stream for ${cmd} failed: ${String(error)}`
+      )
     })
-  )
 
   try {
     const exitCode = await process.exit
@@ -958,24 +969,36 @@ async function installWithCache(): Promise<CacheResult> {
  * Starts a long-running command without waiting for it to exit — for dev
  * servers and watchers. Output is streamed to the page console.
  *
- * Returns immediately; a spawn failure surfaces as an unhandled rejection, not
- * to the caller.
+ * Returns immediately, so the caller does not learn whether the spawn worked.
+ * A failure is reported to the host as a `pageError` instead — the host is
+ * blocked in `getServerUrl` waiting for an event a dead process will never
+ * emit, so that message is the only cause it will ever see.
  */
 function spawnCommand(cmd: string, args: string[]): void {
   invariant(runtime, 'Runtime not booted')
 
   console.log(`[wc-build] Spawning: ${cmd} ${args.join(' ')}`)
 
-  runtime.spawn(cmd, args).then((process) => {
-    process.output.pipeTo(
-      new WritableStream({
-        write(chunk) {
-          const filtered = filterOutput(chunk)
-          if (filtered) console.log(filtered)
-        },
-      })
-    )
-  })
+  void runtime
+    .spawn(cmd, args)
+    .then((process) => {
+      return process.output.pipeTo(
+        new WritableStream({
+          write(chunk) {
+            const filtered = filterOutput(chunk)
+            if (filtered) console.log(filtered)
+          },
+        })
+      )
+    })
+    .catch((error: unknown) => {
+      // The host is waiting on `getServerUrl`, which waits for an event this
+      // process will now never emit. Saying so here is the only thing that
+      // turns that indefinite wait into something with a cause attached.
+      const message = `Spawning ${cmd} failed: ${String(error)}`
+      console.error(`[wc-build] ${message}`)
+      control.emit('pageError', { message })
+    })
 }
 
 /**

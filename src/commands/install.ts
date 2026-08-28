@@ -9,7 +9,8 @@ import { RunnerClient } from '../core/runner-client.js'
 import { listProjectFiles, readProjectFileBytes } from '../core/file-sync.js'
 import { CACHE_PORT, ensureCacheDirs } from '../core/cache.js'
 import { withSpin } from '../utils/spinner.js'
-import { commandFailure } from '../core/command-error.js'
+import { onInterrupt } from '../utils/interrupt.js'
+import { commandFailure } from '../core/errors.js'
 import type { ServerHandlers } from '../core/types.js'
 import type { InstallOptions } from '../types.js'
 
@@ -49,10 +50,10 @@ export async function install(options: InstallOptions): Promise<void> {
     await serverInfo?.shutdown()
   }
 
-  process.on('SIGINT', async () => {
-    console.log(chalk.yellow('\n\n  Installation cancelled.\n'))
-    await cleanup()
-    process.exit(130)
+  onInterrupt({
+    message: chalk.yellow('\n\n  Installation cancelled.\n'),
+    cleanup,
+    exitCode: 130,
   })
 
   try {
