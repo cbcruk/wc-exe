@@ -207,14 +207,18 @@ export class Session {
       await this.runner!.removePaths(plan.remove)
     }
 
-    // The runner pulls the whole project through the server — and on every
-    // sync, not only the first. `mountFromServer` takes no argument, so the
-    // page re-fetches the manifest and then every file in it, however small the
-    // plan that got us here was. The cost of an edit-build loop therefore
-    // scales with the project rather than the diff; `docs/ROUNDTRIPS.md`
-    // records the measured numbers and what fixing it would take.
+    // Only the first sync into a container reads the whole project. After that
+    // the plan already names what changed, and the page is told: an edit-build
+    // loop then costs one request per edited file instead of one per file in
+    // the project. `docs/ROUNDTRIPS.md` is the budget this is spent against.
+    //
+    // "First" is `manifest.size === 0`, which is the same thing as "this
+    // container holds nothing we put there" — set on construction, and reset by
+    // both `ensureBooted` and `onDisconnect`, so a container that went away and
+    // came back is correctly treated as empty rather than as up to date.
     if (plan.upsert.length) {
-      await this.runner!.mountFromServer()
+      const firstSync = this.manifest.size === 0
+      await this.runner!.mountFromServer(firstSync ? undefined : plan.upsert)
     }
 
     this.manifest = next

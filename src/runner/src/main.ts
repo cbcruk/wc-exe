@@ -112,16 +112,35 @@ async function boot(): Promise<void> {
 }
 
 /**
- * Fetches the project from the host server and mounts it into the runtime.
+ * Fetches project files from the host server and puts them into the runtime.
  *
- * Files are fetched one at a time and assembled into a single tree, then
- * mounted in one call.
+ * Two shapes, and which one runs is the host's call:
  *
- * @returns Number of files mounted.
+ * - **No argument** — pull the manifest and every file in it, assemble one tree
+ *   and mount it in a single call. This is a container that holds nothing yet.
+ * - **`paths`** — fetch exactly those and write them individually. The host
+ *   already computed the difference; re-reading the whole project to apply a
+ *   one-file edit is the cost `docs/ROUNDTRIPS.md` exists to stop.
+ *
+ * The second shape writes rather than mounts, and that is deliberate. Mounting
+ * a partial tree raises a question this codebase cannot answer from here —
+ * whether WebContainer merges a directory or replaces it — and being wrong
+ * would silently delete the siblings of an edited file. `writeFile` has one
+ * meaning. It costs a call per file, which is bounded by the diff and therefore
+ * small on exactly the path that uses it.
+ *
+ * An older host that calls this with no argument still gets the full mount, and
+ * an older *page* handed `paths` ignores them and mounts everything — correct,
+ * just not cheap. Neither direction of a version skew is wrong.
+ *
+ * @param paths Project-relative paths to refresh. Omit for the whole project.
+ * @returns Number of files written.
  * @throws If the manifest or any file fails to fetch.
  */
-async function mountFromServer(): Promise<number> {
+async function mountFromServer(paths?: string[]): Promise<number> {
   invariant(runtime, 'Runtime not booted')
+
+  if (paths) return writeFilesFromServer(paths, runtime)
 
   const manifestRes = await fetch(apiUrl('api/files'))
   if (!manifestRes.ok) {
@@ -131,30 +150,58 @@ async function mountFromServer(): Promise<number> {
     )
   }
 
-  const paths: string[] = await manifestRes.json()
+  const all: string[] = await manifestRes.json()
 
-  console.log(`[wc-build] Fetching ${paths.length} files...`)
+  console.log(`[wc-build] Fetching ${all.length} files...`)
 
   const tree: FileTree = {}
 
-  for (const filePath of paths) {
-    const fileRes = await fetch(
-      apiUrl(`api/files/raw?path=${encodeURIComponent(filePath)}`)
-    )
-    if (!fileRes.ok) {
-      throw mountFailed(
-        filePath,
-        `Failed to fetch file ${filePath}: ${fileRes.status}`
-      )
-    }
-
-    const contents = new Uint8Array(await fileRes.arrayBuffer())
-    insertIntoTree(tree, filePath, contents)
+  for (const filePath of all) {
+    insertIntoTree(tree, filePath, await fetchProjectFile(filePath))
   }
 
   await runtime.mount(tree)
 
-  console.log(`[wc-build] Mounted ${paths.length} files.`)
+  console.log(`[wc-build] Mounted ${all.length} files.`)
+
+  return all.length
+}
+
+/** Fetches one project file from the host. */
+async function fetchProjectFile(filePath: string): Promise<Uint8Array> {
+  const res = await fetch(
+    apiUrl(`api/files/raw?path=${encodeURIComponent(filePath)}`)
+  )
+  if (!res.ok) {
+    throw mountFailed(
+      filePath,
+      `Failed to fetch file ${filePath}: ${res.status}`
+    )
+  }
+  return new Uint8Array(await res.arrayBuffer())
+}
+
+/**
+ * Writes the named files into a runtime that already holds the rest.
+ *
+ * Parent directories are created first: a file the host added under a directory
+ * that did not exist yet is an ordinary edit, and `writeFile` alone would fail
+ * on it.
+ */
+async function writeFilesFromServer(
+  paths: string[],
+  rt: Runtime
+): Promise<number> {
+  console.log(`[wc-build] Refreshing ${paths.length} changed file(s)...`)
+
+  for (const filePath of paths) {
+    const contents = await fetchProjectFile(filePath)
+    const slash = filePath.lastIndexOf('/')
+    if (slash > 0) {
+      await rt.fs.mkdir(filePath.slice(0, slash), { recursive: true })
+    }
+    await rt.fs.writeFile(filePath, contents)
+  }
 
   return paths.length
 }
