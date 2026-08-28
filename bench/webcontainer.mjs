@@ -6,16 +6,19 @@
 // harness in ./container2wasm.
 //
 // Two modes:
-//   (default)  every run cold — plain `npm install`, throwaway Chrome profile.
-//              This is the container2wasm comparison baseline.
-//   --cache    warm runs — fixed port + persistent profile + the OPFS cache, so
-//              run 1 seeds and runs 2..N are cache hits. This is the mode that
-//              answers docs/persistent-runner.md Phase 0: on a *warm* run, is
-//              boot actually the dominant cost?
+//   (default)  every run cold — plain `npm install`, and the OPFS cache is
+//              cleared through the page before each run. This is the
+//              container2wasm comparison baseline.
+//   --cache    warm runs — a fixed port plus the OPFS cache, so run 1 seeds and
+//              runs 2..N are cache hits. This is the mode that answers
+//              docs/persistent-runner.md Phase 0: on a *warm* run, is boot
+//              actually the dominant cost?
 //
 // Prerequisites:
 //   pnpm build           # builds dist/ (incl. src/runner/dist) that this imports
-//   A Chrome/Chromium binary (set CHROME_PATH, or rely on the default lookup)
+//   A desktop session whose default browser runs WebContainer. This opens a tab
+//   per run and cannot close them: wc-exe hands the URL to the desktop and
+//   never owns the browser.
 //
 // Usage:
 //   node bench/webcontainer.mjs [projectDir] [--runs N] [--cache] [--keep-cache]
@@ -212,8 +215,10 @@ async function main() {
     }
     if (warmResults.some((r) => r.cacheHit === false)) {
       console.log(
-        '\nWARNING: a warm run reported a cache MISS. The persistent-profile/' +
-          'fixed-port setup is not holding, so these numbers are not warm.'
+        '\nWARNING: a warm run reported a cache MISS. The fixed-port setup is ' +
+          'not holding — check that nothing else took the port, and that the ' +
+          'tab is in the same browser as the previous run, since OPFS lives ' +
+          'in that browser. These numbers are not warm.'
       )
     }
     const b = reportBreakdown('warm run', summary.warmAverage)

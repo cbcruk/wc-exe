@@ -136,8 +136,12 @@ try {
     betaBundle.includes('MARKER_BETA') && !betaBundle.includes('MARKER_ALPHA')
   )
 
-  // Now genuinely at the same time. Two sessions must not fight over the
-  // browser, the profile directory, or each other's files.
+  // Now genuinely at the same time. Two sessions must not fight over each
+  // other's files, nor over the routing that keeps each page talking to its own
+  // session — a call delivered to the wrong page would drive the wrong
+  // project's build. They used to contend for a browser and its profile
+  // directory as well; the daemon stopped launching one, and that whole
+  // category went with it (docs/persistent-runner.md §19).
   const outAlpha2 = path.join(work, 'out-alpha-2')
   const outBeta2 = path.join(work, 'out-beta-2')
   const [a2, b2] = await Promise.all([

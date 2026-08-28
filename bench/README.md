@@ -33,9 +33,13 @@ pnpm build                 # builds dist/ + src/runner/dist that the harness imp
 node bench/webcontainer.mjs test/fixtures/sample-vite-app --runs 3
 ```
 
-Needs a Chrome/Chromium binary — set `CHROME_PATH` if the default lookup
-(`src/core/browser.ts`) misses it. Prints per-run and averaged
-`bootMs / mountMs / installMs / buildMs`. Compare `buildMs`.
+Prints per-run and averaged `bootMs / mountMs / installMs / buildMs`. Compare
+`buildMs`.
+
+**It opens a tab per run in your default browser and does not close them** —
+wc-exe hands the URL to the desktop and never owns the browser, so it has no way
+to. Use a browser that runs WebContainer (Chrome, Edge, Firefox), and expect
+`--runs 4` to leave four tabs behind.
 
 ### Warm mode (`--cache`) — the persistent-runner Phase 0 question
 
@@ -49,12 +53,21 @@ needs warm numbers.
 node bench/webcontainer.mjs ../my-real-project --cache --runs 4
 ```
 
-`--cache` pins the runner to the fixed port and a persistent Chrome profile
-(the same two things the real `--cache` flag needs, for the same reason: OPFS is
-origin-scoped), then installs through `installWithCache`. **Run 1 seeds the
-cache and is excluded from `warmAverage`**; runs 2..N are the measurement. The
-cache lives in a temp dir, not your real `~/.cache/wc-exe`, and is wiped at
-start unless you pass `--keep-cache`.
+`--cache` pins the runner to a fixed port — the same thing the real `--cache`
+flag needs, and for the same reason: OPFS is scoped per origin
+(scheme+host+port), so a random port starts every run with an empty cache. Then
+it installs through `installWithCache`.
+
+The port is `5299`, not the product's `5199`, and that is the isolation. The
+benchmark used to stay clear of your day-to-day cache by owning a Chrome profile
+directory; there is no profile to own now that the page runs in your own
+browser, so a different origin does the same job — and a daemon holding 5199 no
+longer blocks a run. Override with `WC_EXE_BENCH_PORT`.
+
+**Run 1 seeds the cache and is excluded from `warmAverage`**; runs 2..N are the
+measurement. Run 1 clears the cache first, and it does that by asking the page —
+OPFS belongs to the browser, so there is no directory to delete. `--keep-cache`
+skips the clear and measures against whatever the last run left behind.
 
 It then prints each phase's share of the warm total and splits it three ways:
 
