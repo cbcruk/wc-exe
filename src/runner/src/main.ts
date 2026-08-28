@@ -12,6 +12,13 @@ import {
 import { OutputBuffer } from './runtime/output-buffer'
 import { connectControlChannel } from './rpc'
 import {
+  commandFailed,
+  mountFailed,
+  noBuildOutput,
+  runtimeFailure,
+  uploadFailed,
+} from './errors'
+import {
   detectPackageManager,
   installArgs,
   offlineInstallArgs,
@@ -118,7 +125,10 @@ async function mountFromServer(): Promise<number> {
 
   const manifestRes = await fetch(apiUrl('api/files'))
   if (!manifestRes.ok) {
-    throw new Error(`Failed to fetch file manifest: ${manifestRes.status}`)
+    throw mountFailed(
+      'api/files',
+      `Failed to fetch file manifest: ${manifestRes.status}`
+    )
   }
 
   const paths: string[] = await manifestRes.json()
@@ -132,7 +142,10 @@ async function mountFromServer(): Promise<number> {
       apiUrl(`api/files/raw?path=${encodeURIComponent(filePath)}`)
     )
     if (!fileRes.ok) {
-      throw new Error(`Failed to fetch file ${filePath}: ${fileRes.status}`)
+      throw mountFailed(
+        filePath,
+        `Failed to fetch file ${filePath}: ${fileRes.status}`
+      )
     }
 
     const contents = new Uint8Array(await fileRes.arrayBuffer())
@@ -171,7 +184,10 @@ function insertIntoTree(
     } else if ('directory' in existing) {
       node = existing.directory
     } else {
-      throw new Error(`Path conflict: ${dir} is a file, expected a directory`)
+      throw mountFailed(
+        dir,
+        `Path conflict: ${dir} is a file, expected a directory`
+      )
     }
   }
 
@@ -550,7 +566,10 @@ async function computeCacheKey(): Promise<string> {
     }
   }
 
-  throw new Error('No lockfile or package.json found to key the cache on')
+  throw runtimeFailure(
+    'computeCacheKey',
+    'No lockfile or package.json found to key the cache on'
+  )
 }
 
 async function opfsRoot(): Promise<FileSystemDirectoryHandle> {
@@ -905,12 +924,9 @@ async function installWithCache(): Promise<CacheResult> {
     console.log(
       '[wc-build] Runtime has no snapshot support; installing plainly'
     )
-    const { exitCode } = await runCommand(command, [
-      ...argsPrefix,
-      ...installArgs(),
-    ])
-    if (exitCode !== 0) {
-      throw new Error(`${manager} install failed with exit code ${exitCode}`)
+    const plain = await runCommand(command, [...argsPrefix, ...installArgs()])
+    if (plain.exitCode !== 0) {
+      throw commandFailed(`${manager} install`, plain)
     }
     return { cached: false, key, manager }
   }
@@ -938,12 +954,17 @@ async function installWithCache(): Promise<CacheResult> {
     )
   }
 
-  const { exitCode } = await runCommand(command, [
+  // The whole result, not just the exit code. Both of these used to destructure
+  // `{ exitCode }` and throw a bare "install failed with exit code 1" — so the
+  // cached install path gave the user a number and no log, while the uncached
+  // path in `project-build.ts` gave them twenty lines of one. Same failure, and
+  // whether it was actionable depended on which path happened to run it.
+  const installed = await runCommand(command, [
     ...argsPrefix,
     ...offlineInstallArgs(manager, NPM_CACHE_DIR),
   ])
-  if (exitCode !== 0) {
-    throw new Error(`${manager} install failed with exit code ${exitCode}`)
+  if (installed.exitCode !== 0) {
+    throw commandFailed(`${manager} install`, installed)
   }
 
   const bytes = await saveNodeModules(runtime, key)
@@ -1061,7 +1082,8 @@ async function uploadDist(distPath: string): Promise<number> {
   try {
     await rt.fs.readdir(distPath)
   } catch {
-    throw new Error(
+    throw noBuildOutput(
+      distPath,
       `The build reported success but produced no output at ${distPath}. ` +
         'Check the build log above — a tool that fails to start can still exit 0.'
     )
@@ -1094,7 +1116,11 @@ async function uploadDist(distPath: string): Promise<number> {
         )
 
         if (!res.ok) {
-          throw new Error(`Failed to upload ${relative}: ${res.status}`)
+          throw uploadFailed(
+            relative,
+            res.status,
+            `Failed to upload ${relative}: ${res.status}`
+          )
         }
 
         count++

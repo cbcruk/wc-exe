@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { Hono } from 'hono'
 import { RunnerLink, mountRpcRoutes } from './rpc.js'
+import { isWcError, runtimeStateIsKnown } from './errors.js'
 
 /**
  * The control channel is the one piece of this that can be exercised without a
@@ -64,6 +65,9 @@ describe('the runner control channel', () => {
     await stream.cancel()
   })
 
+  // Kept as a string on purpose: the page used to post `error` as one, and a
+  // tab left open from an older build still can. It must not arrive as
+  // "[object Object]" or as a thrown parse failure.
   it('rejects with the message the page reported', async () => {
     const link = new RunnerLink()
     const app = appFor(link)
@@ -74,6 +78,70 @@ describe('the runner control channel', () => {
     await reply(app, { id: invocation.id, ok: false, error: 'install failed' })
 
     await expect(pending).rejects.toThrow('install failed')
+    await stream.cancel()
+  })
+
+  // The point of the boundary: what the page knew has to survive it. Before
+  // this, everything below collapsed into the message string and the host had
+  // an exit code it could only get by parsing English back out of prose.
+  it('carries the tag and fields the page reported, not just a message', async () => {
+    const link = new RunnerLink()
+    const app = appFor(link)
+    const stream = await openStream(app)
+
+    const pending = link.call('installWithCache')
+    const invocation = await stream.next()
+    await reply(app, {
+      id: invocation.id,
+      ok: false,
+      error: {
+        _tag: 'CommandFailed',
+        message: 'pnpm install failed with exit code 1',
+        label: 'pnpm install',
+        exitCode: 1,
+        output: 'ERR_PNPM_NO_MATCHING_VERSION',
+        truncated: false,
+        droppedChars: 0,
+      },
+    })
+
+    const error = await pending.catch((e: unknown) => e)
+
+    expect(isWcError(error)).toBe(true)
+    expect(error).toMatchObject({
+      _tag: 'CommandFailed',
+      label: 'pnpm install',
+      exitCode: 1,
+    })
+    // Composed host-side from the fields, so it reads the same as a failure
+    // raised on the host's own side of the boundary.
+    expect((error as Error).message).toContain('ERR_PNPM_NO_MATCHING_VERSION')
+    // And it is a failure the runtime survived, so a session may be reused.
+    expect(runtimeStateIsKnown(error)).toBe(true)
+    await stream.cancel()
+  })
+
+  it('reports a tag it does not know without losing it', async () => {
+    const link = new RunnerLink()
+    const app = appFor(link)
+    const stream = await openStream(app)
+
+    const pending = link.call('runCommand')
+    const invocation = await stream.next()
+    await reply(app, {
+      id: invocation.id,
+      ok: false,
+      error: { _tag: 'SomethingNewer', message: 'from a newer page bundle' },
+    })
+
+    const error = await pending.catch((e: unknown) => e)
+
+    expect(error).toMatchObject({
+      _tag: 'UnknownFailure',
+      originalTag: 'SomethingNewer',
+    })
+    // Fail-safe: an unrecognised failure must not license reusing the runtime.
+    expect(runtimeStateIsKnown(error)).toBe(false)
     await stream.cancel()
   })
 
@@ -105,6 +173,11 @@ describe('the runner control channel', () => {
     link.close('browser went away')
 
     await expect(pending).rejects.toThrow('browser went away')
+    // A closed link took the container with it, so nothing was left half
+    // written and the next build may open a fresh page rather than rebuild.
+    expect(runtimeStateIsKnown(await pending.catch((e: unknown) => e))).toBe(
+      true
+    )
     await stream.cancel()
   })
 

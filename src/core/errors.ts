@@ -305,14 +305,17 @@ export function fromWire(payload: unknown): WcError {
   const message = asString(wire.message, 'Runner call failed')
 
   switch (tag) {
+    // Recomposed from the fields rather than taken from the wire, so the
+    // sentence a user reads is built in exactly one place. The runner would
+    // otherwise have to duplicate `outputTail` and this exact wording inside
+    // the page bundle, and the two copies would drift the first time either
+    // side changed how a failure reads.
     case 'CommandFailed':
-      return new CommandFailed({
-        label: asString(wire.label, 'command'),
+      return commandFailure(asString(wire.label, 'command'), {
         exitCode: asNumber(wire.exitCode, 1),
         output: asString(wire.output),
         truncated: wire.truncated === true,
         droppedChars: asNumber(wire.droppedChars, 0),
-        message,
       })
     case 'NoBuildOutput':
       return new NoBuildOutput({ distPath: asString(wire.distPath), message })

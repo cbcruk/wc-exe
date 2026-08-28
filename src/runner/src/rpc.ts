@@ -11,6 +11,8 @@
  * WebSocket.
  */
 
+import { toWire } from './errors'
+
 interface Invocation {
   id: number
   method: string
@@ -45,8 +47,25 @@ export function connectControlChannel(
 
   const source = new EventSource(apiUrl('api/rpc/events'))
 
-  source.onmessage = async (message) => {
-    const { id, method, args } = JSON.parse(message.data) as Invocation
+  source.onmessage = (message) => {
+    // Parsed outside the async body on purpose. It used to be inside an `async`
+    // handler, and `EventSource` does not await one — so a frame that failed to
+    // parse produced a rejected promise nobody held, and the host's call simply
+    // never settled. There is no id to answer with at that point, which is the
+    // one case this channel genuinely cannot report; saying so in the console
+    // is better than a silent hang.
+    let invocation: Invocation
+    try {
+      invocation = JSON.parse(message.data as string) as Invocation
+    } catch (error) {
+      console.error('[wc-build] Unparseable invocation from host:', error)
+      return
+    }
+
+    void handle(invocation)
+  }
+
+  async function handle({ id, method, args }: Invocation): Promise<void> {
     const fn = api[method]
     if (typeof fn !== 'function') {
       // Named rather than ignored: a method the host has and the page does not
@@ -55,7 +74,7 @@ export function connectControlChannel(
       post('api/rpc/result', {
         id,
         ok: false,
-        error: `Runner has no method "${method}"`,
+        error: toWire(new Error(`Runner has no method "${method}"`)),
       })
       return
     }
@@ -63,11 +82,10 @@ export function connectControlChannel(
       const result = await (fn as (...a: unknown[]) => unknown)(...args)
       post('api/rpc/result', { id, ok: true, result })
     } catch (error) {
-      post('api/rpc/result', {
-        id,
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-      })
+      // An object, not a message. This is the boundary that used to flatten
+      // every failure into one line of prose: the exit code, the command's
+      // output and whether the runtime was left half-written all stopped here.
+      post('api/rpc/result', { id, ok: false, error: toWire(error) })
     }
   }
 

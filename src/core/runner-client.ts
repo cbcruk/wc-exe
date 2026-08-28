@@ -1,5 +1,6 @@
 import type { RunnerLink } from './rpc.js'
 import { openInBrowser } from './open.js'
+import { RunnerTimeout, RunnerUnavailable, isWcError } from './errors.js'
 import type {
   CacheResult,
   ClearCacheResult,
@@ -81,7 +82,21 @@ export class RunnerClient {
     // The page reports this over the control channel rather than the host
     // polling a global through CDP — which is the point: a page the host did
     // not launch has no global for the host to read.
-    await this.link.waitForReady(60_000)
+    //
+    // Wrapped here rather than inside the link, because this is where the URL
+    // is known, and the URL is the actionable part: the fix for this failure is
+    // almost always "open that address in a browser that can run a
+    // WebContainer". A `RunnerGone` from the link passes through untouched — it
+    // is already a better description than "unavailable".
+    try {
+      await this.link.waitForReady(60_000)
+    } catch (error) {
+      if (isWcError(error)) throw error
+      throw new RunnerUnavailable({
+        url: serverUrl,
+        message: error instanceof Error ? error.message : String(error),
+      })
+    }
     if (this.verbose) console.log('[Runner] control channel attached')
   }
 
@@ -188,10 +203,17 @@ export class RunnerClient {
         // Kill before rejecting, otherwise the command runs on invisibly and
         // keeps consuming the runtime for the rest of the session.
         void this.killCommand(handle!).finally(() => {
+          // Its own tag, not a `CommandFailed`. A command that exited told us
+          // it was finished; this one was cut at whatever point the clock ran
+          // out, so whatever it was writing — `node_modules`, `dist` — is in a
+          // state nobody can describe. That is the difference `Session` reads
+          // to decide whether the container can be reused.
           reject(
-            new Error(
-              `Command timed out after ${timeout}ms: ${cmd} ${args.join(' ')}`
-            )
+            new RunnerTimeout({
+              label: `${cmd} ${args.join(' ')}`.trim(),
+              timeoutMs: timeout,
+              message: `Command timed out after ${timeout}ms: ${cmd} ${args.join(' ')}`,
+            })
           )
         })
       }, timeout)
