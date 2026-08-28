@@ -89,13 +89,20 @@ export async function startDaemon(
      * produce.
      */
     open?: boolean
+    /**
+     * Where the built runner page lives. `null` serves no page — for a daemon
+     * whose sessions are driven by a runner that attaches over the control
+     * channel without loading one. See `createApp`.
+     */
+    runnerDist?: string | null
   } = {}
 ): Promise<RunningDaemon> {
   ensureCacheDirs()
 
   // Fail here, loudly, rather than serving 404s for every asset and leaving the
   // page to time out sixty seconds later with no explanation.
-  const runnerPath = resolveRunnerDist()
+  const runnerPath =
+    options.runnerDist === undefined ? resolveRunnerDist() : options.runnerDist
 
   const token = createToken()
   const idleMs = options.idleMs ?? DEFAULT_IDLE_MS
@@ -168,13 +175,15 @@ export async function startDaemon(
 
   // The runner bundle is built with a relative base, so the same files serve
   // correctly under every session prefix.
-  app.use('/s/:id/*', async (c, next) => {
-    const id = c.req.param('id')
-    return serveStatic({
-      root: runnerPath,
-      rewriteRequestPath: (p) => p.replace(`/s/${id}`, '') || '/',
-    })(c, next)
-  })
+  if (runnerPath !== null) {
+    app.use('/s/:id/*', async (c, next) => {
+      const id = c.req.param('id')
+      return serveStatic({
+        root: runnerPath,
+        rewriteRequestPath: (p) => p.replace(`/s/${id}`, '') || '/',
+      })(c, next)
+    })
+  }
 
   // ---- control plane: CLI only --------------------------------------------
 

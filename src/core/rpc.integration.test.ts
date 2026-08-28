@@ -14,7 +14,11 @@ import { RunnerLink } from './rpc.js'
  * is the failure this repository keeps finding in other shapes.
  *
  * The page's half still cannot be tested here: WebContainer does not boot in
- * this sandbox, so nothing can open the runner for real.
+ * this sandbox, so nothing can open the runner for real. The one-shot
+ * `fakePage` below stays hand-written rather than using `FakeRunnerPage`: these
+ * tests are about the transport, so they need a stream they can cut at a chosen
+ * moment and a reply that is whatever the test says, not whatever a runtime
+ * would answer.
  *
  * The disconnect tests matter for the same reason as the flush test. Now that
  * the host does not own the browser, a closed tab is not a protocol error it
@@ -61,10 +65,13 @@ async function fakePage(url: string, respond: (method: string) => unknown) {
 
 describe('the control channel over a real socket', () => {
   it('delivers a call and its result through @hono/node-server', async () => {
-    running = await startServer({
-      listFiles: async () => [],
-      readFile: async () => new Uint8Array(),
-    })
+    running = await startServer(
+      { listFiles: async () => [], readFile: async () => new Uint8Array() },
+      0,
+      // No page is served here, so nothing needs the built runner bundle —
+      // which is what keeps this whole tier runnable on a fresh clone.
+      { runnerDist: null }
+    )
 
     const pending = running.link.call<string>('describeRuntime', [])
     await fakePage(running.url, (method) => `handled:${method}`)
@@ -73,10 +80,13 @@ describe('the control channel over a real socket', () => {
   })
 
   it('reaches the page even when the call was made before it connected', async () => {
-    running = await startServer({
-      listFiles: async () => [],
-      readFile: async () => new Uint8Array(),
-    })
+    running = await startServer(
+      { listFiles: async () => [], readFile: async () => new Uint8Array() },
+      0,
+      // No page is served here, so nothing needs the built runner bundle —
+      // which is what keeps this whole tier runnable on a fresh clone.
+      { runnerDist: null }
+    )
 
     // No stream open yet — this is the startup gap the queue exists for.
     const pending = running.link.call<number>('mountFromServer', [])
@@ -86,10 +96,13 @@ describe('the control channel over a real socket', () => {
   })
 
   it('resolves waitForReady from a POST the page sends', async () => {
-    running = await startServer({
-      listFiles: async () => [],
-      readFile: async () => new Uint8Array(),
-    })
+    running = await startServer(
+      { listFiles: async () => [], readFile: async () => new Uint8Array() },
+      0,
+      // No page is served here, so nothing needs the built runner bundle —
+      // which is what keeps this whole tier runnable on a fresh clone.
+      { runnerDist: null }
+    )
 
     const waiting = running.link.waitForReady(5000)
     await fetch(`${running.url}/api/rpc/event`, {
@@ -116,7 +129,8 @@ async function linkOnSocket(graceMs: number): Promise<{
   const link = new RunnerLink({ graceMs })
   const app = createApp(
     { listFiles: async () => [], readFile: async () => new Uint8Array() },
-    link
+    link,
+    { runnerDist: null }
   )
   const server = await new Promise<ServerType>((resolve) => {
     const s = serve({ fetch: app.fetch, port: 0, hostname: '127.0.0.1' }, () =>
