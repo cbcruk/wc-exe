@@ -189,10 +189,28 @@ export type WcError =
  * symptom is a wrong artifact rather than an error.
  */
 const RUNTIME_STATE_KNOWN = new Set<string>([
+  // The command exited. Whatever it was doing, it finished doing it.
   'CommandFailed',
+  // The build exited 0 and wrote nothing. Nothing was interrupted.
   'NoBuildOutput',
+  // The container left with the tab, so there is no half-written state for a
+  // later build to inherit — `Session` resets itself from `onDisconnect` and
+  // the next build opens a fresh page.
   'RunnerGone',
+  // No runtime ever came up, so there is nothing to be uncertain about. Left
+  // out, this punished the case it describes: a user who takes longer than the
+  // sixty-second wait to open the tab would lose the session, and the tab they
+  // were opening would then 404 against a session id that no longer exists.
+  'RunnerUnavailable',
 ])
+
+// `UploadFailed` is deliberately **not** here, and the reasoning is worth
+// recording because it looks like it belongs. Uploading walks the runtime
+// read-only and POSTs to the host, so a failure part-way through leaves the
+// host's output directory half-written and the runtime itself untouched — by
+// that argument it is safe to reuse. But "by that argument" is not the bar for
+// an allowlist whose whole job is to be conservative: being wrong costs a
+// wrong artifact, and being cautious costs one boot after a rare failure.
 
 /**
  * Whether a session may be reused after this failure.
