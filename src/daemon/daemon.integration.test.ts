@@ -181,6 +181,47 @@ describe('a file deleted on the host', () => {
   })
 })
 
+describe('a second build into the same container', () => {
+  it('applies the edit, adds the new file, and leaves the rest alone', async () => {
+    const source = await project({
+      'package.json': '{"name":"demo"}',
+      'src/a.ts': 'export const a = 1',
+      'src/b.ts': 'export const b = 2',
+    })
+    const output = await project({})
+    const context = await start()
+    const run: FakeRunnerOptions['run'] = (command, runtime) => {
+      if (command.args.includes('build')) {
+        runtime.write('/dist/index.html', '<!doctype html>')
+      }
+    }
+
+    await build(context, { source, output, distDir: '/dist' }, run)
+
+    await fs.writeFile(path.join(source, 'src/a.ts'), 'export const a = 99')
+    await fs.mkdir(path.join(source, 'src/nested'), { recursive: true })
+    await fs.writeFile(
+      path.join(source, 'src/nested/c.ts'),
+      'export const c = 3'
+    )
+
+    const second = await build(
+      context,
+      { source, output, distDir: '/dist' },
+      run
+    )
+    expect(second.reused).toBe(true)
+
+    const runtime = pages[0].fs
+    expect(runtime.read('/src/a.ts')).toBe('export const a = 99')
+    expect(runtime.read('/src/nested/c.ts')).toBe('export const c = 3')
+    // The one that matters. A partial sync that took its siblings with it would
+    // be the failure that looks like success — the build still runs, against a
+    // tree missing a file nobody deleted.
+    expect(runtime.read('/src/b.ts')).toBe('export const b = 2')
+  })
+})
+
 describe('a project that does not compile', () => {
   it('fails with its own tag and leaves the session reusable', async () => {
     const source = await project({
@@ -340,7 +381,7 @@ describe('what one build costs', () => {
     ])
   })
 
-  it('re-reads every file on a second build, however little changed', async () => {
+  it('re-reads only what changed on a second build', async () => {
     const source = await project({
       'package.json': '{"name":"demo"}',
       'src/a.ts': 'export const a = 1',
@@ -367,17 +408,12 @@ describe('what one build costs', () => {
     )
     expect(second.reused).toBe(true)
 
-    // **This is the cost defect, recorded rather than hidden.** The host knows
-    // exactly which file changed — `diffManifests` computed it, and `sync` only
-    // mounts because that plan was non-empty. But `mountFromServer` takes no
-    // argument: the page re-fetches the manifest and then every file in it. So
-    // an edit-build loop pays the whole project over HTTP on every keystroke's
-    // worth of work, and the cost scales with the project rather than the diff.
+    // One more file read, for the one file that changed — not four more, and no
+    // second manifest. The host already knew the answer (`diffManifests`
+    // computed it) and now says so, so the cost of an edit-build loop is
+    // proportional to the edit rather than to the project.
     //
-    // Fixing it means giving the page a way to be told *which* paths to pull,
-    // which is a change to the runner bundle's API. Until then this number is
-    // the honest one, and it is asserted so that a fix shows up here as a
-    // number that got smaller.
-    expect(pages[0].requests).toEqual({ manifest: 2, files: 8, artifacts: 2 })
+    // These numbers used to be `{ manifest: 2, files: 8, artifacts: 2 }`.
+    expect(pages[0].requests).toEqual({ manifest: 1, files: 5, artifacts: 2 })
   })
 })

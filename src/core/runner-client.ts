@@ -101,13 +101,20 @@ export class RunnerClient {
   }
 
   /**
-   * Has the runner pull the project from the local server and mount it into the
-   * runtime.
+   * Has the runner pull project files from the local server and put them into
+   * the runtime.
    *
-   * @returns Number of files mounted.
+   * @param paths Project-relative paths to refresh — what the host worked out
+   *   actually changed. Omit for a container that holds nothing yet, which is
+   *   the only case where reading the whole project is the cheapest thing to
+   *   do. Naming them is what keeps an edit-build loop's cost proportional to
+   *   the edit instead of to the project (`docs/ROUNDTRIPS.md`).
+   * @returns Number of files written.
    */
-  async mountFromServer(): Promise<number> {
-    return this.callRunner('mountFromServer')
+  async mountFromServer(paths?: string[]): Promise<number> {
+    // Sent as no argument rather than as `undefined`, so a page built before
+    // this parameter existed sees the call it has always seen.
+    return this.callRunner('mountFromServer', paths ? [paths] : [])
   }
 
   /**

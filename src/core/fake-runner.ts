@@ -370,7 +370,7 @@ export class FakeRunnerPage {
   private async dispatch(method: string, args: unknown[]): Promise<unknown> {
     switch (method) {
       case 'mountFromServer':
-        return this.mountFromServer()
+        return this.mountFromServer(args[0] as string[] | undefined)
       case 'removePaths':
         return this.removePaths(args[0] as string[])
       case 'resolvePackageManager':
@@ -408,8 +408,19 @@ export class FakeRunnerPage {
     }
   }
 
-  /** Pulls the whole project through the host's routes, like the page does. */
-  private async mountFromServer(): Promise<number> {
+  /**
+   * Pulls project files through the host's routes, like the page does.
+   *
+   * With `paths` it skips the manifest entirely — the host already said what
+   * changed, so asking again is one of the round trips this parameter exists to
+   * remove.
+   */
+  private async mountFromServer(paths?: string[]): Promise<number> {
+    if (paths) {
+      for (const relPath of paths) await this.pull(relPath)
+      return paths.length
+    }
+
     this.requests.manifest++
     const manifest = await fetch(`${this.url}/api/files`)
     if (!manifest.ok) {
@@ -420,22 +431,25 @@ export class FakeRunnerPage {
       })
     }
 
-    const paths = (await manifest.json()) as string[]
-    for (const relPath of paths) {
-      this.requests.files++
-      const file = await fetch(
-        `${this.url}/api/files/raw?path=${encodeURIComponent(relPath)}`
-      )
-      if (!file.ok) {
-        throw new PageError({
-          _tag: 'MountFailed',
-          path: relPath,
-          message: `Failed to fetch file ${relPath}: ${file.status}`,
-        })
-      }
-      this.fs.write(`/${relPath}`, new Uint8Array(await file.arrayBuffer()))
+    const all = (await manifest.json()) as string[]
+    for (const relPath of all) await this.pull(relPath)
+    return all.length
+  }
+
+  /** Fetches one project file from the host and writes it into the runtime. */
+  private async pull(relPath: string): Promise<void> {
+    this.requests.files++
+    const file = await fetch(
+      `${this.url}/api/files/raw?path=${encodeURIComponent(relPath)}`
+    )
+    if (!file.ok) {
+      throw new PageError({
+        _tag: 'MountFailed',
+        path: relPath,
+        message: `Failed to fetch file ${relPath}: ${file.status}`,
+      })
     }
-    return paths.length
+    this.fs.write(`/${relPath}`, new Uint8Array(await file.arrayBuffer()))
   }
 
   private removePaths(paths: string[]): number {
