@@ -207,8 +207,12 @@ export class Session {
       await this.runner!.removePaths(plan.remove)
     }
 
-    // The runner pulls the whole project through the server. On a first sync
-    // that is everything; afterwards it re-reads files the host says changed.
+    // The runner pulls the whole project through the server — and on every
+    // sync, not only the first. `mountFromServer` takes no argument, so the
+    // page re-fetches the manifest and then every file in it, however small the
+    // plan that got us here was. The cost of an edit-build loop therefore
+    // scales with the project rather than the diff; `docs/ROUNDTRIPS.md`
+    // records the measured numbers and what fixing it would take.
     if (plan.upsert.length) {
       await this.runner!.mountFromServer()
     }

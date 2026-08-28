@@ -15,10 +15,14 @@ import {
   readRecord,
 } from './discovery.js'
 import { Session, sessionKey } from './session.js'
+import { nextMaintenanceAction } from './maintenance.js'
 import { VERSION } from '../version.js'
 
 /** Shut down after this long with no requests. */
 const DEFAULT_IDLE_MS = 10 * 60 * 1000
+
+/** How often the maintenance pass runs. */
+const DEFAULT_MAINTENANCE_MS = 30 * 1000
 
 function toArrayBuffer(view: Uint8Array): ArrayBuffer {
   return view.buffer.slice(
@@ -95,6 +99,12 @@ export async function startDaemon(
      * channel without loading one. See `createApp`.
      */
     runnerDist?: string | null
+    /**
+     * How often the maintenance pass runs. Every pass recomputes what the
+     * daemon should be doing, so this is a latency knob and nothing else —
+     * making it shorter finds work sooner, never differently.
+     */
+    maintenanceMs?: number
   } = {}
 ): Promise<RunningDaemon> {
   ensureCacheDirs()
@@ -106,6 +116,7 @@ export async function startDaemon(
 
   const token = createToken()
   const idleMs = options.idleMs ?? DEFAULT_IDLE_MS
+  const maintenanceMs = options.maintenanceMs ?? DEFAULT_MAINTENANCE_MS
   const sessions = new Map<string, Session>()
   // Monotonic, so an id is never reused after a session is evicted — the page
   // URL carries it, and a recycled id could route one project's files to
@@ -295,19 +306,58 @@ export async function startDaemon(
     })
   }
 
-  const idleTimer = setInterval(() => {
-    if (Date.now() - lastActivity > idleMs) return shutdownNow()
+  /**
+   * One maintenance pass: work out what is most wrong, fix that, stop.
+   *
+   * Nothing here decides anything — `nextMaintenanceAction` does, from facts
+   * gathered right now. This half only gathers and applies, which is what keeps
+   * the decision testable without a running daemon.
+   */
+  const maintain = (): void => {
+    if (closing) return
 
-    // Exit if the discovery record no longer points at us. Without this a
-    // daemon whose record was removed out from under it — the cache directory
-    // wiped, say — keeps running and keeps holding the port, while every CLI
-    // reports that no daemon exists. It becomes unmanageable and breaks any
-    // other process expecting that port to be free.
-    const current = readRecord()
-    if (!current || current.pid !== process.pid) shutdownNow()
-  }, 30_000)
-  // Do not hold the process open on the idle check alone.
-  idleTimer.unref?.()
+    const action = nextMaintenanceAction({
+      now: Date.now(),
+      lastActivity,
+      idleMs,
+      pid: process.pid,
+      record: readRecord(),
+      sessions: [...sessions.values()].map((session) => ({
+        id: session.id,
+        lastUsedAt: session.lastUsedAt,
+        poisoned: session.poisonedReason,
+        connected: session.link.isConnected,
+      })),
+    })
+
+    if (action.kind === 'stop') {
+      if (options.verbose)
+        console.log(`[wc-exe daemon] stopping: ${action.reason}`)
+      return shutdownNow()
+    }
+
+    if (action.kind === 'closeSession') {
+      for (const [key, session] of sessions) {
+        if (session.id !== action.id) continue
+        // Dropped from the map first. A close that fails would otherwise leave
+        // the session both unusable and still listed, and every later pass
+        // would pick the same one and get no further.
+        sessions.delete(key)
+        if (options.verbose)
+          console.log(
+            `[wc-exe daemon] closing session ${session.id}: ${action.reason}`
+          )
+        void session.close().catch((error: unknown) => {
+          reportShutdownFailure(`closing session ${session.id}`, error)
+        })
+        return
+      }
+    }
+  }
+
+  const maintenanceTimer = setInterval(maintain, maintenanceMs)
+  // Do not hold the process open on the maintenance pass alone.
+  maintenanceTimer.unref?.()
 
   /** Names a shutdown step that failed, without letting it stop the shutdown. */
   const reportShutdownFailure = (step: string, error: unknown): void => {
@@ -320,7 +370,7 @@ export async function startDaemon(
   async function shutdown(): Promise<void> {
     if (closing) return
     closing = true
-    clearInterval(idleTimer)
+    clearInterval(maintenanceTimer)
     for (const session of sessions.values()) {
       // Individually, and reported rather than propagated. This loop used to
       // let one session's `close()` reject out of `shutdown()`, and everything

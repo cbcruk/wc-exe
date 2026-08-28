@@ -219,12 +219,23 @@ export class FakeRunnerPage {
   readonly commands: FakeCommand[] = []
   /** Every method the host called, in order — including ones it refused. */
   readonly calls: string[] = []
+  /**
+   * What the runtime had to ask the host for, counted.
+   *
+   * The control channel is one cost and this is the other, larger one: a call
+   * like `mountFromServer` is a single RPC that turns into one request per file
+   * behind it. Counting them here is what makes `docs/ROUNDTRIPS.md` a budget
+   * something can check rather than a claim.
+   */
+  readonly requests = { manifest: 0, files: 0, artifacts: 0 }
 
   private readonly url: string
   private readonly options: FakeRunnerOptions
   private readonly abort = new AbortController()
   private closed = false
   private loop: Promise<void> = Promise.resolve()
+  /** Answers still being computed; see {@link serve} for why they overlap. */
+  private readonly inFlight = new Set<Promise<void>>()
 
   private constructor(options: FakeRunnerOptions) {
     this.url = options.url.replace(/\/$/, '')
@@ -294,7 +305,7 @@ export class FakeRunnerPage {
         const frame = buffer.slice(0, boundary)
         buffer = buffer.slice(boundary + 2)
         const invocation = parseFrame(frame)
-        if (invocation) await this.answer(invocation)
+        if (invocation) this.startAnswering(invocation)
         boundary = buffer.indexOf('\n\n')
       }
 
@@ -308,6 +319,28 @@ export class FakeRunnerPage {
       if (chunk.done) return
       buffer += decoder.decode(chunk.value, { stream: true })
     }
+  }
+
+  /**
+   * Begins answering, without waiting for the answer.
+   *
+   * Calls overlap on a real page and have to overlap here: a `runCommand` with
+   * a timeout is killed by a `killCommand` sent **while it is still running**.
+   * Answering one at a time would leave that kill queued behind the command it
+   * was sent to stop, and the timeout path — the one that decides whether a
+   * session is poisoned — would deadlock instead of being tested.
+   */
+  private startAnswering(invocation: {
+    id: number
+    method: string
+    args: unknown[]
+  }): void {
+    const answering = this.answer(invocation).catch(() => {
+      // `answer` already turns a failure into a wire error; anything reaching
+      // here is the POST failing, which `post` treats as the host going away.
+    })
+    this.inFlight.add(answering)
+    void answering.finally(() => this.inFlight.delete(answering))
   }
 
   private async answer(invocation: {
@@ -377,6 +410,7 @@ export class FakeRunnerPage {
 
   /** Pulls the whole project through the host's routes, like the page does. */
   private async mountFromServer(): Promise<number> {
+    this.requests.manifest++
     const manifest = await fetch(`${this.url}/api/files`)
     if (!manifest.ok) {
       throw new PageError({
@@ -388,6 +422,7 @@ export class FakeRunnerPage {
 
     const paths = (await manifest.json()) as string[]
     for (const relPath of paths) {
+      this.requests.files++
       const file = await fetch(
         `${this.url}/api/files/raw?path=${encodeURIComponent(relPath)}`
       )
@@ -451,6 +486,7 @@ export class FakeRunnerPage {
         .slice(normalize(distPath).length)
         .replace(/^\//, '')
       const body = this.fs.readBytes(absolute)!
+      this.requests.artifacts++
       const response = await fetch(
         `${this.url}/api/dist?path=${encodeURIComponent(relative)}`,
         {
@@ -494,6 +530,9 @@ export class FakeRunnerPage {
     if (this.closed) return
     this.closed = true
     this.abort.abort()
+    // The read loop only. An answer still in flight is deliberately not waited
+    // on: a command that models one that never returns — which is the whole
+    // point of the timeout path — would never let go.
     await this.loop
   }
 }
