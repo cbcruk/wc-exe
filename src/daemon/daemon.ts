@@ -7,6 +7,7 @@ import { CACHE_PORT, ensureCacheDirs } from '../core/cache.js'
 import { mountRpcRoutes } from '../core/rpc.js'
 import { resolveRunnerDist } from '../core/runner-assets.js'
 import { controlPlaneGuard } from './auth.js'
+import { InvalidProject, toWire } from '../core/errors.js'
 import {
   createToken,
   writeRecord,
@@ -42,7 +43,11 @@ export interface RunningDaemon {
  */
 function resolveProject(source: unknown): string {
   if (typeof source !== 'string' || !source.trim()) {
-    throw new Error('source must be a non-empty path')
+    throw new InvalidProject({
+      source: String(source),
+      reason: 'empty',
+      message: 'source must be a non-empty path',
+    })
   }
 
   const resolved = path.resolve(source)
@@ -50,10 +55,18 @@ function resolveProject(source: unknown): string {
   try {
     stat = fs.statSync(resolved)
   } catch {
-    throw new Error(`No such directory: ${resolved}`)
+    throw new InvalidProject({
+      source: resolved,
+      reason: 'missing',
+      message: `No such directory: ${resolved}`,
+    })
   }
   if (!stat.isDirectory()) {
-    throw new Error(`Not a directory: ${resolved}`)
+    throw new InvalidProject({
+      source: resolved,
+      reason: 'not-a-directory',
+      message: `Not a directory: ${resolved}`,
+    })
   }
   return resolved
 }
@@ -191,7 +204,7 @@ export async function startDaemon(
     try {
       source = resolveProject(body.source)
     } catch (error) {
-      return c.json({ error: (error as Error).message }, 400)
+      return c.json({ ok: false, logs: [], error: toWire(error) }, 400)
     }
 
     const key = sessionKey(source)
@@ -238,7 +251,10 @@ export async function startDaemon(
       return c.json({ ok: true, logs, ...result })
     } catch (error) {
       touch()
-      return c.json({ ok: false, logs, error: (error as Error).message }, 500)
+      // The tag survives the second transport too. Without it the CLI can see
+      // that a build failed but not whether the project is broken or the daemon
+      // is — which is the difference `exitCodeFor` is about to make visible.
+      return c.json({ ok: false, logs, error: toWire(error) }, 500)
     }
   })
 
