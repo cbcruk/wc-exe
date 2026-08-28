@@ -5,6 +5,7 @@ import { install } from './commands/install.js'
 import { daemonBuild } from './commands/daemon-build.js'
 import { daemonStatus, stopDaemon } from './daemon/client.js'
 import { reportUnhandled } from './utils/interrupt.js'
+import { reportFailure } from './utils/report.js'
 
 // The last resort for an async failure no caller is waiting for. The typed
 // errors in `core/errors.ts` only reach failures that reach a `catch`; this is
@@ -74,8 +75,7 @@ program
         open: options.open,
       })
     } catch (error) {
-      console.error('\nBuild failed:', (error as Error).message)
-      process.exit(1)
+      reportFailure('Build failed', error)
     }
   })
 
@@ -94,8 +94,7 @@ program
         open: options.open,
       })
     } catch (error) {
-      console.error('\nDev server failed:', (error as Error).message)
-      process.exit(1)
+      reportFailure('Dev server failed', error)
     }
   })
 
@@ -114,8 +113,7 @@ program
         open: options.open,
       })
     } catch (error) {
-      console.error('\nInstall failed:', (error as Error).message)
-      process.exit(1)
+      reportFailure('Install failed', error)
     }
   })
 
