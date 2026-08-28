@@ -23,9 +23,20 @@ function toArrayBuffer(view: Uint8Array): ArrayBuffer {
  * @param handlers Host-side filesystem callbacks backing the `/api` routes.
  * @param link Control channel the page attaches to. Optional only so callers
  *   that never drive the page (tests) can skip it.
+ * @param options.runnerDist Where the built runner page lives. `null` serves no
+ *   page at all — for a host whose runner attaches over the control channel
+ *   without ever loading one, which is what `FakeRunnerPage` does. Left out, the
+ *   bundle is located and a missing one throws here rather than becoming a 404
+ *   per asset and a page that times out with no cause.
  */
-export function createApp(handlers: ServerHandlers, link?: RunnerLink): Hono {
+export function createApp(
+  handlers: ServerHandlers,
+  link?: RunnerLink,
+  options: { runnerDist?: string | null } = {}
+): Hono {
   const app = new Hono()
+  const runnerDist =
+    options.runnerDist === undefined ? resolveRunnerDist() : options.runnerDist
 
   if (link) mountRpcRoutes(app, '', () => link)
 
@@ -64,7 +75,7 @@ export function createApp(handlers: ServerHandlers, link?: RunnerLink): Hono {
     return c.body(null, 204)
   })
 
-  app.use('/*', serveStatic({ root: resolveRunnerDist() }))
+  if (runnerDist !== null) app.use('/*', serveStatic({ root: runnerDist }))
 
   return app
 }
@@ -123,16 +134,18 @@ function shutdownFor(
  *
  * @param handlers Host-side filesystem callbacks backing the `/api` routes.
  * @param port Port to bind. `0` (the default) picks a free one.
+ * @param options.runnerDist See {@link createApp}.
  * @returns Rejects if the port is unavailable or the server fails to start.
  */
 export function startServer(
   handlers: ServerHandlers,
-  port: number = 0
+  port: number = 0,
+  options: { runnerDist?: string | null } = {}
 ): Promise<ServerInfo> {
   return new Promise((resolve, reject) => {
     try {
       const link = new RunnerLink()
-      const app = createApp(handlers, link)
+      const app = createApp(handlers, link, options)
       const server = serve(
         {
           fetch: app.fetch,

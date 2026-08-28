@@ -24,6 +24,14 @@ export {
   type ProjectBuildResult,
 } from './project-build.js'
 export { RunnerLink, mountRpcRoutes } from './rpc.js'
+export {
+  FakeRunnerPage,
+  FakeRuntimeFs,
+  exited,
+  type FakeRunnerOptions,
+  type FakeCommand,
+  type FakeCommandOutcome,
+} from './fake-runner.js'
 export { openInBrowser } from './open.js'
 export {
   startServer,
