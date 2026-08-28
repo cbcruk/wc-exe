@@ -61,7 +61,11 @@ booted in the background and reuses it:
 wc-exe build --daemon
 ```
 
-The daemon starts on first use and shuts itself down after 10 idle minutes.
+The daemon starts on first use and shuts itself down after 10 idle minutes. It
+also lets go of sessions it can no longer use: one left unusable by a failed
+build, and one whose tab you closed and whose project has since gone idle. A
+session whose tab is still open is left alone — the daemon cannot reopen it for
+you.
 
 ```bash
 wc-exe daemon status    # what is running, and which projects it holds open
