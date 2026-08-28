@@ -1,5 +1,6 @@
 import { streamSSE } from 'hono/streaming'
 import type { Context } from 'hono'
+import { fromWire, RunnerGone, type WireError } from './errors.js'
 
 /**
  * The control channel between the host and the runner page.
@@ -35,6 +36,22 @@ const RECONNECT_MS = 1_000
 interface Pending {
   resolve: (value: unknown) => void
   reject: (error: Error) => void
+}
+
+/**
+ * What the page posts back for a call.
+ *
+ * `error` is a {@link WireError} object. It used to be a bare string, and a
+ * string is still accepted: {@link fromWire} turns one into an
+ * `UnknownFailure` carrying it. That path is not decoration — the daemon holds
+ * a *booted* page bundle, and although `ensureDaemon` restarts it on a version
+ * mismatch, a tab a user left open from an older build can still answer.
+ */
+interface CallResult {
+  id: number
+  ok: boolean
+  result?: unknown
+  error?: WireError | string
 }
 
 /** What the host sends down the event stream. */
@@ -146,7 +163,12 @@ export class RunnerLink {
   /** Calls a method on the page's `wcRunner` and waits for its result. */
   call<T>(method: string, args: unknown[] = []): Promise<T> {
     if (this.closed) {
-      return Promise.reject(new Error('Runner link is closed'))
+      return Promise.reject(
+        new RunnerGone({
+          reason: 'the link was closed',
+          message: 'Runner link is closed',
+        })
+      )
     }
     const id = ++this.sequence
     const message: Invocation = { id, method, args }
@@ -226,9 +248,14 @@ export class RunnerLink {
    */
   private handleGone(): void {
     this.graceTimer = null
-    const error = new Error(
-      'The runner page went away (tab closed, navigated, or reloaded).'
-    )
+    // Tagged, and tagged as *safe*: the container went with the tab, so there
+    // is no half-written state for a later build to inherit. A session that
+    // sees this may open a fresh page and carry on.
+    const error = new RunnerGone({
+      reason: 'tab closed, navigated, or reloaded',
+      message:
+        'The runner page went away (tab closed, navigated, or reloaded).',
+    })
     for (const pending of this.pending.values()) pending.reject(error)
     this.pending.clear()
     // Rejecting a ready promise that already resolved is a no-op; rejecting one
@@ -241,17 +268,16 @@ export class RunnerLink {
 
   /** Route handler: `POST …/api/rpc/result`. */
   async result(c: Context): Promise<Response> {
-    const body = (await c.req.json()) as {
-      id: number
-      ok: boolean
-      result?: unknown
-      error?: string
-    }
+    const body = (await c.req.json()) as CallResult
     const pending = this.pending.get(body.id)
     if (!pending) return c.text('unknown call id', 404)
     this.pending.delete(body.id)
     if (body.ok) pending.resolve(body.result)
-    else pending.reject(new Error(body.error ?? 'Runner call failed'))
+    // The one place a failure crosses from the page into the host. Everything
+    // the runner knew about it — which step, which exit code, the command's
+    // output — arrives as fields and stays as fields, instead of being flattened
+    // into a sentence that the only remaining reader would have to parse back.
+    else pending.reject(fromWire(body.error ?? 'Runner call failed'))
     return c.body(null, 204)
   }
 
@@ -281,10 +307,10 @@ export class RunnerLink {
       clearTimeout(this.graceTimer)
       this.graceTimer = null
     }
-    for (const pending of this.pending.values())
-      pending.reject(new Error(reason))
+    const error = new RunnerGone({ reason, message: reason })
+    for (const pending of this.pending.values()) pending.reject(error)
     this.pending.clear()
-    this.readyReject?.(new Error(reason))
+    this.readyReject?.(error)
     this.push = null
     this.endStream?.()
     this.endStream = null

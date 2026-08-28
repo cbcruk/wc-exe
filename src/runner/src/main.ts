@@ -12,6 +12,13 @@ import {
 import { OutputBuffer } from './runtime/output-buffer'
 import { connectControlChannel } from './rpc'
 import {
+  commandFailed,
+  mountFailed,
+  noBuildOutput,
+  runtimeFailure,
+  uploadFailed,
+} from './errors'
+import {
   detectPackageManager,
   installArgs,
   offlineInstallArgs,
@@ -118,7 +125,10 @@ async function mountFromServer(): Promise<number> {
 
   const manifestRes = await fetch(apiUrl('api/files'))
   if (!manifestRes.ok) {
-    throw new Error(`Failed to fetch file manifest: ${manifestRes.status}`)
+    throw mountFailed(
+      'api/files',
+      `Failed to fetch file manifest: ${manifestRes.status}`
+    )
   }
 
   const paths: string[] = await manifestRes.json()
@@ -132,7 +142,10 @@ async function mountFromServer(): Promise<number> {
       apiUrl(`api/files/raw?path=${encodeURIComponent(filePath)}`)
     )
     if (!fileRes.ok) {
-      throw new Error(`Failed to fetch file ${filePath}: ${fileRes.status}`)
+      throw mountFailed(
+        filePath,
+        `Failed to fetch file ${filePath}: ${fileRes.status}`
+      )
     }
 
     const contents = new Uint8Array(await fileRes.arrayBuffer())
@@ -171,7 +184,10 @@ function insertIntoTree(
     } else if ('directory' in existing) {
       node = existing.directory
     } else {
-      throw new Error(`Path conflict: ${dir} is a file, expected a directory`)
+      throw mountFailed(
+        dir,
+        `Path conflict: ${dir} is a file, expected a directory`
+      )
     }
   }
 
@@ -228,15 +244,26 @@ async function runCommand(
 
   if (handle) running.set(handle, process)
 
-  process.output.pipeTo(
-    new WritableStream({
-      write(chunk) {
-        buffer.push(chunk)
-        const filtered = filterOutput(chunk)
-        if (filtered) console.log(filtered)
-      },
+  // Not awaited — the pipe runs for the life of the process and the caller is
+  // waiting on the exit code, not on this. But its rejection is reported rather
+  // than dropped: a stream that errors mid-command means the output the caller
+  // is about to be handed is incomplete, and silence there reads as "the
+  // command printed nothing".
+  void process.output
+    .pipeTo(
+      new WritableStream({
+        write(chunk) {
+          buffer.push(chunk)
+          const filtered = filterOutput(chunk)
+          if (filtered) console.log(filtered)
+        },
+      })
+    )
+    .catch((error: unknown) => {
+      console.error(
+        `[wc-build] Output stream for ${cmd} failed: ${String(error)}`
+      )
     })
-  )
 
   try {
     const exitCode = await process.exit
@@ -539,7 +566,10 @@ async function computeCacheKey(): Promise<string> {
     }
   }
 
-  throw new Error('No lockfile or package.json found to key the cache on')
+  throw runtimeFailure(
+    'computeCacheKey',
+    'No lockfile or package.json found to key the cache on'
+  )
 }
 
 async function opfsRoot(): Promise<FileSystemDirectoryHandle> {
@@ -894,12 +924,9 @@ async function installWithCache(): Promise<CacheResult> {
     console.log(
       '[wc-build] Runtime has no snapshot support; installing plainly'
     )
-    const { exitCode } = await runCommand(command, [
-      ...argsPrefix,
-      ...installArgs(),
-    ])
-    if (exitCode !== 0) {
-      throw new Error(`${manager} install failed with exit code ${exitCode}`)
+    const plain = await runCommand(command, [...argsPrefix, ...installArgs()])
+    if (plain.exitCode !== 0) {
+      throw commandFailed(`${manager} install`, plain)
     }
     return { cached: false, key, manager }
   }
@@ -927,12 +954,17 @@ async function installWithCache(): Promise<CacheResult> {
     )
   }
 
-  const { exitCode } = await runCommand(command, [
+  // The whole result, not just the exit code. Both of these used to destructure
+  // `{ exitCode }` and throw a bare "install failed with exit code 1" — so the
+  // cached install path gave the user a number and no log, while the uncached
+  // path in `project-build.ts` gave them twenty lines of one. Same failure, and
+  // whether it was actionable depended on which path happened to run it.
+  const installed = await runCommand(command, [
     ...argsPrefix,
     ...offlineInstallArgs(manager, NPM_CACHE_DIR),
   ])
-  if (exitCode !== 0) {
-    throw new Error(`${manager} install failed with exit code ${exitCode}`)
+  if (installed.exitCode !== 0) {
+    throw commandFailed(`${manager} install`, installed)
   }
 
   const bytes = await saveNodeModules(runtime, key)
@@ -958,24 +990,36 @@ async function installWithCache(): Promise<CacheResult> {
  * Starts a long-running command without waiting for it to exit — for dev
  * servers and watchers. Output is streamed to the page console.
  *
- * Returns immediately; a spawn failure surfaces as an unhandled rejection, not
- * to the caller.
+ * Returns immediately, so the caller does not learn whether the spawn worked.
+ * A failure is reported to the host as a `pageError` instead — the host is
+ * blocked in `getServerUrl` waiting for an event a dead process will never
+ * emit, so that message is the only cause it will ever see.
  */
 function spawnCommand(cmd: string, args: string[]): void {
   invariant(runtime, 'Runtime not booted')
 
   console.log(`[wc-build] Spawning: ${cmd} ${args.join(' ')}`)
 
-  runtime.spawn(cmd, args).then((process) => {
-    process.output.pipeTo(
-      new WritableStream({
-        write(chunk) {
-          const filtered = filterOutput(chunk)
-          if (filtered) console.log(filtered)
-        },
-      })
-    )
-  })
+  void runtime
+    .spawn(cmd, args)
+    .then((process) => {
+      return process.output.pipeTo(
+        new WritableStream({
+          write(chunk) {
+            const filtered = filterOutput(chunk)
+            if (filtered) console.log(filtered)
+          },
+        })
+      )
+    })
+    .catch((error: unknown) => {
+      // The host is waiting on `getServerUrl`, which waits for an event this
+      // process will now never emit. Saying so here is the only thing that
+      // turns that indefinite wait into something with a cause attached.
+      const message = `Spawning ${cmd} failed: ${String(error)}`
+      console.error(`[wc-build] ${message}`)
+      control.emit('pageError', { message })
+    })
 }
 
 /**
@@ -1038,7 +1082,8 @@ async function uploadDist(distPath: string): Promise<number> {
   try {
     await rt.fs.readdir(distPath)
   } catch {
-    throw new Error(
+    throw noBuildOutput(
+      distPath,
       `The build reported success but produced no output at ${distPath}. ` +
         'Check the build log above — a tool that fails to start can still exit 0.'
     )
@@ -1071,7 +1116,11 @@ async function uploadDist(distPath: string): Promise<number> {
         )
 
         if (!res.ok) {
-          throw new Error(`Failed to upload ${relative}: ${res.status}`)
+          throw uploadFailed(
+            relative,
+            res.status,
+            `Failed to upload ${relative}: ${res.status}`
+          )
         }
 
         count++

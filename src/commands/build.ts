@@ -15,6 +15,8 @@ import {
 import { CACHE_PORT, ensureCacheDirs } from '../core/cache.js'
 import { runProjectBuild } from '../core/project-build.js'
 import { withSpin } from '../utils/spinner.js'
+import { onInterrupt } from '../utils/interrupt.js'
+import { errorMessage } from '../utils/report.js'
 import type { ServerHandlers } from '../core/types.js'
 import type { BuildOptions } from '../types.js'
 
@@ -58,10 +60,10 @@ export async function build(options: BuildOptions): Promise<void> {
     await serverInfo?.shutdown()
   }
 
-  process.on('SIGINT', async () => {
-    console.log(chalk.yellow('\n\n  Build cancelled.\n'))
-    await cleanup()
-    process.exit(130)
+  onInterrupt({
+    message: chalk.yellow('\n\n  Build cancelled.\n'),
+    cleanup,
+    exitCode: 130,
   })
 
   const handlers: ServerHandlers = {
@@ -147,7 +149,7 @@ export async function build(options: BuildOptions): Promise<void> {
   } catch (error) {
     // The spinner is mid-step when a step throws; without this the line it was
     // showing stays on screen as if it had not finished failing.
-    if (spinner.isSpinning) spinner.fail((error as Error).message)
+    if (spinner.isSpinning) spinner.fail(errorMessage(error))
     await cleanup()
     throw error
   }

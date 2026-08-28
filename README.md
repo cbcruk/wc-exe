@@ -137,6 +137,19 @@ Install Options:
   --cache                 Cache node_modules in OPFS; skip install when the lockfile is unchanged
 ```
 
+## Exit codes
+
+Failures are separated by kind, so a script can tell a red build from a blip
+worth retrying without reading stderr:
+
+| Code  | Meaning                                                                                                                                                                                                              |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0`   | Success.                                                                                                                                                                                                             |
+| `1`   | **The project did not build.** A command exited non-zero, or the build reported success and produced no output. Look at the log.                                                                                     |
+| `2`   | **The invocation was wrong.** A source path that is not a directory, and the like. Look at the command line.                                                                                                         |
+| `3`   | **wc-exe could not do its job.** The runner page never became ready, the daemon would not start or stopped answering, a command was killed on timeout, or wc-exe hit a bug of its own. Retrying is often reasonable. |
+| `130` | Interrupted with Ctrl-C.                                                                                                                                                                                             |
+
 ## node_modules cache (`--cache`)
 
 `npm install` runs every time and is the slowest step. With `--cache`, the

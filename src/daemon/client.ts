@@ -9,6 +9,14 @@ import {
   type DaemonRecord,
 } from './discovery.js'
 import { VERSION } from '../version.js'
+import {
+  DaemonStartTimeout,
+  DaemonUnreachable,
+  RuntimeFailure,
+  fromWire,
+  type WcError,
+  type WireError,
+} from '../core/errors.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -37,36 +45,79 @@ const sleep = (ms: number): Promise<void> =>
  *
  * Sends no `Origin` header, which the daemon requires — see `controlPlaneGuard`.
  */
+/**
+ * What every control-plane failure response carries.
+ *
+ * No `ok` field: intersecting it with a success body whose `ok` is `true` would
+ * collapse the property to `never` and take the rest of the shape with it.
+ * Success is read from the HTTP status and the body's own `ok`.
+ */
+interface ControlFailure {
+  /** Progress the daemon recorded before it failed. */
+  logs: string[]
+  error: WireError
+}
+
+/**
+ * Sends one control-plane request and hands back whatever came with it.
+ *
+ * Separate from {@link call} because a *failed build* is not a failed request:
+ * the response body carries the daemon's progress log, and the CLI needs to
+ * print it. Throwing here would leave the caller holding an error and no log —
+ * which is how the log used to end up smuggled onto the `Error` object as an
+ * undeclared `logs` property, a contract living entirely outside the types.
+ */
+async function request<T>(
+  record: DaemonRecord,
+  route: string,
+  init?: RequestInit
+): Promise<{ ok: boolean; body: Partial<T & ControlFailure> }> {
+  let response: Response
+  try {
+    response = await fetch(`http://127.0.0.1:${record.port}${route}`, {
+      ...init,
+      headers: {
+        ...init?.headers,
+        authorization: `Bearer ${record.token}`,
+        'content-type': 'application/json',
+      },
+    })
+  } catch (cause) {
+    // A record pointing at nothing. Named rather than surfaced as fetch's
+    // `TypeError: fetch failed`, which says nothing about what to do.
+    throw new DaemonUnreachable({
+      port: record.port,
+      message:
+        `The daemon on port ${record.port} did not answer: ` +
+        (cause instanceof Error ? cause.message : String(cause)),
+    })
+  }
+
+  const body = (await response.json().catch(() => ({}))) as Partial<
+    T & ControlFailure
+  >
+  return { ok: response.ok, body }
+}
+
+/** Reads the daemon's answer, or throws whatever it reported. */
 async function call<T>(
   record: DaemonRecord,
   route: string,
   init?: RequestInit
 ): Promise<T> {
-  const response = await fetch(`http://127.0.0.1:${record.port}${route}`, {
-    ...init,
-    headers: {
-      ...init?.headers,
-      authorization: `Bearer ${record.token}`,
-      'content-type': 'application/json',
-    },
-  })
+  const { ok, body } = await request<T>(record, route, init)
+  if (!ok) throw failureOf(body, record)
+  return body as T
+}
 
-  const body = (await response.json().catch(() => ({}))) as T & {
-    error?: string
-    logs?: string[]
-  }
-  if (!response.ok) {
-    // Carry the daemon's progress log into the error. Without it a failure
-    // arrives as a bare message with no indication of which step produced it,
-    // which is exactly the hole `commandFailure` was added to close on the
-    // one-shot path.
-    const error = new Error(
-      body.error ?? `Daemon returned ${response.status}`
-    ) as Error & { logs?: string[] }
-    error.logs = body.logs
-    throw error
-  }
-  return body
+/** Rebuilds the failure the daemon reported, tag and fields intact. */
+function failureOf(
+  body: Partial<ControlFailure>,
+  record: DaemonRecord
+): WcError {
+  return fromWire(
+    body.error ?? `The daemon on port ${record.port} failed without saying why`
+  )
 }
 
 /** Asks a daemon for its health, or `null` if it is not answering. */
@@ -128,9 +179,10 @@ function resolveDaemonEntry(): string {
     if (existsSync(candidate)) return candidate
   }
 
-  throw new Error(
-    `Could not find the daemon entry point. Looked in:\n  ${candidates.join('\n  ')}`
-  )
+  throw new RuntimeFailure({
+    operation: 'resolveDaemonEntry',
+    message: `Could not find the daemon entry point. Looked in:\n  ${candidates.join('\n  ')}`,
+  })
 }
 
 /** Spawns a detached daemon and waits for it to advertise itself. */
@@ -154,10 +206,12 @@ async function spawnDaemon(verbose: boolean): Promise<DaemonRecord> {
     await sleep(150)
   }
 
-  throw new Error(
-    `The daemon did not come up within ${START_TIMEOUT_MS / 1000}s. ` +
-      `Try 'wc-exe daemon stop' and run again, or omit --daemon.`
-  )
+  throw new DaemonStartTimeout({
+    timeoutMs: START_TIMEOUT_MS,
+    message:
+      `The daemon did not come up within ${START_TIMEOUT_MS / 1000}s. ` +
+      `Try 'wc-exe daemon stop' and run again, or omit --daemon.`,
+  })
 }
 
 /**
@@ -197,9 +251,9 @@ export async function ensureDaemon(
   return await spawnDaemon(options.verbose ?? false)
 }
 
-/** Result of a daemon-run build. */
+/** A build the daemon completed. */
 export interface DaemonBuildResult {
-  ok: boolean
+  ok: true
   logs: string[]
   reused: boolean
   upserted: number
@@ -207,7 +261,32 @@ export interface DaemonBuildResult {
   written: number
 }
 
-/** Runs a build on the daemon. */
+/**
+ * What a daemon build came back as.
+ *
+ * A union rather than "return or throw", because **both outcomes carry the
+ * log**. The daemon reports its progress line by line as it builds, and that
+ * log is most useful on the run that failed — it is the only thing saying which
+ * step the failure came from. An exception can only carry a value by having one
+ * attached to it, which is what the old code did and why `logs` lived outside
+ * the type system.
+ *
+ * Not a `Result` for the same reason: `Result<T, E>` carries a value on one
+ * side or an error on the other, and this needs the log on both.
+ */
+export type DaemonBuildOutcome =
+  | DaemonBuildResult
+  | { ok: false; logs: string[]; error: WcError }
+
+/**
+ * Runs a build on the daemon.
+ *
+ * @returns The outcome, including a failed build — see
+ *   {@link DaemonBuildOutcome}.
+ * @throws If the daemon itself could not be reached or did not answer with a
+ *   build outcome at all. That is a different failure from a build that ran and
+ *   did not succeed, and the caller treats it differently.
+ */
 export async function buildViaDaemon(
   record: DaemonRecord,
   body: {
@@ -218,9 +297,18 @@ export async function buildViaDaemon(
     fresh: boolean
     timeout?: number
   }
-): Promise<DaemonBuildResult> {
-  return await call<DaemonBuildResult>(record, '/control/build', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  })
+): Promise<DaemonBuildOutcome> {
+  const { ok, body: result } = await request<DaemonBuildResult>(
+    record,
+    '/control/build',
+    { method: 'POST', body: JSON.stringify(body) }
+  )
+
+  if (ok && result.ok) return result as DaemonBuildResult
+
+  return {
+    ok: false,
+    logs: result.logs ?? [],
+    error: failureOf(result, record),
+  }
 }

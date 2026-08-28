@@ -43,6 +43,28 @@ export {
 } from './file-sync.js'
 export { CACHE_ROOT, CACHE_PORT, ensureCacheDirs } from './cache.js'
 export { resolveRunnerDist } from './runner-assets.js'
-export { commandFailure, outputTail } from './command-error.js'
+export {
+  commandFailure,
+  outputTail,
+  toWire,
+  fromWire,
+  isWcError,
+  runtimeStateIsKnown,
+  exitCodeFor,
+  CommandFailed,
+  NoBuildOutput,
+  RunnerGone,
+  RunnerTimeout,
+  MountFailed,
+  UploadFailed,
+  RuntimeFailure,
+  UnknownFailure,
+  InvalidProject,
+  RunnerUnavailable,
+  DaemonUnreachable,
+  DaemonStartTimeout,
+  type WcError,
+  type WireError,
+} from './errors.js'
 
 export type * from './types.js'

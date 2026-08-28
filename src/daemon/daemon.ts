@@ -7,6 +7,7 @@ import { CACHE_PORT, ensureCacheDirs } from '../core/cache.js'
 import { mountRpcRoutes } from '../core/rpc.js'
 import { resolveRunnerDist } from '../core/runner-assets.js'
 import { controlPlaneGuard } from './auth.js'
+import { InvalidProject, toWire } from '../core/errors.js'
 import {
   createToken,
   writeRecord,
@@ -42,7 +43,11 @@ export interface RunningDaemon {
  */
 function resolveProject(source: unknown): string {
   if (typeof source !== 'string' || !source.trim()) {
-    throw new Error('source must be a non-empty path')
+    throw new InvalidProject({
+      source: String(source),
+      reason: 'empty',
+      message: 'source must be a non-empty path',
+    })
   }
 
   const resolved = path.resolve(source)
@@ -50,10 +55,18 @@ function resolveProject(source: unknown): string {
   try {
     stat = fs.statSync(resolved)
   } catch {
-    throw new Error(`No such directory: ${resolved}`)
+    throw new InvalidProject({
+      source: resolved,
+      reason: 'missing',
+      message: `No such directory: ${resolved}`,
+    })
   }
   if (!stat.isDirectory()) {
-    throw new Error(`Not a directory: ${resolved}`)
+    throw new InvalidProject({
+      source: resolved,
+      reason: 'not-a-directory',
+      message: `Not a directory: ${resolved}`,
+    })
   }
   return resolved
 }
@@ -191,7 +204,7 @@ export async function startDaemon(
     try {
       source = resolveProject(body.source)
     } catch (error) {
-      return c.json({ error: (error as Error).message }, 400)
+      return c.json({ ok: false, logs: [], error: toWire(error) }, 400)
     }
 
     const key = sessionKey(source)
@@ -238,14 +251,17 @@ export async function startDaemon(
       return c.json({ ok: true, logs, ...result })
     } catch (error) {
       touch()
-      return c.json({ ok: false, logs, error: (error as Error).message }, 500)
+      // The tag survives the second transport too. Without it the CLI can see
+      // that a build failed but not whether the project is broken or the daemon
+      // is — which is the difference `exitCodeFor` is about to make visible.
+      return c.json({ ok: false, logs, error: toWire(error) }, 500)
     }
   })
 
   app.post('/control/stop', (c) => {
     // Reply before tearing down, so the caller sees an answer rather than a
     // dropped connection.
-    setTimeout(() => void shutdown(), 50)
+    setTimeout(shutdownNow, 50)
     return c.json({ ok: true })
   })
 
@@ -263,8 +279,15 @@ export async function startDaemon(
     server.on('error', reject)
   })
 
+  /** Shuts down, reporting a failure rather than leaving a rejected promise. */
+  const shutdownNow = (): void => {
+    void shutdown().catch((error: unknown) => {
+      reportShutdownFailure('shutdown', error)
+    })
+  }
+
   const idleTimer = setInterval(() => {
-    if (Date.now() - lastActivity > idleMs) return void shutdown()
+    if (Date.now() - lastActivity > idleMs) return shutdownNow()
 
     // Exit if the discovery record no longer points at us. Without this a
     // daemon whose record was removed out from under it — the cache directory
@@ -272,16 +295,34 @@ export async function startDaemon(
     // reports that no daemon exists. It becomes unmanageable and breaks any
     // other process expecting that port to be free.
     const current = readRecord()
-    if (!current || current.pid !== process.pid) void shutdown()
+    if (!current || current.pid !== process.pid) shutdownNow()
   }, 30_000)
   // Do not hold the process open on the idle check alone.
   idleTimer.unref?.()
+
+  /** Names a shutdown step that failed, without letting it stop the shutdown. */
+  const reportShutdownFailure = (step: string, error: unknown): void => {
+    console.error(
+      `[wc-exe daemon] ${step} failed during shutdown: ` +
+        (error instanceof Error ? error.message : String(error))
+    )
+  }
 
   async function shutdown(): Promise<void> {
     if (closing) return
     closing = true
     clearInterval(idleTimer)
-    for (const session of sessions.values()) await session.close()
+    for (const session of sessions.values()) {
+      // Individually, and reported rather than propagated. This loop used to
+      // let one session's `close()` reject out of `shutdown()`, and everything
+      // below — including `clearRecord()` and the `process.exit(0)` in the
+      // signal handler — was skipped. The daemon then stayed alive holding the
+      // port, with a discovery record still advertising it, and `wc-exe daemon
+      // stop` appeared to do nothing.
+      await session.close().catch((error: unknown) => {
+        reportShutdownFailure(`closing session ${session.id}`, error)
+      })
+    }
     sessions.clear()
     // Nothing to shut down beyond this: the tabs belong to the user's browser,
     // and closing them is not the daemon's to do. They are left pointing at a
@@ -311,7 +352,12 @@ export async function startDaemon(
 
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.on(signal, () => {
-      void shutdown().then(() => process.exit(0))
+      // `.finally`, not `.then`: a shutdown that rejects must still exit. With
+      // `.then` the process stayed up on any failure, which is the one outcome
+      // a stop signal must not produce.
+      void shutdown()
+        .catch((error: unknown) => reportShutdownFailure('shutdown', error))
+        .finally(() => process.exit(0))
     })
   }
 

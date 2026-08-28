@@ -40,7 +40,7 @@ export async function daemonBuild(
     await prepareOutputDir(path.resolve(output))
 
     spinner.start('Building...')
-    const result = await buildViaDaemon(record, {
+    const outcome = await buildViaDaemon(record, {
       source: path.resolve(source),
       output: path.resolve(output),
       distDir,
@@ -48,26 +48,40 @@ export async function daemonBuild(
       fresh,
       timeout,
     })
+
+    // A failed build is a value here, not an exception, so the log it came with
+    // is in hand rather than smuggled on an error object. Printed before the
+    // throw for the same reason it always was: without it a failure names a
+    // step nobody can place.
+    if (!outcome.ok) {
+      spinner.fail('Build failed')
+      if (outcome.logs.length) {
+        console.log(chalk.gray('\n  Progress before the failure:'))
+        for (const line of outcome.logs) console.log(chalk.gray(`    ${line}`))
+        console.log()
+      }
+      throw outcome.error
+    }
+
     spinner.succeed(
-      result.reused ? 'Built on a warm container' : 'Built on a fresh container'
+      outcome.reused
+        ? 'Built on a warm container'
+        : 'Built on a fresh container'
     )
 
-    for (const line of result.logs) {
+    for (const line of outcome.logs) {
       console.log(chalk.gray(`  ${line}`))
     }
 
     console.log(
       chalk.green(`\n  Build successful! `) +
-        chalk.gray(`${result.written} files → ${output}\n`)
+        chalk.gray(`${outcome.written} files → ${output}\n`)
     )
   } catch (error) {
-    spinner.fail('Build failed')
-    const logs = (error as Error & { logs?: string[] }).logs
-    if (logs?.length) {
-      console.log(chalk.gray('\n  Progress before the failure:'))
-      for (const line of logs) console.log(chalk.gray(`    ${line}`))
-      console.log()
-    }
+    // Reaching here means the daemon itself failed — unreachable, would not
+    // start, or answered with something that was not a build outcome. A build
+    // that ran and failed was handled above, with its log.
+    if (spinner.isSpinning) spinner.fail('Build failed')
     throw error
   }
 }

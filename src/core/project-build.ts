@@ -1,4 +1,4 @@
-import { commandFailure } from './command-error.js'
+import { commandFailure } from './errors.js'
 import type { RunnerClient } from './runner-client.js'
 import type { PackageManagerChoice } from './types.js'
 

@@ -9,8 +9,42 @@ import {
   writeDistFile,
   type Manifest,
 } from '../core/file-sync.js'
-import { runProjectBuild } from '../core/project-build.js'
+import { runProjectBuild, type BuildRunner } from '../core/project-build.js'
+import { runtimeStateIsKnown, isWcError } from '../core/errors.js'
 import type { ServerHandlers } from '../core/types.js'
+
+/**
+ * The slice of {@link RunnerClient} a session drives.
+ *
+ * Narrowed for the same reason `BuildRunner` is (§18.3 of
+ * `docs/persistent-runner.md`): a test double is then a plain object rather
+ * than an `as unknown as` cast, which would keep compiling however this
+ * interface moves — and stop noticing drift exactly when drift is the risk.
+ */
+export type SessionRunner = BuildRunner &
+  Pick<RunnerClient, 'mountFromServer' | 'close'>
+
+/**
+ * Opens a tab for a session and waits for its runtime to boot.
+ *
+ * The default {@link SessionOptions.attach}. It is a parameter at all because
+ * everything interesting about a session's failure handling is unreachable
+ * otherwise: driving `build()` to a failure needs a runner, and getting a real
+ * one needs a browser.
+ */
+async function attachViaBrowser(options: {
+  link: RunnerLink
+  url: string
+  verbose: boolean
+  open: boolean
+}): Promise<SessionRunner> {
+  const runner = new RunnerClient({
+    verbose: options.verbose,
+    link: options.link,
+  })
+  await runner.launch(options.url, { open: options.open })
+  return runner
+}
 
 /** How a session reports what it did, for the CLI to print. */
 export interface SessionBuildResult {
@@ -38,6 +72,16 @@ export interface SessionOptions {
    * one is watching.
    */
   open?: boolean
+  /**
+   * How this session gets a runner. Defaults to opening a tab and waiting for
+   * its runtime to boot; tests supply a double instead.
+   */
+  attach?: (options: {
+    link: RunnerLink
+    url: string
+    verbose: boolean
+    open: boolean
+  }) => Promise<SessionRunner>
 }
 
 /**
@@ -50,7 +94,7 @@ export interface SessionOptions {
  * the failure this trades against is not a slow build but a wrong one.
  */
 export class Session {
-  private runner: RunnerClient | null = null
+  private runner: SessionRunner | null = null
   private manifest: Manifest = new Map()
   private booted = false
   /** Set when something goes wrong badly enough that reuse is unsafe. */
@@ -68,6 +112,7 @@ export class Session {
   readonly source: string
   private readonly origin: string
   private readonly open: boolean
+  private readonly attach: NonNullable<SessionOptions['attach']>
   private lastUsed = Date.now()
   /** Output directory of the build in flight, for the dist upload route. */
   private currentOutput: string | null = null
@@ -77,6 +122,7 @@ export class Session {
     this.source = options.source
     this.origin = options.origin
     this.open = options.open ?? true
+    this.attach = options.attach ?? attachViaBrowser
 
     // A closed tab takes the container with it, so the session must forget
     // everything it believed about the runtime's contents. This is a better
@@ -132,8 +178,12 @@ export class Session {
     if (!this.open)
       console.log(`Session ${this.id} needs a runner page: ${url}`)
 
-    this.runner = new RunnerClient({ verbose, link: this.link })
-    await this.runner.launch(url, { open: this.open })
+    this.runner = await this.attach({
+      link: this.link,
+      url,
+      verbose,
+      open: this.open,
+    })
     this.booted = true
     // A fresh container holds nothing, so the next sync must push everything.
     this.manifest = new Map()
@@ -232,10 +282,21 @@ export class Session {
         this.currentOutput = null
       }
     } catch (error) {
-      // A build that failed part-way may have left the runtime holding
-      // half-written state we cannot characterise. Reuse is only safe when we
-      // know what is in there.
-      this.poisoned = (error as Error).message
+      // Only when the runtime's contents are no longer something we can
+      // describe. This used to poison on *every* failure, which sounds cautious
+      // and was the opposite: the most common failure by far is a project that
+      // does not compile, and that leaves the container exactly as it was. So
+      // iterating on a broken build tore down the session every run and paid
+      // the boot again — `--daemon` was slowest precisely when it was being
+      // used most, and the only visible symptom was that it felt no faster.
+      //
+      // `runtimeStateIsKnown` is an allowlist, so a failure this code does not
+      // recognise still poisons. Being wrong in that direction costs one boot;
+      // being wrong the other way ships an artifact built from a container
+      // nobody can characterise.
+      if (!runtimeStateIsKnown(error)) {
+        this.poisoned = describePoison(error)
+      }
       throw error
     } finally {
       this.lastUsed = Date.now()
@@ -256,6 +317,21 @@ export class Session {
     this.booted = false
     this.manifest = new Map()
   }
+}
+
+/**
+ * One line naming why a session is unusable, for `wc-exe daemon status`.
+ *
+ * The tag leads, because it is the part that says whether this is the user's
+ * problem or ours. Only the first line survives: a failure message can carry a
+ * whole build log, and `daemon status` prints one line per session.
+ */
+function describePoison(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  const first = message.split('\n')[0]
+  const tag =
+    isWcError(error) && error._tag !== 'UnknownFailure' ? `${error._tag}: ` : ''
+  return `${tag}${first}`
 }
 
 /** Normalises a project path so the same project always maps to one session. */
